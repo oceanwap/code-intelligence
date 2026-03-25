@@ -2,17 +2,26 @@ import { EmbeddingModel, FlagEmbedding } from 'fastembed';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import * as crypto from 'crypto';
 import type { CodeChunk } from './indexer.js';
 import { toUUID } from './indexer.js';
 
 const VECTOR_SIZE = 384; // BGE-small-en-v1.5 (local, no API key, ~33 MB, ~3x faster than base)
 
+// Store the model in a shared user-level cache so it is downloaded only once
+// regardless of which directory `code-intel` is run from.
+const MODEL_CACHE_DIR = path.join(os.homedir(), '.cache', 'code-intelligence', 'models');
+
 // Lazy singleton — model is downloaded once on first use
 let _model: FlagEmbedding | null = null;
 async function getModel(): Promise<FlagEmbedding> {
   if (!_model) {
-    _model = await FlagEmbedding.init({ model: EmbeddingModel.BGESmallENV15 });
+    fs.mkdirSync(MODEL_CACHE_DIR, { recursive: true });
+    _model = await FlagEmbedding.init({
+      model: EmbeddingModel.BGESmallENV15,
+      cacheDir: MODEL_CACHE_DIR,
+    });
   }
   return _model;
 }

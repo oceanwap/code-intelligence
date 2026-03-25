@@ -2,6 +2,7 @@ import { Project, SyntaxKind } from 'ts-morph';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import { indexPhpFiles } from './php-indexer.js';
 
 export interface CodeChunk {
   id: string;
@@ -106,7 +107,7 @@ export function indexDirectory(rootDir: string): CodeChunk[] {
     }
   }
 
-  return [...chunks, ...indexPlainFiles(rootDir)];
+  return [...chunks, ...indexPhpFiles(rootDir), ...indexPlainFiles(rootDir)];
 }
 
 export function walkFiles(dir: string, exts: string[], extraNames?: Set<string>): string[] {

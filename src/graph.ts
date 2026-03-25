@@ -2,6 +2,7 @@ import { Project, SyntaxKind, Node, FunctionDeclaration, ArrowFunction, Function
 import * as path from 'path';
 import * as fs from 'fs';
 import { walkFiles } from './indexer.js';
+import { buildPhpGraph } from './php-graph.js';
 
 export interface GraphData {
   /** symbol name → list of called symbol names (outbound) */
@@ -117,6 +118,9 @@ export function buildGraph(rootDir: string): GraphData {
       }
     }
   }
+
+  // PHP: add symbols, callers, files, symbolFile from PHP sources
+  buildPhpGraph(rootDir, graph);
 
   return graph;
 }

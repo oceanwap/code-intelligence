@@ -18,6 +18,7 @@
     "@qdrant/js-client-rest": "^1.9.0",
     "commander": "^12.1.0",
     "fastembed": "^2.1.0",
+    "php-parser": "^3.5.0",
     "ts-morph": "^23.0.0"
   },
   "devDependencies": {
