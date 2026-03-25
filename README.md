@@ -184,3 +184,9 @@ npm run mcp
 # Run MCP server in HTTP mode
 npm start
 ```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
