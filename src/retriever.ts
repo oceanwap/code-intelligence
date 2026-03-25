@@ -106,19 +106,22 @@ export async function retrieve(
 
   if (queryTokens.length > 0) {
     const alreadyFound = new Set(results.map(r => r.symbol));
+
+    // Build OR filter matching query tokens against the file payload field.
+    // This lets Qdrant do the filtering rather than fetching all file chunks
+    // into memory. We still cap at 200 to guard against very large projects.
     const { points: filePoints } = await qdrant.scroll(collection, {
-      filter: { must: [{ key: 'type', match: { value: 'file' } }] },
+      filter: {
+        must: [{ key: 'type', match: { value: 'file' } }],
+        should: queryTokens.map(t => ({ key: 'file', match: { text: t } })),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
       with_payload: true,
       with_vector: false,
-      limit: 2000,
+      limit: 200,
     });
 
-    const fileMatches = filePoints.filter(p => {
-      const fileLower = (p.payload!['file'] as string).toLowerCase();
-      return queryTokens.some(t => fileLower.includes(t));
-    });
-
-    for (const p of fileMatches) {
+    for (const p of filePoints) {
       const sym = p.payload!['symbol'] as string;
       if (!alreadyFound.has(sym)) {
         results.splice(0, 0, {  // inject at front — filename matches are high-intent

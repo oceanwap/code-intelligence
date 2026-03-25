@@ -60,8 +60,8 @@ function createMcpServer(): McpServer {
           const callees = graph?.symbols[r.symbol] ?? [];
           const callers = graph?.callers?.[r.symbol] ?? [];
           const graphParts = [
-            callees.length ? `calls: ${callees.slice(0, 6).join(', ')}${callees.length > 6 ? '…' : ''}` : '',
-            callers.length ? `calledBy: ${callers.slice(0, 4).join(', ')}${callers.length > 4 ? '…' : ''}` : '',
+            callees.length ? `calls: ${callees.join(', ')}` : '',
+            callers.length ? `calledBy: ${callers.join(', ')}` : '',
           ].filter(Boolean).join(' | ');
           return [
             `**File:** ${r.file}`,
@@ -165,6 +165,167 @@ function createMcpServer(): McpServer {
       }).join('\n\n---\n\n');
 
       return { content: [{ type: 'text', text: output }] };
+    }
+  );
+
+  // --- get_symbols (batch) ---
+  server.registerTool(
+    'get_symbols',
+    {
+      description: 'Retrieve source code and call graph context for multiple named symbols in a single call. Use instead of calling get_symbol repeatedly when you have a list of callees/callers to inspect. Returns code, file, calls, and calledBy for each symbol.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root'),
+        symbols: z.array(z.string()).min(1).max(50).describe('Array of symbol names to look up, e.g. ["handleRequest", "AuthService.login"]'),
+        qdrantUrl: z.string().optional().describe('Qdrant URL (default: http://localhost:6333)'),
+      },
+    },
+    async ({ projectRoot, symbols, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      const graph = loadGraph(path.join(root, '.code-intelligence', 'graph.json'));
+      const qdrant = new QdrantClient({ url: qdrantUrl });
+      const collection = collectionName(root);
+
+      // Single Qdrant scroll with OR filter — O(1) round trip regardless of symbol count
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { points } = await qdrant.scroll(collection, {
+        filter: {
+          should: symbols.map(s => ({ key: 'symbol', match: { value: s } })),
+        } as any,
+        with_payload: true,
+        with_vector: false,
+        limit: symbols.length * 3, // allow multiple chunks per symbol
+      });
+
+      if (points.length === 0) {
+        return { content: [{ type: 'text', text: `None of the requested symbols were found in the index.` }] };
+      }
+
+      // Group points by symbol to deduplicate
+      const bySymbol = new Map<string, typeof points>();
+      for (const p of points) {
+        const sym = p.payload!['symbol'] as string;
+        if (!bySymbol.has(sym)) bySymbol.set(sym, []);
+        bySymbol.get(sym)!.push(p);
+      }
+
+      // Report any not found
+      const notFound = symbols.filter(s => !bySymbol.has(s));
+
+      const sections: string[] = [];
+      for (const [sym, pts] of bySymbol) {
+        const callees = graph?.symbols[sym] ?? [];
+        const callers = graph?.callers?.[sym] ?? [];
+        for (const p of pts) {
+          const file = p.payload!['file'] as string;
+          const type = p.payload!['type'] as string;
+          const code = p.payload!['code'] as string;
+          sections.push([
+            `**${sym}** (${type}) — ${file}`,
+            callees.length ? `Calls (${callees.length}): ${callees.join(', ')}` : '',
+            callers.length ? `Called by (${callers.length}): ${callers.join(', ')}` : '',
+            `\`\`\`\n${code}\n\`\`\``,
+          ].filter(Boolean).join('\n'));
+        }
+      }
+
+      if (notFound.length) {
+        sections.push(`**Not found:** ${notFound.join(', ')}`);
+      }
+
+      return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+    }
+  );
+
+  // --- expand_graph ---
+  server.registerTool(
+    'expand_graph',
+    {
+      description: 'Given a set of seed symbols, return the full N-hop call subgraph with code for every reachable symbol — both outbound (callees) and inbound (callers). Use to understand an entire execution path or module boundary in one shot, instead of iterating get_symbol per node.',
+      inputSchema: {
+        projectRoot: z.string().describe('Absolute path to the project root'),
+        seeds: z.array(z.string()).min(1).max(20).describe('Starting symbol names to expand from'),
+        hops: z.number().int().min(1).max(3).optional().describe('How many hops to follow in each direction (default: 2)'),
+        direction: z.enum(['out', 'in', 'both']).optional().describe('Follow outbound calls, inbound callers, or both (default: both)'),
+        qdrantUrl: z.string().optional().describe('Qdrant URL (default: http://localhost:6333)'),
+      },
+    },
+    async ({ projectRoot, seeds, hops = 2, direction = 'both', qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      const graph = loadGraph(path.join(root, '.code-intelligence', 'graph.json'));
+
+      if (!graph) {
+        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      }
+
+      // BFS expansion
+      const discovered = new Set<string>(seeds);
+      const frontier = new Set<string>(seeds);
+
+      for (let hop = 0; hop < hops; hop++) {
+        const next = new Set<string>();
+        for (const sym of frontier) {
+          if (direction === 'out' || direction === 'both') {
+            for (const callee of (graph.symbols[sym] ?? [])) {
+              if (!discovered.has(callee)) { discovered.add(callee); next.add(callee); }
+            }
+          }
+          if (direction === 'in' || direction === 'both') {
+            for (const caller of (graph.callers?.[sym] ?? [])) {
+              if (!discovered.has(caller)) { discovered.add(caller); next.add(caller); }
+            }
+          }
+        }
+        frontier.clear();
+        next.forEach(s => frontier.add(s));
+        if (frontier.size === 0) break;
+      }
+
+      // Cap at 60 symbols to keep response manageable
+      const symbolList = [...discovered].slice(0, 60);
+      const capped = discovered.size > 60;
+
+      const qdrant = new QdrantClient({ url: qdrantUrl });
+      const collection = collectionName(root);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { points } = await qdrant.scroll(collection, {
+        filter: {
+          should: symbolList.map(s => ({ key: 'symbol', match: { value: s } })),
+        } as any,
+        with_payload: true,
+        with_vector: false,
+        limit: symbolList.length * 2,
+      });
+
+      const bySymbol = new Map<string, typeof points[0]>();
+      for (const p of points) {
+        const sym = p.payload!['symbol'] as string;
+        if (!bySymbol.has(sym)) bySymbol.set(sym, p); // first chunk wins
+      }
+
+      const sections: string[] = [
+        `**Subgraph: ${discovered.size} symbols reachable from [${seeds.join(', ')}]** (${hops}-hop ${direction})${capped ? ' — capped at 60' : ''}`,
+        '',
+      ];
+
+      // Output seeds first, then rest
+      const ordered = [...seeds, ...symbolList.filter(s => !seeds.includes(s))];
+      for (const sym of ordered) {
+        const p = bySymbol.get(sym);
+        const callees = graph.symbols[sym] ?? [];
+        const callers = graph.callers?.[sym] ?? [];
+        const file = p ? (p.payload!['file'] as string) : graph.symbolFile?.[sym] ?? '?';
+        const type = p ? (p.payload!['type'] as string) : 'unknown';
+        const code = p ? `\`\`\`\n${p.payload!['code'] as string}\n\`\`\`` : '*(code not in index)*';
+        sections.push([
+          `### ${sym} (${type}) — ${file}`,
+          callees.length ? `→ calls: ${callees.join(', ')}` : '',
+          callers.length ? `← calledBy: ${callers.join(', ')}` : '',
+          code,
+        ].filter(Boolean).join('\n'));
+      }
+
+      return { content: [{ type: 'text', text: sections.join('\n\n') }] };
     }
   );
 
