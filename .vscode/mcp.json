@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "code-intelligence": {
+      "type": "http",
+      "url": "http://localhost:3737/mcp"
+    }
+  }
+}

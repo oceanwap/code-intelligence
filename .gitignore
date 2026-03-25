@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.code-intelligence/
+*.env
+local_cache
