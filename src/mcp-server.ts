@@ -9,6 +9,7 @@ import { indexProject, queryProject } from './indexer-run.js';
 import { loadGraph } from './graph.js';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { collectionName } from './embedder.js';
+import { getDataDir, getCurrentBranch } from './git.js';
 
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
@@ -52,7 +53,7 @@ function createMcpServer(): McpServer {
       if (!results.length) {
         return { content: [{ type: 'text', text: 'No results found.' }] };
       }
-      const graphPath = path.join(root, '.code-intelligence', 'graph.json');
+      const graphPath = path.join(getDataDir(root), 'graph.json');
       const graph = loadGraph(graphPath);
       const output = results
         .map(r => {
@@ -85,12 +86,16 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot }) => {
       const root = path.resolve(projectRoot);
-      const dataDir = path.join(root, '.code-intelligence');
+      const branch = getCurrentBranch(root);
+      const dataDir = getDataDir(root);
       const manifestFile = path.join(dataDir, 'manifest.json');
       const graphFile = path.join(dataDir, 'graph.json');
 
       if (!fs.existsSync(manifestFile)) {
-        return { content: [{ type: 'text', text: `Not indexed.\nRun index_project on: ${root}` }] };
+        const msg = branch
+          ? `Not indexed on branch "${branch}".\nRun index_project on: ${root}`
+          : `Not indexed.\nRun index_project on: ${root}`;
+        return { content: [{ type: 'text', text: msg }] };
       }
 
       const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8')) as {
@@ -109,7 +114,8 @@ function createMcpServer(): McpServer {
         : 0;
 
       const lines = [
-        `Status: Indexed`,
+        `Status:  Indexed`,
+        ...(branch ? [`Branch:  ${branch}`] : []),
         `Files:   ${fileCount}`,
         `Chunks:  ${chunkCount}`,
         `Symbols: ${symbolCount}`,
@@ -132,7 +138,7 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, symbol, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = loadGraph(path.join(root, '.code-intelligence', 'graph.json'));
+      const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
       const qdrant = new QdrantClient({ url: qdrantUrl });
       const collection = collectionName(root);
 
@@ -181,7 +187,7 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, symbols, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = loadGraph(path.join(root, '.code-intelligence', 'graph.json'));
+      const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
       const qdrant = new QdrantClient({ url: qdrantUrl });
       const collection = collectionName(root);
 
@@ -251,7 +257,7 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, seeds, hops = 2, direction = 'both', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = loadGraph(path.join(root, '.code-intelligence', 'graph.json'));
+      const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
 
       if (!graph) {
         return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
@@ -341,7 +347,7 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, fileFilter }) => {
       const root = path.resolve(projectRoot);
-      const graph = loadGraph(path.join(root, '.code-intelligence', 'graph.json'));
+      const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
 
       if (!graph) {
         return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
@@ -400,7 +406,7 @@ function createMcpServer(): McpServer {
         return { content: [{ type: 'text', text: `No chunks found for "${file}". Path must be relative to project root.` }] };
       }
 
-      const graph = loadGraph(path.join(root, '.code-intelligence', 'graph.json'));
+      const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
       const output = points.map(p => {
         const symbol = p.payload!['symbol'] as string;
         const type = p.payload!['type'] as string;

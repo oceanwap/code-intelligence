@@ -6,6 +6,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import type { CodeChunk } from './indexer.js';
 import { toUUID } from './indexer.js';
+import { getCurrentBranch } from './git.js';
 
 const VECTOR_SIZE = 384; // BGE-small-en-v1.5 (local, no API key, ~33 MB, ~3x faster than base)
 
@@ -49,11 +50,17 @@ export async function embedQuery(text: string): Promise<number[]> {
   return Array.from(await model.queryEmbed(text));
 }
 
-// Each project gets its own Qdrant collection, scoped by root path hash
+// Each project+branch gets its own Qdrant collection so switching branches
+// never serves stale embeddings from a different branch's index.
+// Non-git projects are scoped by root path only (no branch component).
 export function collectionName(projectRoot: string): string {
+  const branch = getCurrentBranch(path.resolve(projectRoot));
+  const key = branch !== null
+    ? path.resolve(projectRoot) + '\n' + branch
+    : path.resolve(projectRoot);
   const hash = crypto
     .createHash('sha256')
-    .update(path.resolve(projectRoot))
+    .update(key)
     .digest('hex')
     .slice(0, 8);
   return `code-${hash}`;

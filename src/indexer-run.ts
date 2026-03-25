@@ -4,6 +4,7 @@ import { indexDirectory, buildManifest, loadManifest, saveManifest } from './ind
 import { embedAndStore, deletePoints, deleteOrphanPoints } from './embedder.js';
 import { buildGraph, saveGraph } from './graph.js';
 import { retrieve, type RetrievedChunk } from './retriever.js';
+import { getDataDir } from './git.js';
 
 export interface IndexResult {
   chunks: number;
@@ -29,7 +30,7 @@ export async function indexProject(
   onProgress?: ProgressCallback
 ): Promise<IndexResult> {
   const root = path.resolve(projectRoot);
-  const dataDir = path.join(root, '.code-intelligence');
+  const dataDir = getDataDir(root);
   const manifestFile = path.join(dataDir, 'manifest.json');
   const cacheFile = path.join(dataDir, 'cache.json');
 
@@ -90,6 +91,6 @@ export async function queryProject(
   qdrantUrl = 'http://localhost:6333'
 ): Promise<RetrievedChunk[]> {
   const root = path.resolve(projectRoot);
-  const graphPath = path.join(root, '.code-intelligence', 'graph.json');
+  const graphPath = path.join(getDataDir(root), 'graph.json');
   return retrieve(question, root, graphPath, qdrantUrl);
 }
