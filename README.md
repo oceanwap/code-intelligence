@@ -13,6 +13,7 @@ No cloud APIs, no API keys. Everything runs on your machine.
 - **Call graph** — builds outbound + inbound call edges across all symbols so retrieval can follow dependencies
 - **Differential indexing** — only re-embeds files that changed since the last run (manifest + mtime tracking)
 - **Plain-file indexing** — also indexes `.json`, `.yaml`, `.md`, `Dockerfile`, etc. as whole-file chunks
+- **Offline project memory** — derives semantic change memory from local git history and semantic fact memory from README/docs/notes without external AI APIs
 - **MCP server** — exposes tools that VS Code Copilot agent can call to explore any indexed project
 
 ---
@@ -88,11 +89,23 @@ code-intel index . --qdrant http://localhost:6333
 code-intel query "..." --dir . --qdrant http://localhost:6333
 ```
 
+### Project status and history
+
+```bash
+code-intel status --dir .
+code-intel features --dir .
+code-intel changes --dir . --limit 10
+code-intel changes --dir . --type fix --topic auth
+code-intel memory-query "what changed in caching recently" --dir .
+```
+
+Project-memory entries are built locally from recent git history plus markdown/text docs. For supported languages, changed hunks are mapped to impacted symbols so history is stored as semantic impact instead of raw line diffs. Document memory is section-based, so README/docs/ADR-style files become searchable project facts. The initial implementation indexes the most recent 150 commits per branch.
+
 ---
 
 ## MCP Server
 
-The MCP server exposes 6 tools to VS Code Copilot agent.
+The MCP server exposes code-intelligence tools for both code memory and project memory.
 
 ### Start the server
 
@@ -110,6 +123,10 @@ Runs on `http://localhost:3737/mcp`.
 | ----------------- | ------------------------------------------------------------------------------------ |
 | `index_project`   | Parse and index a codebase. Runs differential update — only re-embeds changed files. |
 | `index_status`    | Check if a project is indexed and show stats (chunks, symbols, call graph edges).    |
+| `project_status`  | Show an engineer-style status snapshot: branch, latest change, active topics, fixes. |
+| `feature_map`     | Show documented features and architecture facts from offline document memory.         |
+| `recent_changes`  | Show recent semantic changes from offline project memory.                             |
+| `query_project_memory` | Semantic search over local git-derived project memory.                          |
 | `query_project`   | Semantic search with natural language. Returns code + file + call graph context.     |
 | `get_symbol`      | Look up a specific symbol by name — returns source, callers, and callees.            |
 | `list_symbols`    | List all symbols grouped by file. Supports file path filter.                         |
@@ -159,10 +176,13 @@ With the server running, VS Code Copilot agent can call these tools automaticall
 | Location                                     | Contents                                                    |
 | -------------------------------------------- | ----------------------------------------------------------- |
 | `~/.cache/code-intelligence/models/`         | BGE embedding model (shared, downloaded once)               |
-| `<project>/.code-intelligence/manifest.json` | File mtimes + chunk IDs (differential indexing state)       |
-| `<project>/.code-intelligence/cache.json`    | Embedding vector cache (avoid re-embedding unchanged files) |
-| `<project>/.code-intelligence/graph.json`    | Call graph: symbols → callees, callers, file locations      |
+| `<project>/.code-intelligence/<branch>/manifest.json` | File mtimes + chunk IDs (differential indexing state) |
+| `<project>/.code-intelligence/<branch>/cache.json`    | Embedding vector cache (avoid re-embedding unchanged files) |
+| `<project>/.code-intelligence/<branch>/graph.json`    | Call graph: symbols → callees, callers, file locations |
+| `<project>/.code-intelligence/<branch>/project-memory.json` | Offline semantic project memory derived from git history |
+| `<project>/.code-intelligence/<branch>/project-memory-cache.json` | Embedding cache for project-memory entries |
 | Qdrant collection `code-<hash>`              | Vector embeddings + payloads, one collection per project    |
+| Qdrant collection `memory-<hash>`            | Semantic embeddings for project-memory entries              |
 
 Add `.code-intelligence` to your project's `.gitignore`.
 
@@ -171,6 +191,9 @@ Add `.code-intelligence` to your project's `.gitignore`.
 ## Development
 
 ```bash
+# Run tests
+npm test
+
 # Type-check
 npm run typecheck
 

@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import { indexDirectory, buildManifest, loadManifest, saveManifest } from './indexer.js';
 import { embedAndStore, deletePoints, deleteOrphanPoints } from './embedder.js';
 import { buildGraph, saveGraph } from './graph.js';
+import { syncProjectMemory } from './project-memory.js';
 import { retrieve, type RetrievedChunk } from './retriever.js';
 import { getDataDir } from './git.js';
 
@@ -12,6 +13,9 @@ export interface IndexResult {
   files: number;
   staleRemoved: number;
   orphansRemoved: number;
+  memoryEntries: number;
+  newMemoryEntries: number;
+  staleMemoryRemoved: number;
 }
 
 export type ProgressCallback = (
@@ -71,6 +75,7 @@ export async function indexProject(
   }
 
   await embedAndStore(chunks, cacheFile, root, qdrantUrl, onProgress);
+  const memory = await syncProjectMemory(root, qdrantUrl);
 
   saveManifest(newManifest, manifestFile);
 
@@ -80,6 +85,9 @@ export async function indexProject(
     files: Object.keys(graph.files).length,
     staleRemoved,
     orphansRemoved,
+    memoryEntries: memory.totalEntries,
+    newMemoryEntries: memory.newEntries,
+    staleMemoryRemoved: memory.staleRemoved,
   };
 }
 

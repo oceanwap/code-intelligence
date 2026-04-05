@@ -7,9 +7,24 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { indexProject, queryProject } from './indexer-run.js';
 import { loadGraph } from './graph.js';
+import {
+  getFeatureMap,
+  getProjectMemoryCount,
+  getProjectStatus,
+  listRecentChanges,
+  queryProjectMemory,
+  renderFeatureMap,
+  renderMemoryQueryResults,
+  renderProjectStatus,
+  renderRecentChanges,
+  syncProjectMemory,
+} from './project-memory.js';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { collectionName } from './embedder.js';
 import { getDataDir, getCurrentBranch } from './git.js';
+
+const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositories, indexes and project memory are branch-scoped, so check status or re-index after switching branches.';
+const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
 
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
@@ -17,10 +32,10 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'index_project',
     {
-      description: 'Parse and index a codebase using ts-morph AST. Stores embeddings in Qdrant and builds a dependency graph. Must be run before querying.',
+      description: 'First tool to call for a repo or branch that may not be indexed yet. Parses code, stores code embeddings, builds the call graph, and refreshes offline project memory from git history and docs. Re-run after meaningful file changes or branch switches. Typical workflow: index_project -> index_status or project_status -> feature_map/query_project/query_project_memory -> get_symbol/get_symbols/expand_graph/get_file_chunks.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root to index'),
-        qdrantUrl: z.string().optional().describe('Qdrant server URL (default: http://localhost:6333)'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
     async ({ projectRoot, qdrantUrl = 'http://localhost:6333' }) => {
@@ -30,9 +45,12 @@ function createMcpServer(): McpServer {
         `Indexed ${result.chunks} chunks from ${root}`,
         `Symbols in graph: ${result.symbols}`,
         `Files in graph: ${result.files}`,
+        `Project memory entries: ${result.memoryEntries}`,
       ];
       if (result.staleRemoved > 0) lines.push(`Removed ${result.staleRemoved} stale chunk(s)`);
       if (result.orphansRemoved > 0) lines.push(`Removed ${result.orphansRemoved} orphaned chunk(s)`);
+      if (result.newMemoryEntries > 0) lines.push(`Added ${result.newMemoryEntries} new project-memory entr${result.newMemoryEntries === 1 ? 'y' : 'ies'}`);
+      if (result.staleMemoryRemoved > 0) lines.push(`Removed ${result.staleMemoryRemoved} stale project-memory entr${result.staleMemoryRemoved === 1 ? 'y' : 'ies'}`);
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
   );
@@ -40,11 +58,11 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'query_project',
     {
-      description: 'Search an indexed codebase with a natural language question. Returns relevant functions/classes with file paths and scores.',
+      description: 'Use for implementation questions about code behavior, ownership, data flow, or where logic lives. This is the main semantic code-search entry point and returns ranked code plus graph-expanded related symbols. Prefer query_project_memory for history, status, bug timeline, or document questions. Typical follow-up: get_symbol for one result, get_symbols for several, expand_graph for an execution path, or get_file_chunks for a whole file.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root (must be indexed first)'),
-        question: z.string().describe('Natural language question about the codebase'),
-        qdrantUrl: z.string().optional().describe('Qdrant server URL (default: http://localhost:6333)'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        question: z.string().describe('Natural language implementation question about the codebase, for example "how does authentication work" or "where is rate limiting applied".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
     async ({ projectRoot, question, qdrantUrl = 'http://localhost:6333' }) => {
@@ -79,9 +97,9 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'index_status',
     {
-      description: 'Check whether a project has been indexed and show stats (chunks, symbols, call graph edges). Call this before query_project to confirm the project is ready, or to decide if re-indexing is needed.',
+      description: 'Lightweight readiness check. Use this before exploration when you are not sure the current branch is indexed, or when results may be stale after branch/file changes. If the project is not indexed, call index_project next. If it is indexed, choose project_status for a current-state summary, feature_map for high-level project understanding, query_project for code questions, or query_project_memory for history/status questions.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
       },
     },
     async ({ projectRoot }) => {
@@ -120,8 +138,88 @@ function createMcpServer(): McpServer {
         `Chunks:  ${chunkCount}`,
         `Symbols: ${symbolCount}`,
         `Call graph edges: ${edgeCount}`,
+        `Project memory entries: ${getProjectMemoryCount(root)}`,
       ];
       return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
+  server.registerTool(
+    'project_status',
+    {
+      description: 'Best first read-only project-memory tool after indexing. Use this for an engineer-style snapshot of the current branch: latest change, dirty files, active topics, and recent fixes. Prefer this over query_project when the question is "what is going on in this project right now" rather than "how is this implemented". Common next steps: recent_changes for a timeline, feature_map for capabilities/architecture, or query_project/query_project_memory for deeper investigation.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const status = getProjectStatus(root);
+      if (!status) {
+        return { content: [{ type: 'text', text: 'No project memory found. Run index_project first.' }] };
+      }
+      return { content: [{ type: 'text', text: renderProjectStatus(status) }] };
+    }
+  );
+
+  server.registerTool(
+    'recent_changes',
+    {
+      description: 'Use for timeline-style questions such as "what changed recently", "recent fixes in auth", or "show refactors touching caching". Results come from offline project memory built from git history and are summarized by impacted symbols, files, and topics instead of raw diffs. This is usually the right follow-up after project_status when you want a chronological view.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        limit: z.number().int().min(1).max(25).optional().describe('Number of recent changes to return (default: 10)'),
+        type: z.enum(['feature', 'fix', 'refactor', 'docs', 'test', 'ops', 'chore']).optional().describe('Optional change-type filter. Use this to narrow history to fixes, features, refactors, docs, tests, ops, or chores.'),
+        topic: z.string().optional().describe('Optional topic filter, for example "auth", "cache", or "deployment". Useful when you already know the feature area.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, limit = 10, type, topic, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const entries = listRecentChanges(root, { limit, type, topic });
+      return { content: [{ type: 'text', text: renderRecentChanges(entries) }] };
+    }
+  );
+
+  server.registerTool(
+    'feature_map',
+    {
+      description: 'Use this to understand what the project does at a high level before diving into code. It prioritizes documented features, architecture, storage layout, supported languages, and recent feature-oriented changes from offline document memory. Prefer this over query_project when the question is about capabilities or system shape rather than implementation details.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const featureMap = getFeatureMap(root);
+      if (!featureMap) {
+        return { content: [{ type: 'text', text: 'No project memory found. Run index_project first.' }] };
+      }
+      return { content: [{ type: 'text', text: renderFeatureMap(featureMap) }] };
+    }
+  );
+
+  server.registerTool(
+    'query_project_memory',
+    {
+      description: 'Semantic search over offline project memory, which combines git-derived change memory with document-derived project facts. Use this for questions about history, status, rationale, features, architecture, or recent bugs, for example "what changed in auth recently", "why was caching touched", or "what does this project do". Prefer query_project for source-level implementation questions.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        question: z.string().describe('Natural language question about project history, status, rationale, or documented facts.'),
+        limit: z.number().int().min(1).max(10).optional().describe('Number of matching memory entries to return (default: 5)'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, question, limit = 5, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const hits = await queryProjectMemory(root, question, qdrantUrl, limit);
+      return { content: [{ type: 'text', text: renderMemoryQueryResults(hits) }] };
     }
   );
 
@@ -129,11 +227,11 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'get_symbol',
     {
-      description: 'Retrieve the full source code and call graph context for a specific named symbol (function, class, or method). Returns code, file path, symbols it calls, and symbols that call it. Use after query_project to drill into a result, or when you know a symbol name.',
+      description: 'Precision drilldown for one exact symbol. Use this after query_project when a specific function, class, or method looks relevant, or when you already know the symbol name. Returns source plus inbound and outbound graph context. If you have several symbols to inspect, prefer get_symbols to avoid repeated round trips.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root'),
-        symbol: z.string().describe('Symbol name to look up, e.g. "handleRequest", "AuthService", "AuthService.login"'),
-        qdrantUrl: z.string().optional().describe('Qdrant URL (default: http://localhost:6333)'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbol: z.string().describe('Exact symbol name to look up, for example "handleRequest", "AuthService", or "AuthService.login". Best used with a symbol name taken from query_project, list_symbols, or expand_graph output.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
     async ({ projectRoot, symbol, qdrantUrl = 'http://localhost:6333' }) => {
@@ -178,11 +276,11 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'get_symbols',
     {
-      description: 'Retrieve source code and call graph context for multiple named symbols in a single call. Use instead of calling get_symbol repeatedly when you have a list of callees/callers to inspect. Returns code, file, calls, and calledBy for each symbol.',
+      description: 'Batch drilldown for multiple exact symbols. Use this when query_project, get_symbol, or expand_graph gives you a list of callers/callees that you want to inspect together. This is more efficient than repeated get_symbol calls and is the right tool for comparing several related symbols at once.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root'),
-        symbols: z.array(z.string()).min(1).max(50).describe('Array of symbol names to look up, e.g. ["handleRequest", "AuthService.login"]'),
-        qdrantUrl: z.string().optional().describe('Qdrant URL (default: http://localhost:6333)'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbols: z.array(z.string()).min(1).max(50).describe('Array of exact symbol names to inspect, for example ["handleRequest", "AuthService.login"]. Usually taken from query_project, get_symbol, or expand_graph output.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
     async ({ projectRoot, symbols, qdrantUrl = 'http://localhost:6333' }) => {
@@ -246,13 +344,13 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'expand_graph',
     {
-      description: 'Given a set of seed symbols, return the full N-hop call subgraph with code for every reachable symbol — both outbound (callees) and inbound (callers). Use to understand an entire execution path or module boundary in one shot, instead of iterating get_symbol per node.',
+      description: 'Use this when you need execution-path or dependency context around one or a few seed symbols. It expands the call graph outward, inward, or both, and returns reachable symbols with code. Prefer this over repeated get_symbol calls when tracing a flow through a subsystem. Start with 1-2 hops unless you intentionally want a wider boundary view.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root'),
-        seeds: z.array(z.string()).min(1).max(20).describe('Starting symbol names to expand from'),
-        hops: z.number().int().min(1).max(3).optional().describe('How many hops to follow in each direction (default: 2)'),
-        direction: z.enum(['out', 'in', 'both']).optional().describe('Follow outbound calls, inbound callers, or both (default: both)'),
-        qdrantUrl: z.string().optional().describe('Qdrant URL (default: http://localhost:6333)'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        seeds: z.array(z.string()).min(1).max(20).describe('Exact starting symbol names to expand from. Usually taken from query_project or get_symbol output.'),
+        hops: z.number().int().min(1).max(3).optional().describe('How many hops to follow in each direction (default: 2). Use 1 for tight traces and 2 for a broader module view.'),
+        direction: z.enum(['out', 'in', 'both']).optional().describe('Follow outbound calls, inbound callers, or both (default: both). Use out for downstream effects, in for upstream entry points, and both for general reasoning.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
     async ({ projectRoot, seeds, hops = 2, direction = 'both', qdrantUrl = 'http://localhost:6333' }) => {
@@ -339,10 +437,10 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'list_symbols',
     {
-      description: 'List all indexed symbols (functions, classes, methods) grouped by file. Optionally filter by file path substring. Use to orient yourself in a codebase before querying, or to find all entry points in a module.',
+      description: 'Orientation tool for seeing the indexed API surface grouped by file. Use this when you know the module area but not the exact symbol names yet, or when you want entry points before using get_symbol/get_symbols/expand_graph. It is especially useful with fileFilter for narrowing to one subsystem such as auth, api, or graph.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root'),
-        fileFilter: z.string().optional().describe('Only show symbols from files whose path contains this string (e.g. "auth" or "src/api")'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        fileFilter: z.string().optional().describe('Only show symbols from files whose path contains this string, for example "auth" or "src/api". Use this to narrow orientation to one module.'),
       },
     },
     async ({ projectRoot, fileFilter }) => {
@@ -382,11 +480,11 @@ function createMcpServer(): McpServer {
   server.registerTool(
     'get_file_chunks',
     {
-      description: 'Get all indexed chunks (functions, classes, methods) from a specific file. Use to see the full API surface of a file when you know its path.',
+      description: 'File-level drilldown. Use this when you already know a file path and want the full indexed API surface in one call, including each symbol and its local graph context. Prefer this over query_project when the file is known and you need a compact file summary before reading specific symbols.',
       inputSchema: {
-        projectRoot: z.string().describe('Absolute path to the project root'),
-        file: z.string().describe('Relative file path within the project root, e.g. "src/auth/service.ts"'),
-        qdrantUrl: z.string().optional().describe('Qdrant URL (default: http://localhost:6333)'),
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        file: z.string().describe('Relative file path within the project root, for example "src/auth/service.ts". Use a repo-relative path, not an absolute path.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
     async ({ projectRoot, file, qdrantUrl = 'http://localhost:6333' }) => {

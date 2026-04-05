@@ -8,7 +8,9 @@ import type { CodeChunk } from './indexer.js';
 import { toUUID } from './indexer.js';
 import { getCurrentBranch } from './git.js';
 
-const VECTOR_SIZE = 384; // BGE-small-en-v1.5 (local, no API key, ~33 MB, ~3x faster than base)
+export const VECTOR_SIZE = 384; // BGE-small-en-v1.5 (local, no API key, ~33 MB, ~3x faster than base)
+const UPSERT_BATCH_SIZE = 25;
+const MAX_UPSERT_RETRIES = 3;
 
 // Store the model in a shared user-level cache so it is downloaded only once
 // regardless of which directory `code-intel` is run from.
@@ -50,10 +52,30 @@ export async function embedQuery(text: string): Promise<number[]> {
   return Array.from(await model.queryEmbed(text));
 }
 
+async function wait(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function upsertWithRetry(
+  qdrant: QdrantClient,
+  collection: string,
+  points: Array<{ id: string; vector: number[]; payload: Record<string, unknown> }>
+): Promise<void> {
+  for (let attempt = 1; attempt <= MAX_UPSERT_RETRIES; attempt++) {
+    try {
+      await qdrant.upsert(collection, { points });
+      return;
+    } catch (error) {
+      if (attempt === MAX_UPSERT_RETRIES) throw error;
+      await wait(200 * attempt);
+    }
+  }
+}
+
 // Each project+branch gets its own Qdrant collection so switching branches
 // never serves stale embeddings from a different branch's index.
 // Non-git projects are scoped by root path only (no branch component).
-export function collectionName(projectRoot: string): string {
+export function scopedCollectionName(projectRoot: string, scope: 'code' | 'memory'): string {
   const branch = getCurrentBranch(path.resolve(projectRoot));
   const key = branch !== null
     ? path.resolve(projectRoot) + '\n' + branch
@@ -63,7 +85,11 @@ export function collectionName(projectRoot: string): string {
     .update(key)
     .digest('hex')
     .slice(0, 8);
-  return `code-${hash}`;
+  return `${scope}-${hash}`;
+}
+
+export function collectionName(projectRoot: string): string {
+  return scopedCollectionName(projectRoot, 'code');
 }
 
 export async function embedAndStore(
@@ -136,10 +162,10 @@ export async function embedAndStore(
     });
   }
 
-  // Upsert in batches of 100
-  for (let i = 0; i < points.length; i += 100) {
-    await qdrant.upsert(collection, { points: points.slice(i, i + 100) });
-    onProgress?.('storing', Math.min(i + 100, points.length), points.length);
+  // Upsert in smaller batches with retry to avoid transient socket closures.
+  for (let i = 0; i < points.length; i += UPSERT_BATCH_SIZE) {
+    await upsertWithRetry(qdrant, collection, points.slice(i, i + UPSERT_BATCH_SIZE));
+    onProgress?.('storing', Math.min(i + UPSERT_BATCH_SIZE, points.length), points.length);
   }
 
   if (points.length > 0) {
