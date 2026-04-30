@@ -313,10 +313,18 @@ function buildCommitEntry(projectRoot: string, commit: GitCommitMetadata): Chang
     return entry;
 }
 
-async function ensureMemoryCollection(projectRoot: string, qdrantUrl: string): Promise<QdrantClient> {
+interface MemoryCollectionState {
+    qdrant: QdrantClient;
+    needsFullSync: boolean;
+    cacheInvalidated: boolean;
+}
+
+async function ensureMemoryCollection(projectRoot: string, qdrantUrl: string): Promise<MemoryCollectionState> {
     const qdrant = new QdrantClient({ url: qdrantUrl });
     const collection = memoryCollectionName(projectRoot);
     const existing = await qdrant.getCollections();
+    let needsFullSync = false;
+    let cacheInvalidated = false;
 
     if (existing.collections.find(item => item.name === collection)) {
         const info = await qdrant.getCollection(collection);
@@ -326,14 +334,17 @@ async function ensureMemoryCollection(projectRoot: string, qdrantUrl: string): P
             await qdrant.createCollection(collection, {
                 vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
             });
+            needsFullSync = true;
+            cacheInvalidated = true;
         }
     } else {
         await qdrant.createCollection(collection, {
             vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
         });
+        needsFullSync = true;
     }
 
-    return qdrant;
+    return { qdrant, needsFullSync, cacheInvalidated };
 }
 
 async function upsertWithRetry(
@@ -364,9 +375,9 @@ async function upsertMemoryEntries(
 ): Promise<number> {
     if (entries.length === 0) return 0;
 
-    const qdrant = await ensureMemoryCollection(projectRoot, qdrantUrl);
+    const { qdrant, needsFullSync, cacheInvalidated } = await ensureMemoryCollection(projectRoot, qdrantUrl);
     const collection = memoryCollectionName(projectRoot);
-    const cache = loadMemoryCache(cacheFile);
+    const cache = cacheInvalidated ? {} : loadMemoryCache(cacheFile);
     const uncached = entries.filter(entry => !cache[entry.id]);
 
     if (uncached.length > 0) {
@@ -377,7 +388,8 @@ async function upsertMemoryEntries(
         saveMemoryCache(cacheFile, cache);
     }
 
-    const points = uncached.map(entry => ({
+    const entriesToStore = needsFullSync ? entries : uncached;
+    const points = entriesToStore.map(entry => ({
         id: memoryPointId(entry.id),
         vector: cache[entry.id],
         payload: {
@@ -415,7 +427,7 @@ async function deleteStaleMemoryEntries(
     for (const id of staleIds) delete cache[id];
     saveMemoryCache(cacheFile, cache);
 
-    const qdrant = await ensureMemoryCollection(projectRoot, qdrantUrl);
+    const { qdrant } = await ensureMemoryCollection(projectRoot, qdrantUrl);
     await qdrant.delete(memoryCollectionName(projectRoot), {
         points: staleIds.map(memoryPointId),
     });
@@ -511,7 +523,7 @@ export async function queryProjectMemory(
     const snapshot = loadMemorySnapshot(root);
     if (!snapshot || snapshot.entries.length === 0) return [];
 
-    const qdrant = await ensureMemoryCollection(root, qdrantUrl);
+    const { qdrant } = await ensureMemoryCollection(root, qdrantUrl);
     const hits = await qdrant.search(memoryCollectionName(root), {
         vector: await embedQuery(question),
         limit: Math.max(limit * 2, 10),

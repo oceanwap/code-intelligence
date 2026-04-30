@@ -56,6 +56,51 @@ async function wait(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function qdrantCollectionExists(qdrant: QdrantClient, collection: string): Promise<boolean> {
+  const existing = await qdrant.getCollections();
+  return existing.collections.some(item => item.name === collection);
+}
+
+function isMissingCollectionError(error: unknown): boolean {
+  const candidate = error as {
+    status?: number;
+    message?: string;
+    data?: { status?: { error?: string } };
+  };
+  const detail = `${candidate.message ?? ''}\n${candidate.data?.status?.error ?? ''}`.toLowerCase();
+  return candidate.status === 404 && detail.includes('collection') && detail.includes("doesn't exist");
+}
+
+function clearCache(cache: Record<string, number[]>, cacheFile: string): void {
+  Object.keys(cache).forEach(key => delete cache[key]);
+  if (fs.existsSync(cacheFile)) fs.unlinkSync(cacheFile);
+}
+
+function pruneInvalidVectors(cache: Record<string, number[]>, cacheFile: string): void {
+  let changed = false;
+  for (const [id, vector] of Object.entries(cache)) {
+    if (vector.length !== VECTOR_SIZE) {
+      delete cache[id];
+      changed = true;
+    }
+  }
+  if (changed && fs.existsSync(cacheFile)) fs.writeFileSync(cacheFile, JSON.stringify(cache));
+}
+
+async function deleteQdrantPoints(
+  qdrant: QdrantClient,
+  collection: string,
+  pointIds: string[]
+): Promise<void> {
+  if (!(await qdrantCollectionExists(qdrant, collection))) return;
+  try {
+    await qdrant.delete(collection, { points: pointIds });
+  } catch (error) {
+    if (isMissingCollectionError(error)) return;
+    throw error;
+  }
+}
+
 async function upsertWithRetry(
   qdrant: QdrantClient,
   collection: string,
@@ -106,8 +151,10 @@ export async function embedAndStore(
   const cache: Record<string, number[]> = fs.existsSync(cacheFile)
     ? (JSON.parse(fs.readFileSync(cacheFile, 'utf-8')) as Record<string, number[]>)
     : {};
+  pruneInvalidVectors(cache, cacheFile);
 
   const existing = await qdrant.getCollections();
+  let collectionNeedsFullSync = false;
   if (existing.collections.find(c => c.name === collection)) {
     // Recreate collection if vector size changed (e.g. model switch)
     const info = await qdrant.getCollection(collection);
@@ -115,17 +162,17 @@ export async function embedAndStore(
     if (dim !== undefined && dim !== VECTOR_SIZE) {
       console.log(`Collection dim mismatch (${dim} → ${VECTOR_SIZE}), recreating...`);
       await qdrant.deleteCollection(collection);
-      // Also invalidate cache since old vectors are wrong size
-      if (fs.existsSync(cacheFile)) fs.unlinkSync(cacheFile);
-      Object.keys(cache).forEach(k => delete cache[k]);
+      clearCache(cache, cacheFile);
       await qdrant.createCollection(collection, {
         vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
       });
+      collectionNeedsFullSync = true;
     }
   } else {
     await qdrant.createCollection(collection, {
       vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
     });
+    collectionNeedsFullSync = true;
   }
 
   const points: Array<{
@@ -148,10 +195,12 @@ export async function embedAndStore(
   // Only upsert newly-embedded chunks — unchanged chunks are already in Qdrant
   const newlyEmbedded = new Set(uncached.map(c => c.id));
   for (const chunk of chunks) {
-    if (!newlyEmbedded.has(chunk.id)) continue;
+    if (!collectionNeedsFullSync && !newlyEmbedded.has(chunk.id)) continue;
+    const vector = cache[chunk.id];
+    if (!vector) throw new Error(`Missing embedding vector for chunk ${chunk.id}`);
     points.push({
       id: toUUID(chunk.id),
-      vector: cache[chunk.id],
+      vector,
       payload: {
         file: chunk.file,
         symbol: chunk.symbol,
@@ -194,7 +243,7 @@ export async function deletePoints(
   }
 
   // Delete from Qdrant
-  await qdrant.delete(collection, { points: chunkIds.map(toUUID) });
+  await deleteQdrantPoints(qdrant, collection, chunkIds.map(toUUID));
 }
 
 /**
@@ -243,7 +292,7 @@ export async function deleteOrphanPoints(
       for (const id of orphanIds) delete cache[id];
       fs.writeFileSync(cacheFile, JSON.stringify(cache));
     }
-    await qdrant.delete(collection, { points: orphanIds.map(toUUID) });
+    await deleteQdrantPoints(qdrant, collection, orphanIds.map(toUUID));
   }
 
   return orphanIds.length;
