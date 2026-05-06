@@ -81,3 +81,30 @@ test('buildDocumentEntries classifies changelog files from their path', t => {
     assert.equal(releaseEntry.docType, 'changelog');
     assert.ok(releaseEntry.summary.includes('offline project memory'));
 });
+
+test('buildDocumentEntries stores a compact body excerpt instead of the full section', t => {
+    const dir = makeTempDir(t);
+    fs.writeFileSync(
+        path.join(dir, 'README.md'),
+        [
+            '# Product Brain',
+            '',
+            '## Deep Dive',
+            '',
+            'First important line about retrieval quality.',
+            'Second important line about project memory.',
+            'Third important line about graph context.',
+            'Fourth important line about explainable ranking.',
+            'Fifth appendix line that should not stay in stored body.',
+            '',
+        ].join('\n')
+    );
+
+    const entries = buildDocumentEntries(dir);
+    const deepDive = entries.find(entry => entry.title === 'Deep Dive');
+
+    assert.ok(deepDive);
+    assert.ok(deepDive.body.includes('First important line about retrieval quality'));
+    assert.ok(deepDive.body.includes('Fourth important line about explainable ranking'));
+    assert.ok(!deepDive.body.includes('Fifth appendix line that should not stay in stored body'));
+});

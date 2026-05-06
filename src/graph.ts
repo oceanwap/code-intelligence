@@ -13,9 +13,63 @@ export interface GraphData {
   files: Record<string, string[]>;
   /** symbol name → relative file path it lives in */
   symbolFile: Record<string, string>;
+  /** type/interface symbol name → direct supertypes it extends or implements */
+  supertypes: Record<string, string[]>;
+  /** type/interface symbol name → direct known subtypes or implementers */
+  subtypes: Record<string, string[]>;
+  /** symbol name → concrete symbols that implement or override it */
+  implementations: Record<string, string[]>;
+  /** symbol name → base symbols it implements or overrides */
+  implementedFrom: Record<string, string[]>;
 }
 
 type FnLike = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
+
+type TypeMembers = Record<string, Set<string>>;
+
+function addUnique(target: Record<string, string[]>, key: string, value: string): void {
+  if (!key || !value) return;
+  const entries = (target[key] ??= []);
+  if (!entries.includes(value)) entries.push(value);
+}
+
+function normalizeTypeName(name: string | null | undefined): string | null {
+  if (!name) return null;
+  const normalized = name.trim().replace(/^typeof\s+/, '');
+  return normalized || null;
+}
+
+function directTypeReferences(values: Array<string | null | undefined>): string[] {
+  const refs = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizeTypeName(value);
+    if (normalized) refs.add(normalized);
+  }
+  return [...refs];
+}
+
+function collectAllSupertypes(typeName: string, directSupertypes: Record<string, string[]>, seen = new Set<string>()): string[] {
+  for (const supertype of directSupertypes[typeName] ?? []) {
+    if (seen.has(supertype)) continue;
+    seen.add(supertype);
+    collectAllSupertypes(supertype, directSupertypes, seen);
+  }
+  return [...seen];
+}
+
+function registerSupertypes(graph: GraphData, typeName: string, supertypes: string[]): void {
+  if (supertypes.length > 0) {
+    graph.supertypes[typeName] = supertypes;
+  }
+  for (const supertype of supertypes) {
+    addUnique(graph.subtypes, supertype, typeName);
+  }
+}
+
+function registerImplementation(graph: GraphData, baseSymbol: string, implementationSymbol: string): void {
+  addUnique(graph.implementations, baseSymbol, implementationSymbol);
+  addUnique(graph.implementedFrom, implementationSymbol, baseSymbol);
+}
 
 /** Extract a display name for any function-like node */
 function getFnName(node: FnLike, parentName?: string): string | null {
@@ -84,7 +138,14 @@ export function buildGraph(rootDir: string): GraphData {
     callers: Object.create(null) as Record<string, string[]>,
     files: Object.create(null) as Record<string, string[]>,
     symbolFile: Object.create(null) as Record<string, string>,
+    supertypes: Object.create(null) as Record<string, string[]>,
+    subtypes: Object.create(null) as Record<string, string[]>,
+    implementations: Object.create(null) as Record<string, string[]>,
+    implementedFrom: Object.create(null) as Record<string, string[]>,
   };
+
+  const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
+  const typeNames = new Set<string>();
 
   for (const sf of project.getSourceFiles()) {
     const relPath = path.relative(rootDir, sf.getFilePath());
@@ -92,6 +153,20 @@ export function buildGraph(rootDir: string): GraphData {
     graph.files[relPath] = sf
       .getImportDeclarations()
       .map(d => d.getModuleSpecifierValue());
+
+    for (const iface of sf.getInterfaces()) {
+      const interfaceName = iface.getName();
+      if (!interfaceName) continue;
+
+      graph.symbolFile[interfaceName] = relPath;
+      typeNames.add(interfaceName);
+      typeMembers[interfaceName] = new Set(iface.getMethods().map(method => method.getName()));
+      registerSupertypes(
+        graph,
+        interfaceName,
+        directTypeReferences(iface.getExtends().map(expr => expr.getExpression().getText()))
+      );
+    }
 
     // Collect all function-like nodes: declarations, arrow fns, methods
     const fnNodes: FnLike[] = [
@@ -115,6 +190,35 @@ export function buildGraph(rootDir: string): GraphData {
         if (!graph.callers[callee].includes(name)) {
           graph.callers[callee].push(name);
         }
+      }
+    }
+
+    for (const cls of sf.getClasses()) {
+      const className = cls.getName();
+      if (!className) continue;
+
+      typeNames.add(className);
+      typeMembers[className] = new Set(cls.getMethods().map(method => method.getName()));
+      const directSupertypes = directTypeReferences([
+        cls.getExtends()?.getExpression().getText(),
+        ...cls.getImplements().map(expr => expr.getExpression().getText()),
+      ]);
+      registerSupertypes(graph, className, directSupertypes);
+    }
+  }
+
+  for (const typeName of typeNames) {
+    const allSupertypes = collectAllSupertypes(typeName, graph.supertypes);
+
+    for (const supertype of allSupertypes) {
+      registerImplementation(graph, supertype, typeName);
+    }
+
+    for (const memberName of typeMembers[typeName] ?? []) {
+      const implementationSymbol = `${typeName}.${memberName}`;
+      for (const supertype of allSupertypes) {
+        if (!(typeMembers[supertype]?.has(memberName))) continue;
+        registerImplementation(graph, `${supertype}.${memberName}`, implementationSymbol);
       }
     }
   }

@@ -24,6 +24,62 @@ interface PhpEngine {
   parseCode(code: string, filename: string): Node;
 }
 
+type TypeMembers = Record<string, Set<string>>;
+
+function addUnique(target: Record<string, string[]>, key: string, value: string): void {
+  if (!key || !value) return;
+  const entries = (target[key] ??= []);
+  if (!entries.includes(value)) entries.push(value);
+}
+
+function normalizePhpType(name: string | null | undefined, nsPrefix: string, imports: string[]): string | null {
+  if (!name) return null;
+  const trimmed = name.replace(/^\\/, '').trim();
+  if (!trimmed) return null;
+  if (trimmed.includes('\\')) return trimmed;
+  const imported = imports.find(entry => entry === trimmed || entry.endsWith(`\\${trimmed}`));
+  if (imported) return imported.replace(/^\\/, '');
+  return nsPrefix ? `${nsPrefix}${trimmed}` : trimmed;
+}
+
+function normalizePhpTypes(values: Array<string | null | undefined>, nsPrefix: string, imports: string[]): string[] {
+  const refs = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizePhpType(value, nsPrefix, imports);
+    if (normalized) refs.add(normalized);
+  }
+  return [...refs];
+}
+
+function asPhpNodeList(value: unknown): Array<Node | string | null | undefined> {
+  if (Array.isArray(value)) return value as Array<Node | string | null | undefined>;
+  if (value === null || value === undefined) return [];
+  return [value as Node | string | null | undefined];
+}
+
+function registerSupertypes(graph: GraphData, typeName: string, supertypes: string[]): void {
+  if (supertypes.length > 0) {
+    graph.supertypes[typeName] = supertypes;
+  }
+  for (const supertype of supertypes) {
+    addUnique(graph.subtypes, supertype, typeName);
+  }
+}
+
+function collectAllSupertypes(typeName: string, directSupertypes: Record<string, string[]>, seen = new Set<string>()): string[] {
+  for (const supertype of directSupertypes[typeName] ?? []) {
+    if (seen.has(supertype)) continue;
+    seen.add(supertype);
+    collectAllSupertypes(supertype, directSupertypes, seen);
+  }
+  return [...seen];
+}
+
+function registerImplementation(graph: GraphData, baseSymbol: string, implementationSymbol: string): void {
+  addUnique(graph.implementations, baseSymbol, implementationSymbol);
+  addUnique(graph.implementedFrom, implementationSymbol, baseSymbol);
+}
+
 function makeParser(): PhpEngine {
   return new Engine({
     parser: { extractDoc: false, suppressErrors: true },
@@ -93,6 +149,8 @@ function extractPhpCalls(node: Node): string[] {
 
 export function buildPhpGraph(rootDir: string, graph: GraphData): void {
   const files = walkFiles(rootDir, ['.php']);
+  const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
+  const typeNames = new Set<string>();
 
   for (const absPath of files) {
     const relPath = path.relative(rootDir, absPath);
@@ -161,8 +219,21 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
           if (!className) continue;
           const fullClassName = `${nsPrefix}${className}`;
           graph.symbolFile[fullClassName] = relPath;
+          typeNames.add(fullClassName);
+
+          const directSupertypes = normalizePhpTypes([
+            ...asPhpNodeList(n.extends).map(entry => nodeName(entry)),
+            ...asPhpNodeList(n.implements).map(entry => nodeName(entry)),
+          ], nsPrefix, fileImports);
+          registerSupertypes(graph, fullClassName, directSupertypes);
 
           const body: Node[] = n.body ?? [];
+          typeMembers[fullClassName] = new Set(
+            body
+              .filter(member => member.kind === 'method')
+              .map(member => nodeName(member.name))
+              .filter((name): name is string => Boolean(name))
+          );
           for (const member of body) {
             if (member.kind !== 'method') continue;
             const methodName = nodeName(member.name);
@@ -185,6 +256,22 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
             }
           }
         }
+      }
+    }
+  }
+
+  for (const typeName of typeNames) {
+    const allSupertypes = collectAllSupertypes(typeName, graph.supertypes);
+
+    for (const supertype of allSupertypes) {
+      registerImplementation(graph, supertype, typeName);
+    }
+
+    for (const memberName of typeMembers[typeName] ?? []) {
+      const implementationSymbol = `${typeName}::${memberName}`;
+      for (const supertype of allSupertypes) {
+        if (!(typeMembers[supertype]?.has(memberName))) continue;
+        registerImplementation(graph, `${supertype}::${memberName}`, implementationSymbol);
       }
     }
   }

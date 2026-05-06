@@ -5,26 +5,108 @@ import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { z } from 'zod';
 import * as path from 'path';
 import * as fs from 'fs';
+import {
+  buildFeatureBrief,
+  renderFeatureBrief,
+} from './feature-knowledge.js';
+import {
+  getAffectedSymbols as getAffectedSymbolsInsight,
+  getRiskHotspots as getRiskHotspotsInsight,
+  renderAffectedSymbols as renderAffectedSymbolsInsight,
+  renderRiskHotspots as renderRiskHotspotsInsight,
+} from './engineering-insights.js';
 import { indexProject, queryProject } from './indexer-run.js';
-import { loadGraph } from './graph.js';
+import { loadGraph, type GraphData } from './graph.js';
 import {
   getFeatureMap,
+  getBugBrief,
   getProjectMemoryCount,
   getProjectStatus,
+  getWhyChanged,
   listRecentChanges,
+  listRecentBugs,
   queryProjectMemory,
+  renderBugBrief,
   renderFeatureMap,
   renderMemoryQueryResults,
   renderProjectStatus,
+  renderRecentBugs,
   renderRecentChanges,
+  renderWhyChanged,
   syncProjectMemory,
 } from './project-memory.js';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { collectionName } from './embedder.js';
 import { getDataDir, getCurrentBranch } from './git.js';
+import {
+  serializeFeatureBriefResponse,
+  serializeQueryProjectResponse,
+} from './output-format.js';
 
 const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositories, indexes and project memory are branch-scoped, so check status or re-index after switching branches.';
 const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
+
+type IndexedPoint = {
+  payload?: Record<string, unknown> | null;
+};
+
+function formatGraphContext(graph: GraphData | null, symbol: string): string[] {
+  const directSupertypes = graph?.supertypes?.[symbol] ?? [];
+  const directSubtypes = graph?.subtypes?.[symbol] ?? [];
+  const implementedFrom = graph?.implementedFrom?.[symbol] ?? [];
+  const implementations = graph?.implementations?.[symbol] ?? [];
+
+  return [
+    directSupertypes.length ? `**Direct supertypes (${directSupertypes.length}):** ${directSupertypes.join(', ')}` : '',
+    directSubtypes.length ? `**Direct subtypes (${directSubtypes.length}):** ${directSubtypes.join(', ')}` : '',
+    implementedFrom.length ? `**Implements / overrides (${implementedFrom.length}):** ${implementedFrom.join(', ')}` : '',
+    implementations.length ? `**Known implementations (${implementations.length}):** ${implementations.join(', ')}` : '',
+  ].filter(Boolean);
+}
+
+async function scrollSymbolPoints(qdrant: QdrantClient, collection: string, symbols: string[]): Promise<IndexedPoint[]> {
+  if (symbols.length === 0) return [];
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { points } = await qdrant.scroll(collection, {
+    filter: {
+      should: symbols.map(symbol => ({ key: 'symbol', match: { value: symbol } })),
+    } as any,
+    with_payload: true,
+    with_vector: false,
+    limit: Math.max(symbols.length * 3, 10),
+  });
+
+  return points as IndexedPoint[];
+}
+
+function groupPointsBySymbol(points: IndexedPoint[]): Map<string, IndexedPoint[]> {
+  const grouped = new Map<string, IndexedPoint[]>();
+  for (const point of points) {
+    const symbol = point.payload?.['symbol'];
+    if (typeof symbol !== 'string') continue;
+    if (!grouped.has(symbol)) grouped.set(symbol, []);
+    grouped.get(symbol)!.push(point);
+  }
+  return grouped;
+}
+
+function renderIndexedSymbol(graph: GraphData | null, symbol: string, point?: IndexedPoint): string {
+  const payload = point?.payload ?? null;
+  const file = typeof payload?.['file'] === 'string' ? payload['file'] : graph?.symbolFile?.[symbol] ?? '?';
+  const type = typeof payload?.['type'] === 'string' ? payload['type'] : 'unknown';
+  const code = typeof payload?.['code'] === 'string' ? payload['code'] : null;
+  const callees = graph?.symbols[symbol] ?? [];
+  const callers = graph?.callers?.[symbol] ?? [];
+
+  return [
+    `**${symbol}** (${type}) — ${file}`,
+    callees.length ? `**Calls (${callees.length}):** ${callees.join(', ')}` : '',
+    callers.length ? `**Called by (${callers.length}):** ${callers.join(', ')}` : '',
+    ...formatGraphContext(graph, symbol),
+    code ? `\`\`\`\n${code}\n\`\`\`` : '*(code not in index)*',
+  ].filter(Boolean).join('\n');
+}
 
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
@@ -62,29 +144,45 @@ function createMcpServer(): McpServer {
       inputSchema: {
         projectRoot: z.string().describe(PROJECT_ROOT_DESC),
         question: z.string().describe('Natural language implementation question about the codebase, for example "how does authentication work" or "where is rate limiting applied".'),
+        format: z.enum(['text', 'json']).optional().describe('Output format. Use json when the client wants structured scores, signals, and code fields (default: text).'),
         qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
-    async ({ projectRoot, question, qdrantUrl = 'http://localhost:6333' }) => {
+    async ({ projectRoot, question, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       const results = await queryProject(root, question, qdrantUrl);
       if (!results.length) {
         return { content: [{ type: 'text', text: 'No results found.' }] };
       }
+      if (format === 'json') {
+        return { content: [{ type: 'text', text: JSON.stringify(serializeQueryProjectResponse(question, results), null, 2) }] };
+      }
       const graphPath = path.join(getDataDir(root), 'graph.json');
       const graph = loadGraph(graphPath);
       const output = results
         .map(r => {
-          const label = r.score > 0 ? `score: ${r.score.toFixed(3)}` : 'related';
+          const hybridScore = r.score;
+          const semanticScore = r.semanticScore ?? 0;
           const callees = graph?.symbols[r.symbol] ?? [];
           const callers = graph?.callers?.[r.symbol] ?? [];
+          const directSupertypes = graph?.supertypes?.[r.symbol] ?? [];
+          const implementations = graph?.implementations?.[r.symbol] ?? [];
           const graphParts = [
             callees.length ? `calls: ${callees.join(', ')}` : '',
             callers.length ? `calledBy: ${callers.join(', ')}` : '',
+            directSupertypes.length ? `inherits: ${directSupertypes.join(', ')}` : '',
+            implementations.length ? `implementedBy: ${implementations.slice(0, 6).join(', ')}${implementations.length > 6 ? ', ...' : ''}` : '',
           ].filter(Boolean).join(' | ');
           return [
             `**File:** ${r.file}`,
-            `**Symbol:** ${r.symbol} (${r.type}) [${label}]${graphParts ? ` — ${graphParts}` : ''}`,
+            `**Symbol:** ${r.symbol} (${r.type})${graphParts ? ` — ${graphParts}` : ''}`,
+            `**Ranking:** hybrid ${hybridScore.toFixed(3)} | semantic ${semanticScore.toFixed(3)}`,
+            r.rankingSignals && r.rankingSignals.length > 0
+              ? `**Ranking signals:** ${r.rankingSignals.join('; ')}`
+              : '',
+            r.scoreBreakdown
+              ? `**Score breakdown:** semantic ${r.scoreBreakdown.semantic.toFixed(2)}, symbol overlap ${r.scoreBreakdown.symbolOverlap.toFixed(2)}, file overlap ${r.scoreBreakdown.fileOverlap.toFixed(2)}, memory ${r.scoreBreakdown.directMemory.toFixed(2)}, neighbor support ${r.scoreBreakdown.neighborSupport.toFixed(2)}, connectivity ${r.scoreBreakdown.connectivity.toFixed(2)}`
+              : '',
             `\`\`\`\n${r.code}\n\`\`\``,
           ].join('\n');
         })
@@ -185,6 +283,25 @@ function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    'recent_bugs',
+    {
+      description: 'Use for bug-history questions such as "what broke recently", "recent auth bugs", or "show regressions touching caching". Results come from offline bug memory synthesized from local fix history, so they surface likely past failures rather than every change.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        limit: z.number().int().min(1).max(25).optional().describe('Number of recent bug-memory entries to return (default: 10).'),
+        topic: z.string().optional().describe('Optional topic filter, for example "auth", "cache", or "graph".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, limit = 10, topic, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const entries = listRecentBugs(root, { limit, topic });
+      return { content: [{ type: 'text', text: renderRecentBugs(entries) }] };
+    }
+  );
+
+  server.registerTool(
     'feature_map',
     {
       description: 'Use this to understand what the project does at a high level before diving into code. It prioritizes documented features, architecture, storage layout, supported languages, and recent feature-oriented changes from offline document memory. Prefer this over query_project when the question is about capabilities or system shape rather than implementation details.',
@@ -201,6 +318,127 @@ function createMcpServer(): McpServer {
         return { content: [{ type: 'text', text: 'No project memory found. Run index_project first.' }] };
       }
       return { content: [{ type: 'text', text: renderFeatureMap(featureMap) }] };
+    }
+  );
+
+  server.registerTool(
+    'feature_brief',
+    {
+      description: 'Best first tool for feature-specific knowledge. Use this when you want a project-engineer brief for one feature area in a single MCP call. It combines offline docs, semantic code anchors, recent rationale, hotspots, and likely neighboring symbols, then suggests the exact symbols to inspect in a second call with get_symbols or expand_graph.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        feature: z.string().describe('Natural language feature name or area, for example "authentication", "cache invalidation", or "graph expansion".'),
+        format: z.enum(['text', 'json']).optional().describe('Output format. Use json when the client wants structured anchors, rationale, hotspots, and impact data (default: text).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, feature, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      const graphPath = path.join(getDataDir(root), 'graph.json');
+      if (!fs.existsSync(graphPath)) {
+        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      }
+
+      await syncProjectMemory(root, qdrantUrl);
+      const brief = await buildFeatureBrief(root, feature, qdrantUrl);
+      if (format === 'json') {
+        return { content: [{ type: 'text', text: JSON.stringify(serializeFeatureBriefResponse(brief), null, 2) }] };
+      }
+      return { content: [{ type: 'text', text: renderFeatureBrief(brief) }] };
+    }
+  );
+
+  server.registerTool(
+    'analyze_impact',
+    {
+      description: 'Use before edits, refactors, or deep debugging when you want a ranked impact neighborhood instead of a raw graph dump. It combines callers, callees, inheritance and implementation edges, plus recent project-memory history, to surface the most relevant nearby symbols around one or more seeds.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        seeds: z.array(z.string()).min(1).max(20).describe('Exact seed symbol names to analyze, for example ["buildGraph"] or ["AuthService.login", "TokenStore.refresh"].'),
+        hops: z.number().int().min(1).max(3).optional().describe('How many structural hops to follow from the seeds (default: 2).'),
+        direction: z.enum(['out', 'in', 'both']).optional().describe('Follow downstream dependencies, upstream dependents, or both (default: both).'),
+        limit: z.number().int().min(1).max(30).optional().describe('Maximum number of ranked related symbols to return (default: 15).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, seeds, hops = 2, direction = 'both', limit = 15, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const analysis = getAffectedSymbolsInsight(root, seeds, { hops, direction, limit });
+      if (!analysis) {
+        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      }
+      return { content: [{ type: 'text', text: renderAffectedSymbolsInsight(analysis) }] };
+    }
+  );
+
+  server.registerTool(
+    'risk_hotspots',
+    {
+      description: 'Use this to identify high-risk symbols and files before planning a change. It ranks hotspots by recent project-memory changes, fix frequency, and graph connectivity so agents can quickly spot unstable or highly connected areas that deserve extra caution. Add topic when you already know the subsystem you care about.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        limit: z.number().int().min(1).max(25).optional().describe('Maximum number of symbol and file hotspots to return per section (default: 10).'),
+        topic: z.string().optional().describe('Optional topic filter, for example "auth", "cache", or "graph".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, limit = 10, topic, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const hotspots = getRiskHotspotsInsight(root, { limit, topic });
+      if (!hotspots) {
+        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      }
+      return { content: [{ type: 'text', text: renderRiskHotspotsInsight(hotspots) }] };
+    }
+  );
+
+  server.registerTool(
+    'why_changed',
+    {
+      description: 'Use this when you have an exact symbol or file target and want the recent rationale and change history, not a semantic search result. It searches offline project memory for matching symbols or files and returns the most relevant recent changes, summaries, and topics. Prefer this over query_project_memory when you already know the target name.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        target: z.string().describe('Exact or near-exact symbol or file target, for example "AuthService.login", "buildGraph", or "src/cache.ts".'),
+        mode: z.enum(['auto', 'symbol', 'file']).optional().describe('Match by symbol, file path, or both (default: auto).'),
+        topic: z.string().optional().describe('Optional topic filter when you want the history only within one subsystem.'),
+        limit: z.number().int().min(1).max(25).optional().describe('Maximum number of matching changes to return (default: 10).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, target, mode = 'auto', topic, limit = 10, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const result = getWhyChanged(root, { target, mode, topic, limit });
+      if (!result) {
+        return { content: [{ type: 'text', text: 'No project memory found. Run index_project first.' }] };
+      }
+      return { content: [{ type: 'text', text: renderWhyChanged(result) }] };
+    }
+  );
+
+  server.registerTool(
+    'bug_brief',
+    {
+      description: 'Use this when you have an exact symbol or file target and want the nearby bug history instead of general change history. It searches offline bug memory for matching symbols or files and returns the most relevant fixed bugs, summaries, and topics.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        target: z.string().describe('Exact or near-exact symbol or file target, for example "AuthService.login", "buildGraph", or "src/cache.ts".'),
+        mode: z.enum(['auto', 'symbol', 'file']).optional().describe('Match by symbol, file path, or both (default: auto).'),
+        topic: z.string().optional().describe('Optional topic filter when you want bug history only within one subsystem.'),
+        limit: z.number().int().min(1).max(25).optional().describe('Maximum number of matching bug entries to return (default: 10).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, target, mode = 'auto', topic, limit = 10, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      await syncProjectMemory(root, qdrantUrl);
+      const result = getBugBrief(root, { target, mode, topic, limit });
+      if (!result) {
+        return { content: [{ type: 'text', text: 'No project memory found. Run index_project first.' }] };
+      }
+      return { content: [{ type: 'text', text: renderBugBrief(result) }] };
     }
   );
 
@@ -264,6 +502,7 @@ function createMcpServer(): McpServer {
           `**Type:** ${type}`,
           callees.length ? `**Calls (${callees.length}):** ${callees.join(', ')}` : '',
           callers.length ? `**Called by (${callers.length}):** ${callers.join(', ')}` : '',
+          ...formatGraphContext(graph, symbol),
           `\`\`\`\n${code}\n\`\`\``,
         ].filter(Boolean).join('\n');
       }).join('\n\n---\n\n');
@@ -317,18 +556,8 @@ function createMcpServer(): McpServer {
 
       const sections: string[] = [];
       for (const [sym, pts] of bySymbol) {
-        const callees = graph?.symbols[sym] ?? [];
-        const callers = graph?.callers?.[sym] ?? [];
         for (const p of pts) {
-          const file = p.payload!['file'] as string;
-          const type = p.payload!['type'] as string;
-          const code = p.payload!['code'] as string;
-          sections.push([
-            `**${sym}** (${type}) — ${file}`,
-            callees.length ? `Calls (${callees.length}): ${callees.join(', ')}` : '',
-            callers.length ? `Called by (${callers.length}): ${callers.join(', ')}` : '',
-            `\`\`\`\n${code}\n\`\`\``,
-          ].filter(Boolean).join('\n'));
+          sections.push(renderIndexedSymbol(graph, sym, p));
         }
       }
 
@@ -337,6 +566,107 @@ function createMcpServer(): McpServer {
       }
 
       return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+    }
+  );
+
+  server.registerTool(
+    'find_references',
+    {
+      description: 'Direct Serena-style reference lookup for one exact symbol. Use this after get_symbol or list_symbols when you need narrow upstream evidence instead of a wider subgraph. It returns graph-based callers for functions and methods, plus implementation/override references for base types or methods, with code snippets when the referenced symbols are indexed.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbol: z.string().describe('Exact symbol name to inspect, for example "buildGraph", "AuthService.login", or "Worker.run".'),
+        limit: z.number().int().min(1).max(25).optional().describe('Maximum number of direct reference symbols to render (default: 10).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, symbol, limit = 10, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
+
+      if (!graph) {
+        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      }
+
+      const callers = graph.callers?.[symbol] ?? [];
+      const implementations = graph.implementations?.[symbol] ?? [];
+      const totalReferences = new Set([...callers, ...implementations]);
+
+      if (totalReferences.size === 0) {
+        return { content: [{ type: 'text', text: `No direct graph references found for "${symbol}".` }] };
+      }
+
+      const shownSymbols = [...totalReferences].slice(0, limit);
+      const shownSet = new Set(shownSymbols);
+      const qdrant = new QdrantClient({ url: qdrantUrl });
+      const collection = collectionName(root);
+      const pointMap = groupPointsBySymbol(await scrollSymbolPoints(qdrant, collection, shownSymbols));
+
+      const sections: string[] = [
+        `**Direct references for ${symbol}**`,
+        graph.symbolFile[symbol] ? `Declared in: ${graph.symbolFile[symbol]}` : '',
+        callers.length ? `Call references: ${callers.length}` : '',
+        implementations.length ? `Implementation references: ${implementations.length}` : '',
+        shownSymbols.length < totalReferences.size ? `Showing first ${shownSymbols.length} of ${totalReferences.size} direct references.` : '',
+      ].filter(Boolean);
+
+      const groups: Array<{ title: string; symbols: string[] }> = [
+        { title: 'Call References', symbols: callers.filter(ref => shownSet.has(ref)) },
+        { title: 'Implementation References', symbols: implementations.filter(ref => shownSet.has(ref)) },
+      ].filter(group => group.symbols.length > 0);
+
+      for (const group of groups) {
+        sections.push(`\n### ${group.title}`);
+        for (const ref of group.symbols) {
+          sections.push(renderIndexedSymbol(graph, ref, pointMap.get(ref)?.[0]));
+        }
+      }
+
+      return { content: [{ type: 'text', text: sections.join('\n\n') }] };
+    }
+  );
+
+  server.registerTool(
+    'find_implementations',
+    {
+      description: 'Serena-style implementation lookup for one exact type or method symbol. Use this when tracing interface adopters, subclasses, or method overrides, for example "StorageProvider", "BaseIndexer", or "BaseIndexer.run". Results come from the indexed inheritance graph and include code snippets for local implementations when available.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbol: z.string().describe('Exact base symbol to inspect, such as an interface, class, or method. Examples: "StorageProvider", "BaseIndexer", "BaseIndexer.run".'),
+        limit: z.number().int().min(1).max(25).optional().describe('Maximum number of implementations to render (default: 10).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, symbol, limit = 10, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
+
+      if (!graph) {
+        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      }
+
+      const implementations = graph.implementations?.[symbol] ?? [];
+      if (implementations.length === 0) {
+        return { content: [{ type: 'text', text: `No implementations found for "${symbol}".` }] };
+      }
+
+      const shownSymbols = implementations.slice(0, limit);
+      const qdrant = new QdrantClient({ url: qdrantUrl });
+      const collection = collectionName(root);
+      const pointMap = groupPointsBySymbol(await scrollSymbolPoints(qdrant, collection, shownSymbols));
+
+      const sections: string[] = [
+        `**Implementations of ${symbol}**`,
+        graph.symbolFile[symbol] ? `Declared in: ${graph.symbolFile[symbol]}` : '',
+        `Known implementations: ${implementations.length}`,
+        shownSymbols.length < implementations.length ? `Showing first ${shownSymbols.length} implementations.` : '',
+      ].filter(Boolean);
+
+      for (const implementation of shownSymbols) {
+        sections.push(renderIndexedSymbol(graph, implementation, pointMap.get(implementation)?.[0]));
+      }
+
+      return { content: [{ type: 'text', text: sections.join('\n\n') }] };
     }
   );
 
@@ -425,6 +755,7 @@ function createMcpServer(): McpServer {
           `### ${sym} (${type}) — ${file}`,
           callees.length ? `→ calls: ${callees.join(', ')}` : '',
           callers.length ? `← calledBy: ${callers.join(', ')}` : '',
+          ...formatGraphContext(graph, sym),
           code,
         ].filter(Boolean).join('\n'));
       }
@@ -515,6 +846,7 @@ function createMcpServer(): McpServer {
           `**${symbol}** (${type})`,
           callees.length ? `calls: ${callees.join(', ')}` : '',
           callers.length ? `calledBy: ${callers.join(', ')}` : '',
+          ...formatGraphContext(graph, symbol),
           `\`\`\`\n${code}\n\`\`\``,
         ].filter(Boolean).join('\n');
       }).join('\n\n---\n\n');

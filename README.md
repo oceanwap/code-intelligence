@@ -14,6 +14,7 @@ No cloud APIs, no API keys. Everything runs on your machine.
 - **Differential indexing** — only re-embeds files that changed since the last run (manifest + mtime tracking)
 - **Plain-file indexing** — also indexes `.json`, `.yaml`, `.md`, `Dockerfile`, etc. as whole-file chunks
 - **Offline project memory** — derives semantic change memory from local git history and semantic fact memory from README/docs/notes without external AI APIs
+- **Offline bug memory** — synthesizes evidence-backed bug memory from local fix history, including extracted symptoms, failing-test hints, and error signatures when they appear in commit text
 - **MCP server** — exposes tools that VS Code Copilot agent can call to explore any indexed project
 
 ---
@@ -96,10 +97,12 @@ code-intel status --dir .
 code-intel features --dir .
 code-intel changes --dir . --limit 10
 code-intel changes --dir . --type fix --topic auth
+code-intel bugs --dir . --limit 10 --topic auth
+code-intel bug-brief AuthService.login --dir . --mode symbol
 code-intel memory-query "what changed in caching recently" --dir .
 ```
 
-Project-memory entries are built locally from recent git history plus markdown/text docs. For supported languages, changed hunks are mapped to impacted symbols so history is stored as semantic impact instead of raw line diffs. Document memory is section-based, so README/docs/ADR-style files become searchable project facts. The initial implementation indexes the most recent 150 commits per branch.
+Project-memory entries are built locally from recent git history plus markdown/text docs. For supported languages, changed hunks are mapped to impacted symbols so history is stored as semantic impact instead of raw line diffs. Document memory is section-based, so README/docs/ADR-style files become searchable project facts. Bug memory is the first structured failure layer on top of that: fix commits become bug entries only when the commit text yields concrete evidence such as symptoms, failing-test names, or explicit error signatures, so agents can ask what broke recently without falling back to vague fix history. The initial implementation indexes the most recent 150 commits per branch.
 
 ---
 
@@ -126,6 +129,8 @@ Runs on `http://localhost:3737/mcp`.
 | `project_status`  | Show an engineer-style status snapshot: branch, latest change, active topics, fixes. |
 | `feature_map`     | Show documented features and architecture facts from offline document memory.         |
 | `recent_changes`  | Show recent semantic changes from offline project memory.                             |
+| `recent_bugs`     | Show recent bug-memory entries synthesized from local fix history.                    |
+| `bug_brief`       | Show recent bug history for an exact symbol or file target.                           |
 | `query_project_memory` | Semantic search over local git-derived project memory.                          |
 | `query_project`   | Semantic search with natural language. Returns code + file + call graph context.     |
 | `get_symbol`      | Look up a specific symbol by name — returns source, callers, and callees.            |

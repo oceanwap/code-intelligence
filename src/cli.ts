@@ -1,18 +1,32 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import * as path from 'path';
+import type { RetrievedChunk } from './indexer-run.js';
+import {
+  getAffectedSymbols,
+  getRiskHotspots,
+  renderAffectedSymbols,
+  renderRiskHotspots,
+} from './engineering-insights.js';
 import { indexProject, queryProject } from './indexer-run.js';
 import {
   getFeatureMap,
+  getBugBrief,
   listRecentChanges,
+  listRecentBugs,
+  getWhyChanged,
   queryProjectMemory,
+  renderBugBrief,
   renderFeatureMap,
   renderMemoryQueryResults,
   renderProjectStatus,
+  renderRecentBugs,
   renderRecentChanges,
+  renderWhyChanged,
   syncProjectMemory,
   getProjectStatus,
 } from './project-memory.js';
+import { serializeQueryProjectResponse } from './output-format.js';
 
 function drawBar(label: string, done: number, total: number): void {
   const W = 25;
@@ -25,6 +39,36 @@ function drawBar(label: string, done: number, total: number): void {
 
 const program = new Command();
 program.name('code-intel').description('Local code intelligence CLI');
+
+function renderQueryChunkText(result: RetrievedChunk): string {
+  const lines = [
+    `File:   ${result.file}`,
+    `Symbol: ${result.symbol} (${result.type})`,
+    `Ranking: hybrid ${result.score.toFixed(3)} | semantic ${(result.semanticScore ?? 0).toFixed(3)}`,
+  ];
+
+  if (result.rankingSignals && result.rankingSignals.length > 0) {
+    lines.push(`Signals: ${result.rankingSignals.join('; ')}`);
+  }
+
+  if (result.scoreBreakdown) {
+    lines.push(
+      `Breakdown: semantic ${result.scoreBreakdown.semantic.toFixed(2)}, `
+      + `symbol overlap ${result.scoreBreakdown.symbolOverlap.toFixed(2)}, `
+      + `file overlap ${result.scoreBreakdown.fileOverlap.toFixed(2)}, `
+      + `memory ${result.scoreBreakdown.directMemory.toFixed(2)}, `
+      + `neighbor support ${result.scoreBreakdown.neighborSupport.toFixed(2)}, `
+      + `connectivity ${result.scoreBreakdown.connectivity.toFixed(2)}`
+    );
+  }
+
+  return [
+    `${'─'.repeat(60)}`,
+    ...lines,
+    '─'.repeat(60),
+    result.code,
+  ].join('\n');
+}
 
 // index <dir> — parse with ts-morph, embed, store in Qdrant
 program
@@ -58,21 +102,22 @@ program
   .command('query <question>')
   .description('Retrieve relevant code for a natural language question')
   .option('--dir <path>', 'Project root directory', '.')
+  .option('--format <format>', 'Output format: text|json', 'text')
   .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
-  .action(async (question: string, opts: { dir: string; qdrant: string }) => {
+  .action(async (question: string, opts: { dir: string; format: 'text' | 'json'; qdrant: string }) => {
     const results = await queryProject(path.resolve(opts.dir), question, opts.qdrant);
     if (!results.length) {
       console.log('No results found.');
       return;
     }
 
+    if (opts.format === 'json') {
+      console.log(JSON.stringify(serializeQueryProjectResponse(question, results), null, 2));
+      return;
+    }
+
     for (const r of results) {
-      const label = r.score > 0 ? `score: ${r.score.toFixed(3)}` : 'related';
-      console.log(`\n${'─'.repeat(60)}`);
-      console.log(`File:   ${r.file}`);
-      console.log(`Symbol: ${r.symbol} (${r.type})  [${label}]`);
-      console.log('─'.repeat(60));
-      console.log(r.code);
+      console.log(`\n${renderQueryChunkText(r)}`);
     }
   });
 
@@ -113,6 +158,23 @@ program
   });
 
 program
+  .command('bugs')
+  .description('Show recent bug-memory entries synthesized from fix history')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--limit <n>', 'Number of bugs to show', '10')
+  .option('--topic <topic>', 'Optional topic filter')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .action(async (opts: { dir: string; limit: string; topic?: string; qdrant: string }) => {
+    const root = path.resolve(opts.dir);
+    await syncProjectMemory(root, opts.qdrant);
+    const entries = listRecentBugs(root, {
+      limit: Number(opts.limit) || 10,
+      topic: opts.topic,
+    });
+    console.log(renderRecentBugs(entries));
+  });
+
+program
   .command('features')
   .description('Show documented project features and architecture facts from offline document memory')
   .option('--dir <path>', 'Project root directory', '.')
@@ -140,6 +202,102 @@ program
     await syncProjectMemory(root, opts.qdrant);
     const results = await queryProjectMemory(root, question, opts.qdrant, Number(opts.limit) || 5);
     console.log(renderMemoryQueryResults(results));
+  });
+
+program
+  .command('impact <symbols...>')
+  .description('Rank likely affected nearby symbols using graph relations and offline project memory')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--hops <n>', 'How many graph hops to follow', '2')
+  .option('--direction <dir>', 'Direction: out|in|both', 'both')
+  .option('--limit <n>', 'Number of related symbols to show', '15')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .action(async (symbols: string[], opts: { dir: string; hops: string; direction: 'out' | 'in' | 'both'; limit: string; qdrant: string }) => {
+    const root = path.resolve(opts.dir);
+    await syncProjectMemory(root, opts.qdrant);
+    const result = getAffectedSymbols(root, symbols, {
+      hops: Number(opts.hops) || 2,
+      direction: opts.direction,
+      limit: Number(opts.limit) || 15,
+    });
+    if (!result) {
+      console.log('Project not indexed. Run `code-intel index .` first.');
+      return;
+    }
+
+    console.log(renderAffectedSymbols(result));
+  });
+
+program
+  .command('hotspots')
+  .description('Show risky symbols and files ranked by change frequency, fixes, and graph connectivity')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--limit <n>', 'Number of symbol and file hotspots to show', '10')
+  .option('--topic <topic>', 'Optional topic filter')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .action(async (opts: { dir: string; limit: string; topic?: string; qdrant: string }) => {
+    const root = path.resolve(opts.dir);
+    await syncProjectMemory(root, opts.qdrant);
+    const result = getRiskHotspots(root, {
+      limit: Number(opts.limit) || 10,
+      topic: opts.topic,
+    });
+    if (!result) {
+      console.log('Project not indexed. Run `code-intel index .` first.');
+      return;
+    }
+
+    console.log(renderRiskHotspots(result));
+  });
+
+program
+  .command('why-changed <target>')
+  .description('Show recent recorded changes for a symbol or file target from offline project memory')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--mode <mode>', 'Match mode: auto|symbol|file', 'auto')
+  .option('--topic <topic>', 'Optional topic filter')
+  .option('--limit <n>', 'Number of matching changes to show', '10')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .action(async (target: string, opts: { dir: string; mode: 'auto' | 'symbol' | 'file'; topic?: string; limit: string; qdrant: string }) => {
+    const root = path.resolve(opts.dir);
+    await syncProjectMemory(root, opts.qdrant);
+    const result = getWhyChanged(root, {
+      target,
+      mode: opts.mode,
+      topic: opts.topic,
+      limit: Number(opts.limit) || 10,
+    });
+    if (!result) {
+      console.log('No project memory found. Run `code-intel index .` first.');
+      return;
+    }
+
+    console.log(renderWhyChanged(result));
+  });
+
+program
+  .command('bug-brief <target>')
+  .description('Show recent recorded bugs for a symbol or file target from offline bug memory')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--mode <mode>', 'Match mode: auto|symbol|file', 'auto')
+  .option('--topic <topic>', 'Optional topic filter')
+  .option('--limit <n>', 'Number of matching bug entries to show', '10')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .action(async (target: string, opts: { dir: string; mode: 'auto' | 'symbol' | 'file'; topic?: string; limit: string; qdrant: string }) => {
+    const root = path.resolve(opts.dir);
+    await syncProjectMemory(root, opts.qdrant);
+    const result = getBugBrief(root, {
+      target,
+      mode: opts.mode,
+      topic: opts.topic,
+      limit: Number(opts.limit) || 10,
+    });
+    if (!result) {
+      console.log('No project memory found. Run `code-intel index .` first.');
+      return;
+    }
+
+    console.log(renderBugBrief(result));
   });
 
 program.parse();

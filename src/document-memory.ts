@@ -44,6 +44,8 @@ const DOC_NAMES = new Set([
 ]);
 const MAX_DOC_BYTES = 96_000;
 const MAX_DOC_BODY_CHARS = 4_000;
+const MAX_STORED_DOC_BODY_LINES = 4;
+const MAX_STORED_DOC_BODY_CHARS = 480;
 const MAX_DOC_SECTIONS_PER_FILE = 24;
 const MAX_TOTAL_DOC_ENTRIES = 120;
 const TOPIC_STOP_WORDS = new Set([
@@ -187,6 +189,13 @@ function summarizeSection(title: string, body: string, docType: ProjectDocumentT
     return `${docType} note: ${title}. ${summaryLines.join(' ')}`.slice(0, 320);
 }
 
+function compactSectionBody(body: string): string {
+    return meaningfulLines(body)
+        .slice(0, MAX_STORED_DOC_BODY_LINES)
+        .join('\n')
+        .slice(0, MAX_STORED_DOC_BODY_CHARS);
+}
+
 export function buildDocumentEntries(projectRoot: string): DocumentMemoryEntry[] {
     const root = path.resolve(projectRoot);
     const files = walkFiles(root, DOC_EXTS, DOC_NAMES);
@@ -227,7 +236,7 @@ export function buildDocumentEntries(projectRoot: string): DocumentMemoryEntry[]
                 kind: 'document',
                 timestamp: new Date(stat.mtimeMs).toISOString(),
                 title: section.title,
-                body,
+                body: compactSectionBody(body),
                 summary: summarizeSection(section.title, body, docType),
                 changeType: 'docs',
                 topics: inferTopics(relPath, section.title, body, docType),
