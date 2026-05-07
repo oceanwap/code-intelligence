@@ -4,11 +4,21 @@ import * as fs from 'fs';
 import { walkFiles } from './indexer.js';
 import { buildPhpGraph } from './php-graph.js';
 
+export interface GraphCallSite {
+  symbol: string;
+  file: string;
+  line: number;
+}
+
 export interface GraphData {
   /** symbol name → list of called symbol names (outbound) */
   symbols: Record<string, string[]>;
+  /** caller symbol → compact callsite entries for outbound calls */
+  callSites?: Record<string, GraphCallSite[]>;
   /** symbol name → list of symbol names that call it (inbound/callers) */
   callers: Record<string, string[]>;
+  /** callee symbol → compact callsite entries for inbound callers */
+  calledBySites?: Record<string, GraphCallSite[]>;
   /** relative file path → list of import specifiers */
   files: Record<string, string[]>;
   /** symbol name → relative file path it lives in */
@@ -31,6 +41,14 @@ function addUnique(target: Record<string, string[]>, key: string, value: string)
   if (!key || !value) return;
   const entries = (target[key] ??= []);
   if (!entries.includes(value)) entries.push(value);
+}
+
+function addCallSite(target: Record<string, GraphCallSite[]>, key: string, value: GraphCallSite): void {
+  if (!key || !value.symbol || !value.file || value.line < 1) return;
+  const entries = (target[key] ??= []);
+  if (!entries.some(entry => entry.symbol === value.symbol && entry.file === value.file && entry.line === value.line)) {
+    entries.push(value);
+  }
 }
 
 function normalizeTypeName(name: string | null | undefined): string | null {
@@ -94,14 +112,15 @@ function getFnName(node: FnLike, parentName?: string): string | null {
 }
 
 /** Extract all called symbol names from a function-like node */
-function extractCalls(node: FnLike): string[] {
-  const calls = new Set<string>();
+function extractCalls(node: FnLike, relPath: string): GraphCallSite[] {
+  const calls: GraphCallSite[] = [];
   for (const call of node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const expr = call.getExpression();
     const text = expr.getText();
+    const line = call.getStartLineNumber();
     // Simple call: foo()
     if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(text)) {
-      calls.add(text);
+      calls.push({ symbol: text, file: relPath, line });
     }
     // Method call: this.foo() or obj.foo() — capture the method name
     if (Node.isPropertyAccessExpression(expr)) {
@@ -111,16 +130,16 @@ function extractCalls(node: FnLike): string[] {
         // Record as ClassName.methodName if we can find the class
         const cls = node.getFirstAncestorByKind(SyntaxKind.ClassDeclaration);
         if (cls?.getName()) {
-          calls.add(`${cls.getName()}.${methodName}`);
+          calls.push({ symbol: `${cls.getName()}.${methodName}`, file: relPath, line });
         } else {
-          calls.add(methodName);
+          calls.push({ symbol: methodName, file: relPath, line });
         }
       } else {
-        calls.add(methodName);
+        calls.push({ symbol: methodName, file: relPath, line });
       }
     }
   }
-  return [...calls];
+  return calls;
 }
 
 export function buildGraph(rootDir: string): GraphData {
@@ -135,7 +154,9 @@ export function buildGraph(rootDir: string): GraphData {
 
   const graph: GraphData = {
     symbols: Object.create(null) as Record<string, string[]>,
+    callSites: Object.create(null) as Record<string, GraphCallSite[]>,
     callers: Object.create(null) as Record<string, string[]>,
+    calledBySites: Object.create(null) as Record<string, GraphCallSite[]>,
     files: Object.create(null) as Record<string, string[]>,
     symbolFile: Object.create(null) as Record<string, string>,
     supertypes: Object.create(null) as Record<string, string[]>,
@@ -180,16 +201,18 @@ export function buildGraph(rootDir: string): GraphData {
       const name = getFnName(fn as FnLike);
       if (!name) continue;
 
-      const calls = extractCalls(fn as FnLike);
-      graph.symbols[name] = [...new Set([...(graph.symbols[name] ?? []), ...calls])];
+      const calls = extractCalls(fn as FnLike, relPath);
+      graph.symbols[name] = [...new Set([...(graph.symbols[name] ?? []), ...calls.map(call => call.symbol)])];
+      for (const call of calls) addCallSite(graph.callSites!, name, call);
       graph.symbolFile[name] = relPath;
 
       // Build inbound (callers) index
       for (const callee of calls) {
-        (graph.callers[callee] ??= []);
-        if (!graph.callers[callee].includes(name)) {
-          graph.callers[callee].push(name);
+        (graph.callers[callee.symbol] ??= []);
+        if (!graph.callers[callee.symbol].includes(name)) {
+          graph.callers[callee.symbol].push(name);
         }
+        addCallSite(graph.calledBySites!, callee.symbol, { symbol: name, file: relPath, line: callee.line });
       }
     }
 

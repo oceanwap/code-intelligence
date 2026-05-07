@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { rankRetrievedChunks, type RetrievedChunk } from '../src/retriever.js';
+import { connectRetrievedChunksWithinResults, rankRetrievedChunks, type RetrievedChunk } from '../src/retriever.js';
 import type { GraphData } from '../src/graph.js';
 import type { ProjectMemoryEntry } from '../src/project-memory.js';
 
@@ -80,4 +80,46 @@ test('rankRetrievedChunks lifts feature-relevant symbols over generic helpers', 
   assert.ok(ranked[0]?.rankingSignals?.includes('supported by project memory'));
   assert.ok((ranked[0]?.scoreBreakdown?.directMemory ?? 0) > 0);
   assert.ok((ranked[0]?.scoreBreakdown?.semantic ?? 0) > 0);
+});
+
+test('connectRetrievedChunksWithinResults marks links between returned slices', () => {
+  const graph: GraphData = {
+    symbols: {
+      'AuthService.login': ['SessionStore.issue'],
+      'SessionStore.issue': [],
+      'AuthController.handle': ['AuthService.login'],
+    },
+    callers: {
+      'AuthService.login': ['AuthController.handle'],
+      'SessionStore.issue': ['AuthService.login'],
+    },
+    files: {
+      'src/auth.ts': [],
+      'src/session.ts': [],
+      'src/controller.ts': [],
+    },
+    symbolFile: {
+      'AuthService.login': 'src/auth.ts',
+      'SessionStore.issue': 'src/session.ts',
+      'AuthController.handle': 'src/controller.ts',
+    },
+    supertypes: {},
+    subtypes: {},
+    implementations: {},
+    implementedFrom: {},
+  };
+
+  const connected = connectRetrievedChunksWithinResults([
+    makeChunk({ symbol: 'AuthService.login' }),
+    makeChunk({ symbol: 'SessionStore.issue', file: 'src/session.ts' }),
+    makeChunk({ symbol: 'AuthController.handle', file: 'src/controller.ts' }),
+  ], graph);
+
+  const auth = connected.find(chunk => chunk.symbol === 'AuthService.login');
+  assert.equal(auth?.connectionsWithinResults?.total, 2);
+  assert.deepEqual(auth?.connectionsWithinResults?.calls, ['SessionStore.issue']);
+  assert.deepEqual(auth?.connectionsWithinResults?.usedBy, ['AuthController.handle']);
+
+  const session = connected.find(chunk => chunk.symbol === 'SessionStore.issue');
+  assert.deepEqual(session?.connectionsWithinResults?.usedBy, ['AuthService.login']);
 });

@@ -12,6 +12,7 @@ import { indexProject, queryProject } from './indexer-run.js';
 import {
   getFeatureMap,
   getBugBrief,
+  getProjectMemoryFreshness,
   listRecentChanges,
   listRecentBugs,
   getWhyChanged,
@@ -27,6 +28,28 @@ import {
   getProjectStatus,
 } from './project-memory.js';
 import { serializeQueryProjectResponse } from './output-format.js';
+
+function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
+  return ranges
+    .map(range => range.startLine === range.endLine ? `${range.startLine}` : `${range.startLine}-${range.endLine}`)
+    .join(', ');
+}
+
+function formatGraphList(label: string, relation: { total: number; symbols: string[] } | undefined): string | null {
+  if (!relation || relation.total === 0) return null;
+  const suffix = relation.total > relation.symbols.length ? ', ...' : '';
+  return `${label}: ${relation.total} (${relation.symbols.join(', ')}${suffix})`;
+}
+
+function formatCallSiteList(label: string, relation: { sites: Array<{ symbol: string; file: string; line: number }> } | undefined): string | null {
+  if (!relation || relation.sites.length === 0) return null;
+  return `${label} places: ${relation.sites.map(site => `${site.symbol} @ ${site.file}:${site.line}`).join('; ')}`;
+}
+
+function formatSymbolList(label: string, values: string[] | undefined): string | null {
+  if (!values || values.length === 0) return null;
+  return `${label}: ${values.join(', ')}`;
+}
 
 function drawBar(label: string, done: number, total: number): void {
   const W = 25;
@@ -44,8 +67,49 @@ function renderQueryChunkText(result: RetrievedChunk): string {
   const lines = [
     `File:   ${result.file}`,
     `Symbol: ${result.symbol} (${result.type})`,
+    `Lines:  ${result.lineStart ?? '?'}-${result.lineEnd ?? '?'}`,
     `Ranking: hybrid ${result.score.toFixed(3)} | semantic ${(result.semanticScore ?? 0).toFixed(3)}`,
   ];
+
+  if (result.freshness) {
+    lines.push(`Index refreshed: ${result.freshness.indexRefreshedAt ?? 'unknown'}`);
+    if (result.freshness.latestChange) {
+      lines.push(
+        `Latest slice change: ${result.freshness.latestChange.timestamp || 'unknown'} ${result.freshness.latestChange.sha.slice(0, 12)} ${result.freshness.latestChange.title}`
+      );
+      if (result.freshness.latestChange.changedLines.length > 0) {
+        lines.push(`Changed lines in slice: ${formatLineRanges(result.freshness.latestChange.changedLines)}`);
+      }
+    }
+    if (result.freshness.reasons.length > 0) {
+      lines.push(`Freshness: re-index recommended (${result.freshness.reasons.join('; ')})`);
+    }
+  }
+
+  const graphLines = [
+    formatGraphList('Calls', result.graphSummary?.calls),
+    formatCallSiteList('Call', result.graphSummary?.calls),
+    formatGraphList('Used by', result.graphSummary?.usedBy),
+    formatCallSiteList('Used by', result.graphSummary?.usedBy),
+    formatGraphList('Supertypes', result.graphSummary?.supertypes),
+    formatGraphList('Subtypes', result.graphSummary?.subtypes),
+    formatGraphList('Implements', result.graphSummary?.implements),
+    formatGraphList('Implemented by', result.graphSummary?.implementedBy),
+  ].filter((line): line is string => Boolean(line));
+  lines.push(...graphLines);
+
+  if ((result.connectionsWithinResults?.total ?? 0) > 0) {
+    lines.push(`Connected returned slices: ${result.connectionsWithinResults?.total}`);
+    const connectionLines = [
+      formatSymbolList('Returned calls', result.connectionsWithinResults?.calls),
+      formatSymbolList('Returned used by', result.connectionsWithinResults?.usedBy),
+      formatSymbolList('Returned supertypes', result.connectionsWithinResults?.supertypes),
+      formatSymbolList('Returned subtypes', result.connectionsWithinResults?.subtypes),
+      formatSymbolList('Returned implements', result.connectionsWithinResults?.implements),
+      formatSymbolList('Returned implemented by', result.connectionsWithinResults?.implementedBy),
+    ].filter((line): line is string => Boolean(line));
+    lines.push(...connectionLines);
+  }
 
   if (result.rankingSignals && result.rankingSignals.length > 0) {
     lines.push(`Signals: ${result.rankingSignals.join('; ')}`);
@@ -105,15 +169,22 @@ program
   .option('--format <format>', 'Output format: text|json', 'text')
   .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
   .action(async (question: string, opts: { dir: string; format: 'text' | 'json'; qdrant: string }) => {
-    const results = await queryProject(path.resolve(opts.dir), question, opts.qdrant);
+    const root = path.resolve(opts.dir);
+    const results = await queryProject(root, question, opts.qdrant);
+    const memoryFreshness = getProjectMemoryFreshness(root);
     if (!results.length) {
       console.log('No results found.');
       return;
     }
 
     if (opts.format === 'json') {
-      console.log(JSON.stringify(serializeQueryProjectResponse(question, results), null, 2));
+      console.log(JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness), null, 2));
       return;
+    }
+
+    console.log(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
+    if (memoryFreshness.reasons.length > 0) {
+      console.log(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);
     }
 
     for (const r of results) {

@@ -1,4 +1,4 @@
-import { Project, SyntaxKind } from 'ts-morph';
+import { Project, type Node as MorphNode, type SourceFile, SyntaxKind } from 'ts-morph';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
@@ -11,6 +11,8 @@ export interface CodeChunk {
   type: 'function' | 'class' | 'method' | 'file';
   code: string;
   imports: string[];
+  lineStart: number;
+  lineEnd: number;
 }
 
 // Extensions indexed as whole-file plain-text chunks (no AST)
@@ -33,6 +35,20 @@ function isPlainFile(filePath: string): boolean {
 
 const MAX_PLAIN_BYTES = 32_000; // skip huge generated files
 
+function lineRangeForNode(sourceFile: SourceFile, node: MorphNode): { lineStart: number; lineEnd: number } {
+  return {
+    lineStart: sourceFile.getLineAndColumnAtPos(node.getStart()).line,
+    lineEnd: sourceFile.getLineAndColumnAtPos(node.getEnd()).line,
+  };
+}
+
+function lineRangeForText(text: string): { lineStart: number; lineEnd: number } {
+  return {
+    lineStart: 1,
+    lineEnd: Math.max(1, text.split('\n').length),
+  };
+}
+
 function indexPlainFiles(rootDir: string): CodeChunk[] {
   const chunks: CodeChunk[] = [];
   const allFiles = walkFiles(rootDir, [...PLAIN_EXTS], PLAIN_NAMES);
@@ -49,6 +65,7 @@ function indexPlainFiles(rootDir: string): CodeChunk[] {
       type: 'file',
       code,
       imports: [],
+      ...lineRangeForText(code),
     });
   }
   return chunks;
@@ -72,6 +89,7 @@ export function indexDirectory(rootDir: string): CodeChunk[] {
 
     for (const fn of sf.getFunctions()) {
       const name = fn.getName() ?? '<anonymous>';
+      const range = lineRangeForNode(sf, fn);
       chunks.push({
         id: chunkId(relPath, name),
         file: relPath,
@@ -79,11 +97,13 @@ export function indexDirectory(rootDir: string): CodeChunk[] {
         type: 'function',
         code: fn.getText(),
         imports,
+        ...range,
       });
     }
 
     for (const cls of sf.getClasses()) {
       const className = cls.getName() ?? '<anonymous>';
+      const classRange = lineRangeForNode(sf, cls);
       chunks.push({
         id: chunkId(relPath, className),
         file: relPath,
@@ -91,10 +111,12 @@ export function indexDirectory(rootDir: string): CodeChunk[] {
         type: 'class',
         code: cls.getText(),
         imports,
+        ...classRange,
       });
 
       for (const method of cls.getMethods()) {
         const sym = `${className}.${method.getName()}`;
+        const methodRange = lineRangeForNode(sf, method);
         chunks.push({
           id: chunkId(relPath, sym),
           file: relPath,
@@ -102,6 +124,7 @@ export function indexDirectory(rootDir: string): CodeChunk[] {
           type: 'method',
           code: method.getText(),
           imports,
+          ...methodRange,
         });
       }
     }
@@ -158,6 +181,8 @@ export function walkFiles(dir: string, exts: string[], extraNames?: Set<string>)
 // --- Differential index manifest ---
 
 export interface Manifest {
+  /** ISO timestamp when the index manifest was written */
+  indexedAt?: string;
   /** relPath → last-seen mtime in ms */
   mtimes: Record<string, number>;
   /** relPath → chunk IDs extracted from that file */
@@ -189,7 +214,7 @@ export function buildManifest(rootDir: string, chunks: CodeChunk[]): Manifest {
       if (fs.existsSync(abs)) mtimes[c.file] = fs.statSync(abs).mtimeMs;
     }
   }
-  return { mtimes, fileChunks };
+  return { indexedAt: new Date().toISOString(), mtimes, fileChunks };
 }
 
 // 32-char hex id derived from file path + symbol name

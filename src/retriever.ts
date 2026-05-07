@@ -1,7 +1,8 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
-import { loadGraph, type GraphData } from './graph.js';
+import { loadGraph, type GraphCallSite, type GraphData } from './graph.js';
 import { collectionName, embedQuery } from './embedder.js';
 import { getProjectMemoryEntries, type ProjectMemoryEntry } from './project-memory.js';
+import { getRetrievedSliceFreshness, type RetrievedSliceFreshness } from './query-freshness.js';
 
 const MAX_CHARS = 3000 * 4; // ~3000 tokens (1 token ≈ 4 chars)
 const STOP_WORDS = new Set([
@@ -16,9 +17,29 @@ export interface RetrievedChunk {
   symbol: string;
   type: string;
   code: string;
+  lineStart?: number;
+  lineEnd?: number;
+  graphSummary?: {
+    calls: { total: number; symbols: string[]; sites: Array<{ symbol: string; file: string; line: number }> };
+    usedBy: { total: number; symbols: string[]; sites: Array<{ symbol: string; file: string; line: number }> };
+    supertypes: { total: number; symbols: string[] };
+    subtypes: { total: number; symbols: string[] };
+    implements: { total: number; symbols: string[] };
+    implementedBy: { total: number; symbols: string[] };
+  };
+  connectionsWithinResults?: {
+    total: number;
+    calls: string[];
+    usedBy: string[];
+    supertypes: string[];
+    subtypes: string[];
+    implements: string[];
+    implementedBy: string[];
+  };
   score: number;
   semanticScore?: number;
   rankingSignals?: string[];
+  freshness?: RetrievedSliceFreshness;
   scoreBreakdown?: {
     semantic: number;
     symbolOverlap: number;
@@ -52,6 +73,85 @@ function graphNeighbors(graph: GraphData | null, symbol: string): string[] {
     ...(graph.supertypes?.[symbol] ?? []),
     ...(graph.subtypes?.[symbol] ?? []),
   ])];
+}
+
+function summarizeRelation(values: string[], limit = 5): { total: number; symbols: string[] } {
+  const unique = [...new Set(values)];
+  return {
+    total: unique.length,
+    symbols: unique.slice(0, limit),
+  };
+}
+
+function summarizeSites(values: GraphCallSite[] | undefined, limit = 5): Array<{ symbol: string; file: string; line: number }> {
+  const entries = values ?? [];
+  const seen = new Set<string>();
+  const result: Array<{ symbol: string; file: string; line: number }> = [];
+  for (const entry of entries) {
+    const key = `${entry.symbol}::${entry.file}::${entry.line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ symbol: entry.symbol, file: entry.file, line: entry.line });
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
+function buildGraphSummary(graph: GraphData | null, symbol: string): RetrievedChunk['graphSummary'] {
+  return {
+    calls: {
+      ...summarizeRelation(graph?.symbols[symbol] ?? []),
+      sites: summarizeSites(graph?.callSites?.[symbol]),
+    },
+    usedBy: {
+      ...summarizeRelation(graph?.callers?.[symbol] ?? []),
+      sites: summarizeSites(graph?.calledBySites?.[symbol]),
+    },
+    supertypes: summarizeRelation(graph?.supertypes?.[symbol] ?? []),
+    subtypes: summarizeRelation(graph?.subtypes?.[symbol] ?? []),
+    implements: summarizeRelation(graph?.implementedFrom?.[symbol] ?? []),
+    implementedBy: summarizeRelation(graph?.implementations?.[symbol] ?? []),
+  };
+}
+
+function intersectReturnedSymbols(values: string[], returnedSymbols: Set<string>, currentSymbol: string): string[] {
+  return [...new Set(values)].filter(symbol => symbol !== currentSymbol && returnedSymbols.has(symbol));
+}
+
+export function connectRetrievedChunksWithinResults(
+  results: RetrievedChunk[],
+  graph: GraphData | null
+): RetrievedChunk[] {
+  const returnedSymbols = new Set(results.map(result => result.symbol));
+  return results.map(result => {
+    const calls = intersectReturnedSymbols(graph?.symbols[result.symbol] ?? [], returnedSymbols, result.symbol);
+    const usedBy = intersectReturnedSymbols(graph?.callers?.[result.symbol] ?? [], returnedSymbols, result.symbol);
+    const supertypes = intersectReturnedSymbols(graph?.supertypes?.[result.symbol] ?? [], returnedSymbols, result.symbol);
+    const subtypes = intersectReturnedSymbols(graph?.subtypes?.[result.symbol] ?? [], returnedSymbols, result.symbol);
+    const implementsSymbols = intersectReturnedSymbols(graph?.implementedFrom?.[result.symbol] ?? [], returnedSymbols, result.symbol);
+    const implementedBy = intersectReturnedSymbols(graph?.implementations?.[result.symbol] ?? [], returnedSymbols, result.symbol);
+    const total = new Set([
+      ...calls,
+      ...usedBy,
+      ...supertypes,
+      ...subtypes,
+      ...implementsSymbols,
+      ...implementedBy,
+    ]).size;
+
+    return {
+      ...result,
+      connectionsWithinResults: {
+        total,
+        calls,
+        usedBy,
+        supertypes,
+        subtypes,
+        implements: implementsSymbols,
+        implementedBy,
+      },
+    } satisfies RetrievedChunk;
+  });
 }
 
 function buildMemorySupport(
@@ -163,6 +263,8 @@ export async function retrieve(
     symbol: h.payload!['symbol'] as string,
     type: h.payload!['type'] as string,
     code: h.payload!['code'] as string,
+    lineStart: typeof h.payload?.['lineStart'] === 'number' ? h.payload['lineStart'] as number : undefined,
+    lineEnd: typeof h.payload?.['lineEnd'] === 'number' ? h.payload['lineEnd'] as number : undefined,
     score: h.score,
     semanticScore: h.score,
   }));
@@ -216,6 +318,8 @@ export async function retrieve(
             symbol: sym,
             type: p.payload!['type'] as string,
             code: p.payload!['code'] as string,
+            lineStart: typeof p.payload?.['lineStart'] === 'number' ? p.payload['lineStart'] as number : undefined,
+            lineEnd: typeof p.payload?.['lineEnd'] === 'number' ? p.payload['lineEnd'] as number : undefined,
             score: 0,
             semanticScore: 0,
           });
@@ -255,6 +359,8 @@ export async function retrieve(
           symbol: sym,
           type: p.payload!['type'] as string,
           code: p.payload!['code'] as string,
+          lineStart: typeof p.payload?.['lineStart'] === 'number' ? p.payload['lineStart'] as number : undefined,
+          lineEnd: typeof p.payload?.['lineEnd'] === 'number' ? p.payload['lineEnd'] as number : undefined,
           score: 0,
           semanticScore: 0,
         });
@@ -264,13 +370,19 @@ export async function retrieve(
   }
 
   const memoryEntries = getProjectMemoryEntries(projectRoot);
-  const ranked = rankRetrievedChunks(query, results, graph, memoryEntries);
+  const ranked = rankRetrievedChunks(query, results, graph, memoryEntries)
+    .map(result => ({
+      ...result,
+      graphSummary: buildGraphSummary(graph, result.symbol),
+      freshness: getRetrievedSliceFreshness(projectRoot, result.file, result.lineStart, result.lineEnd),
+    }));
 
   // 5. Truncate to ~3000 tokens
   let total = 0;
-  return ranked.filter(r => {
+  const truncated = ranked.filter(r => {
     if (total + r.code.length > MAX_CHARS) return false;
     total += r.code.length;
     return true;
   });
+  return connectRetrievedChunksWithinResults(truncated, graph);
 }

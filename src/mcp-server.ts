@@ -21,6 +21,7 @@ import {
   getFeatureMap,
   getBugBrief,
   getProjectMemoryCount,
+  getProjectMemoryFreshness,
   getProjectStatus,
   getWhyChanged,
   listRecentChanges,
@@ -42,26 +43,33 @@ import {
   serializeFeatureBriefResponse,
   serializeQueryProjectResponse,
 } from './output-format.js';
+import { buildEnrichedSymbolContext, type IndexedSymbolPoint } from './symbol-context.js';
 
 const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositories, indexes and project memory are branch-scoped, so check status or re-index after switching branches.';
 const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
 
-type IndexedPoint = {
-  payload?: Record<string, unknown> | null;
-};
+type IndexedPoint = IndexedSymbolPoint;
 
-function formatGraphContext(graph: GraphData | null, symbol: string): string[] {
-  const directSupertypes = graph?.supertypes?.[symbol] ?? [];
-  const directSubtypes = graph?.subtypes?.[symbol] ?? [];
-  const implementedFrom = graph?.implementedFrom?.[symbol] ?? [];
-  const implementations = graph?.implementations?.[symbol] ?? [];
+function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
+  return ranges
+    .map(range => range.startLine === range.endLine ? `${range.startLine}` : `${range.startLine}-${range.endLine}`)
+    .join(', ');
+}
 
-  return [
-    directSupertypes.length ? `**Direct supertypes (${directSupertypes.length}):** ${directSupertypes.join(', ')}` : '',
-    directSubtypes.length ? `**Direct subtypes (${directSubtypes.length}):** ${directSubtypes.join(', ')}` : '',
-    implementedFrom.length ? `**Implements / overrides (${implementedFrom.length}):** ${implementedFrom.join(', ')}` : '',
-    implementations.length ? `**Known implementations (${implementations.length}):** ${implementations.join(', ')}` : '',
-  ].filter(Boolean);
+function formatGraphRelation(label: string, relation: { total: number; symbols: string[] } | undefined): string {
+  if (!relation || relation.total === 0) return '';
+  const suffix = relation.total > relation.symbols.length ? ', ...' : '';
+  return `**${label}:** ${relation.total} (${relation.symbols.join(', ')}${suffix})`;
+}
+
+function formatCallSiteRelation(label: string, relation: { sites: Array<{ symbol: string; file: string; line: number }> } | undefined): string {
+  if (!relation || relation.sites.length === 0) return '';
+  return `**${label} places:** ${relation.sites.map(site => `${site.symbol} @ ${site.file}:${site.line}`).join('; ')}`;
+}
+
+function formatSymbolRelation(label: string, values: string[] | undefined): string {
+  if (!values || values.length === 0) return '';
+  return `**${label}:** ${values.join(', ')}`;
 }
 
 async function scrollSymbolPoints(qdrant: QdrantClient, collection: string, symbols: string[]): Promise<IndexedPoint[]> {
@@ -91,20 +99,31 @@ function groupPointsBySymbol(points: IndexedPoint[]): Map<string, IndexedPoint[]
   return grouped;
 }
 
-function renderIndexedSymbol(graph: GraphData | null, symbol: string, point?: IndexedPoint): string {
-  const payload = point?.payload ?? null;
-  const file = typeof payload?.['file'] === 'string' ? payload['file'] : graph?.symbolFile?.[symbol] ?? '?';
-  const type = typeof payload?.['type'] === 'string' ? payload['type'] : 'unknown';
-  const code = typeof payload?.['code'] === 'string' ? payload['code'] : null;
-  const callees = graph?.symbols[symbol] ?? [];
-  const callers = graph?.callers?.[symbol] ?? [];
-
+function renderIndexedSymbol(projectRoot: string, graph: GraphData | null, symbol: string, point?: IndexedPoint): string {
+  const context = buildEnrichedSymbolContext(projectRoot, graph, symbol, point);
   return [
-    `**${symbol}** (${type}) — ${file}`,
-    callees.length ? `**Calls (${callees.length}):** ${callees.join(', ')}` : '',
-    callers.length ? `**Called by (${callers.length}):** ${callers.join(', ')}` : '',
-    ...formatGraphContext(graph, symbol),
-    code ? `\`\`\`\n${code}\n\`\`\`` : '*(code not in index)*',
+    `**${context.symbol}** (${context.type}) — ${context.file}`,
+    context.lineStart && context.lineEnd ? `**Lines:** ${context.lineStart}-${context.lineEnd}` : '',
+    context.freshness.indexRefreshedAt ? `**Slice index refreshed:** ${context.freshness.indexRefreshedAt}` : '',
+    context.freshness.latestChange
+      ? `**Latest slice change:** ${context.freshness.latestChange.timestamp || 'unknown'} ${context.freshness.latestChange.sha.slice(0, 12)} ${context.freshness.latestChange.title}`
+      : '',
+    context.freshness.latestChange?.changedLines.length
+      ? `**Changed lines in slice:** ${formatLineRanges(context.freshness.latestChange.changedLines)}`
+      : '',
+    context.freshness.reasons.length > 0
+      ? `**Freshness:** re-index recommended (${context.freshness.reasons.join('; ')})`
+      : '',
+    formatGraphRelation('Calls', context.graph.calls),
+    formatCallSiteRelation('Call', context.graph.calls),
+    formatGraphRelation('Used by', context.graph.usedBy),
+    formatCallSiteRelation('Used by', context.graph.usedBy),
+    formatGraphRelation('Supertypes', context.graph.supertypes),
+    formatGraphRelation('Subtypes', context.graph.subtypes),
+    formatGraphRelation('Implements', context.graph.implements),
+    formatGraphRelation('Implemented by', context.graph.implementedBy),
+    `**Recommended next MCP calls:** ${context.nextCalls.map(call => `${call.tool} (${call.reason})`).join('; ')}`,
+    context.code ? `\`\`\`\n${context.code}\n\`\`\`` : '*(code not in index)*',
   ].filter(Boolean).join('\n');
 }
 
@@ -151,32 +170,56 @@ function createMcpServer(): McpServer {
     async ({ projectRoot, question, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       const results = await queryProject(root, question, qdrantUrl);
+      const memoryFreshness = getProjectMemoryFreshness(root);
       if (!results.length) {
         return { content: [{ type: 'text', text: 'No results found.' }] };
       }
       if (format === 'json') {
-        return { content: [{ type: 'text', text: JSON.stringify(serializeQueryProjectResponse(question, results), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness), null, 2) }] };
       }
-      const graphPath = path.join(getDataDir(root), 'graph.json');
-      const graph = loadGraph(graphPath);
+      const sections = [];
+      sections.push(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
+      if (memoryFreshness.reasons.length > 0) {
+        sections.push(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);
+      }
       const output = results
         .map(r => {
           const hybridScore = r.score;
           const semanticScore = r.semanticScore ?? 0;
-          const callees = graph?.symbols[r.symbol] ?? [];
-          const callers = graph?.callers?.[r.symbol] ?? [];
-          const directSupertypes = graph?.supertypes?.[r.symbol] ?? [];
-          const implementations = graph?.implementations?.[r.symbol] ?? [];
-          const graphParts = [
-            callees.length ? `calls: ${callees.join(', ')}` : '',
-            callers.length ? `calledBy: ${callers.join(', ')}` : '',
-            directSupertypes.length ? `inherits: ${directSupertypes.join(', ')}` : '',
-            implementations.length ? `implementedBy: ${implementations.slice(0, 6).join(', ')}${implementations.length > 6 ? ', ...' : ''}` : '',
-          ].filter(Boolean).join(' | ');
           return [
             `**File:** ${r.file}`,
-            `**Symbol:** ${r.symbol} (${r.type})${graphParts ? ` — ${graphParts}` : ''}`,
+            `**Symbol:** ${r.symbol} (${r.type})`,
+            r.lineStart && r.lineEnd ? `**Lines:** ${r.lineStart}-${r.lineEnd}` : '',
             `**Ranking:** hybrid ${hybridScore.toFixed(3)} | semantic ${semanticScore.toFixed(3)}`,
+            r.freshness?.indexRefreshedAt
+              ? `**Slice index refreshed:** ${r.freshness.indexRefreshedAt}`
+              : '',
+            r.freshness?.latestChange
+              ? `**Latest slice change:** ${r.freshness.latestChange.timestamp || 'unknown'} ${r.freshness.latestChange.sha.slice(0, 12)} ${r.freshness.latestChange.title}`
+              : '',
+            r.freshness?.latestChange?.changedLines.length
+              ? `**Changed lines in slice:** ${formatLineRanges(r.freshness.latestChange.changedLines)}`
+              : '',
+            r.freshness && r.freshness.reasons.length > 0
+              ? `**Freshness:** re-index recommended (${r.freshness.reasons.join('; ')})`
+              : '',
+            formatGraphRelation('Calls', r.graphSummary?.calls),
+            formatCallSiteRelation('Call', r.graphSummary?.calls),
+            formatGraphRelation('Used by', r.graphSummary?.usedBy),
+            formatCallSiteRelation('Used by', r.graphSummary?.usedBy),
+            formatGraphRelation('Supertypes', r.graphSummary?.supertypes),
+            formatGraphRelation('Subtypes', r.graphSummary?.subtypes),
+            formatGraphRelation('Implements', r.graphSummary?.implements),
+            formatGraphRelation('Implemented by', r.graphSummary?.implementedBy),
+            (r.connectionsWithinResults?.total ?? 0) > 0
+              ? `**Connected returned slices:** ${r.connectionsWithinResults?.total}`
+              : '',
+            formatSymbolRelation('Returned calls', r.connectionsWithinResults?.calls),
+            formatSymbolRelation('Returned used by', r.connectionsWithinResults?.usedBy),
+            formatSymbolRelation('Returned supertypes', r.connectionsWithinResults?.supertypes),
+            formatSymbolRelation('Returned subtypes', r.connectionsWithinResults?.subtypes),
+            formatSymbolRelation('Returned implements', r.connectionsWithinResults?.implements),
+            formatSymbolRelation('Returned implemented by', r.connectionsWithinResults?.implementedBy),
             r.rankingSignals && r.rankingSignals.length > 0
               ? `**Ranking signals:** ${r.rankingSignals.join('; ')}`
               : '',
@@ -187,7 +230,8 @@ function createMcpServer(): McpServer {
           ].join('\n');
         })
         .join('\n\n---\n\n');
-      return { content: [{ type: 'text', text: output }] };
+      sections.push(output);
+      return { content: [{ type: 'text', text: sections.join('\n\n') }] };
     }
   );
 
@@ -490,22 +534,7 @@ function createMcpServer(): McpServer {
         return { content: [{ type: 'text', text: `Symbol "${symbol}" not found in index.` }] };
       }
 
-      const callees = graph?.symbols[symbol] ?? [];
-      const callers = graph?.callers?.[symbol] ?? [];
-
-      const output = points.map(p => {
-        const file = p.payload!['file'] as string;
-        const type = p.payload!['type'] as string;
-        const code = p.payload!['code'] as string;
-        return [
-          `**File:** ${file}`,
-          `**Type:** ${type}`,
-          callees.length ? `**Calls (${callees.length}):** ${callees.join(', ')}` : '',
-          callers.length ? `**Called by (${callers.length}):** ${callers.join(', ')}` : '',
-          ...formatGraphContext(graph, symbol),
-          `\`\`\`\n${code}\n\`\`\``,
-        ].filter(Boolean).join('\n');
-      }).join('\n\n---\n\n');
+      const output = points.map(p => renderIndexedSymbol(root, graph, symbol, p)).join('\n\n---\n\n');
 
       return { content: [{ type: 'text', text: output }] };
     }
@@ -557,7 +586,7 @@ function createMcpServer(): McpServer {
       const sections: string[] = [];
       for (const [sym, pts] of bySymbol) {
         for (const p of pts) {
-          sections.push(renderIndexedSymbol(graph, sym, p));
+          sections.push(renderIndexedSymbol(root, graph, sym, p));
         }
       }
 
@@ -618,7 +647,7 @@ function createMcpServer(): McpServer {
       for (const group of groups) {
         sections.push(`\n### ${group.title}`);
         for (const ref of group.symbols) {
-          sections.push(renderIndexedSymbol(graph, ref, pointMap.get(ref)?.[0]));
+          sections.push(renderIndexedSymbol(root, graph, ref, pointMap.get(ref)?.[0]));
         }
       }
 
@@ -663,7 +692,7 @@ function createMcpServer(): McpServer {
       ].filter(Boolean);
 
       for (const implementation of shownSymbols) {
-        sections.push(renderIndexedSymbol(graph, implementation, pointMap.get(implementation)?.[0]));
+        sections.push(renderIndexedSymbol(root, graph, implementation, pointMap.get(implementation)?.[0]));
       }
 
       return { content: [{ type: 'text', text: sections.join('\n\n') }] };
@@ -746,18 +775,8 @@ function createMcpServer(): McpServer {
       const ordered = [...seeds, ...symbolList.filter(s => !seeds.includes(s))];
       for (const sym of ordered) {
         const p = bySymbol.get(sym);
-        const callees = graph.symbols[sym] ?? [];
-        const callers = graph.callers?.[sym] ?? [];
-        const file = p ? (p.payload!['file'] as string) : graph.symbolFile?.[sym] ?? '?';
-        const type = p ? (p.payload!['type'] as string) : 'unknown';
-        const code = p ? `\`\`\`\n${p.payload!['code'] as string}\n\`\`\`` : '*(code not in index)*';
-        sections.push([
-          `### ${sym} (${type}) — ${file}`,
-          callees.length ? `→ calls: ${callees.join(', ')}` : '',
-          callers.length ? `← calledBy: ${callers.join(', ')}` : '',
-          ...formatGraphContext(graph, sym),
-          code,
-        ].filter(Boolean).join('\n'));
+        sections.push(`### ${sym}`);
+        sections.push(renderIndexedSymbol(root, graph, sym, p));
       }
 
       return { content: [{ type: 'text', text: sections.join('\n\n') }] };
@@ -836,20 +855,7 @@ function createMcpServer(): McpServer {
       }
 
       const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
-      const output = points.map(p => {
-        const symbol = p.payload!['symbol'] as string;
-        const type = p.payload!['type'] as string;
-        const code = p.payload!['code'] as string;
-        const callees = graph?.symbols[symbol] ?? [];
-        const callers = graph?.callers?.[symbol] ?? [];
-        return [
-          `**${symbol}** (${type})`,
-          callees.length ? `calls: ${callees.join(', ')}` : '',
-          callers.length ? `calledBy: ${callers.join(', ')}` : '',
-          ...formatGraphContext(graph, symbol),
-          `\`\`\`\n${code}\n\`\`\``,
-        ].filter(Boolean).join('\n');
-      }).join('\n\n---\n\n');
+      const output = points.map(p => renderIndexedSymbol(root, graph, p.payload!['symbol'] as string, p)).join('\n\n---\n\n');
 
       return { content: [{ type: 'text', text: output }] };
     }

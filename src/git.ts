@@ -32,6 +32,20 @@ export interface GitWorkingTreeChange {
   status: string;
 }
 
+export interface GitLineRange {
+  startLine: number;
+  endLine: number;
+}
+
+export interface GitLineCommitHistory {
+  sha: string;
+  authorName: string;
+  authorEmail: string;
+  authoredAt: string;
+  summary: string;
+  lineRanges: GitLineRange[];
+}
+
 function parseGitDirFile(dotGitFile: string): string | null {
   try {
     const raw = fs.readFileSync(dotGitFile, 'utf-8').trim();
@@ -329,4 +343,115 @@ export function getWorkingTreeChanges(projectRoot: string): GitWorkingTreeChange
         : rawPath;
       return { path: pathText, status } satisfies GitWorkingTreeChange;
     });
+}
+
+function compactLineRanges(lines: number[]): GitLineRange[] {
+  const sorted = [...new Set(lines)].sort((left, right) => left - right);
+  if (sorted.length === 0) return [];
+  const ranges: GitLineRange[] = [];
+  let startLine = sorted[0];
+  let endLine = sorted[0];
+  for (let index = 1; index < sorted.length; index += 1) {
+    const line = sorted[index];
+    if (line === endLine + 1) {
+      endLine = line;
+      continue;
+    }
+    ranges.push({ startLine, endLine });
+    startLine = line;
+    endLine = line;
+  }
+  ranges.push({ startLine, endLine });
+  return ranges;
+}
+
+export function getLineCommitHistory(
+  projectRoot: string,
+  filePath: string,
+  startLine: number,
+  endLine: number
+): GitLineCommitHistory[] {
+  if (!isGitRepo(projectRoot)) return [];
+  if (startLine < 1 || endLine < startLine) return [];
+
+  let raw = '';
+  try {
+    raw = runGit(projectRoot, [
+      'blame',
+      '--line-porcelain',
+      '-L',
+      `${startLine},${endLine}`,
+      '--',
+      filePath,
+    ]);
+  } catch {
+    return [];
+  }
+
+  const commits = new Map<string, { meta: Omit<GitLineCommitHistory, 'lineRanges'>; lines: number[] }>();
+  const lines = raw.split('\n');
+  let index = 0;
+
+  while (index < lines.length) {
+    const header = /^([0-9a-f]{40}|0{40})\s+\d+\s+(\d+)(?:\s+(\d+))?$/.exec(lines[index] ?? '');
+    if (!header) {
+      index += 1;
+      continue;
+    }
+
+    const sha = header[1];
+    const finalLine = Number(header[2]);
+    const lineCount = header[3] ? Number(header[3]) : 1;
+    index += 1;
+
+    let authorName = '';
+    let authorEmail = '';
+    let authoredAt = '';
+    let summary = '';
+
+    while (index < lines.length) {
+      const line = lines[index] ?? '';
+      if (line.startsWith('\t')) {
+        index += 1;
+        break;
+      }
+      if (line.startsWith('author ')) authorName = line.slice('author '.length).trim();
+      else if (line.startsWith('author-mail ')) authorEmail = line.slice('author-mail '.length).trim().replace(/^<|>$/g, '');
+      else if (line.startsWith('author-time ')) {
+        const seconds = Number(line.slice('author-time '.length).trim());
+        authoredAt = Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : '';
+      } else if (line.startsWith('summary ')) summary = line.slice('summary '.length).trim();
+      index += 1;
+    }
+
+    if (!commits.has(sha)) {
+      commits.set(sha, {
+        meta: {
+          sha,
+          authorName,
+          authorEmail,
+          authoredAt,
+          summary,
+        },
+        lines: [],
+      });
+    }
+
+    const entry = commits.get(sha);
+    if (!entry) continue;
+    for (let offset = 0; offset < lineCount; offset += 1) {
+      entry.lines.push(finalLine + offset);
+    }
+    if (!entry.meta.authorName && authorName) entry.meta.authorName = authorName;
+    if (!entry.meta.authorEmail && authorEmail) entry.meta.authorEmail = authorEmail;
+    if (!entry.meta.authoredAt && authoredAt) entry.meta.authoredAt = authoredAt;
+    if (!entry.meta.summary && summary) entry.meta.summary = summary;
+  }
+
+  return [...commits.values()]
+    .map(entry => ({
+      ...entry.meta,
+      lineRanges: compactLineRanges(entry.lines),
+    }))
+    .sort((left, right) => Date.parse(right.authoredAt || '1970-01-01T00:00:00.000Z') - Date.parse(left.authoredAt || '1970-01-01T00:00:00.000Z'));
 }

@@ -206,6 +206,8 @@ export async function embedAndStore(
         symbol: chunk.symbol,
         type: chunk.type,
         code: chunk.code,
+        lineStart: chunk.lineStart,
+        lineEnd: chunk.lineEnd,
         chunkId: chunk.id,
       },
     });

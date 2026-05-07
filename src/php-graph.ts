@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { createRequire } from 'module';
 import { walkFiles } from './indexer.js';
-import type { GraphData } from './graph.js';
+import type { GraphCallSite, GraphData } from './graph.js';
 
 const require = createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -16,6 +16,10 @@ const Engine: new (opts: unknown) => PhpEngine =
 
 interface Node {
   kind: string;
+  loc?: {
+    start?: { line: number };
+    end?: { line: number };
+  };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   [key: string]: any;
 }
@@ -83,7 +87,7 @@ function registerImplementation(graph: GraphData, baseSymbol: string, implementa
 function makeParser(): PhpEngine {
   return new Engine({
     parser: { extractDoc: false, suppressErrors: true },
-    ast: { withPositions: false },
+    ast: { withPositions: true },
     lexer: { all_tokens: false },
   });
 }
@@ -104,18 +108,19 @@ function walk(node: Node, visitor: (n: Node) => void): void {
   }
 }
 
-/** Collect all call expressions within a subtree, returning callee name strings */
-function extractPhpCalls(node: Node): string[] {
-  const calls = new Set<string>();
+/** Collect all call expressions within a subtree, returning callee callsite entries */
+function extractPhpCalls(node: Node, relPath: string): GraphCallSite[] {
+  const calls: GraphCallSite[] = [];
   walk(node, n => {
     if (n.kind !== 'call') return;
     const what = n.what as Node | undefined;
     if (!what) return;
+    const line = n.loc?.start?.line ?? what.loc?.start?.line ?? 1;
 
     // Plain function call: foo()
     if (what.kind === 'identifier' || what.kind === 'name') {
       const name = nodeName(what);
-      if (name) calls.add(name);
+      if (name) calls.push({ symbol: name, file: relPath, line });
     }
 
     // Static call: ClassName::method()  or  self::method()
@@ -124,9 +129,9 @@ function extractPhpCalls(node: Node): string[] {
       const methodName = nodeName(what.offset);
       if (methodName) {
         if (className && className !== 'self' && className !== 'static' && className !== 'parent') {
-          calls.add(`${className}::${methodName}`);
+          calls.push({ symbol: `${className}::${methodName}`, file: relPath, line });
         } else {
-          calls.add(methodName);
+          calls.push({ symbol: methodName, file: relPath, line });
         }
       }
     }
@@ -137,14 +142,14 @@ function extractPhpCalls(node: Node): string[] {
       const obj = what.what as Node | undefined;
       if (methodName) {
         if (obj?.kind === 'variable' && (obj.name === 'this' || obj.name === 'self')) {
-          calls.add(methodName); // resolved further if we know the class name at call site
+          calls.push({ symbol: methodName, file: relPath, line }); // resolved further if we know the class name at call site
         } else {
-          calls.add(methodName);
+          calls.push({ symbol: methodName, file: relPath, line });
         }
       }
     }
   });
-  return [...calls];
+  return calls;
 }
 
 export function buildPhpGraph(rootDir: string, graph: GraphData): void {
@@ -204,12 +209,22 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
           const name = nodeName(n.name);
           if (!name) continue;
           const fullName = `${nsPrefix}${name}`;
-          const calls = extractPhpCalls(n.body ?? n);
-          graph.symbols[fullName] = [...new Set([...(graph.symbols[fullName] ?? []), ...calls])];
+          const calls = extractPhpCalls(n.body ?? n, relPath);
+          graph.symbols[fullName] = [...new Set([...(graph.symbols[fullName] ?? []), ...calls.map(call => call.symbol)])];
+          for (const call of calls) {
+            (graph.callSites![fullName] ??= []);
+            if (!graph.callSites![fullName].some(entry => entry.symbol === call.symbol && entry.file === call.file && entry.line === call.line)) {
+              graph.callSites![fullName].push(call);
+            }
+          }
           graph.symbolFile[fullName] = relPath;
           for (const callee of calls) {
-            (graph.callers[callee] ??= []);
-            if (!graph.callers[callee].includes(fullName)) graph.callers[callee].push(fullName);
+            (graph.callers[callee.symbol] ??= []);
+            if (!graph.callers[callee.symbol].includes(fullName)) graph.callers[callee.symbol].push(fullName);
+            (graph.calledBySites![callee.symbol] ??= []);
+            if (!graph.calledBySites![callee.symbol].some(entry => entry.symbol === fullName && entry.file === relPath && entry.line === callee.line)) {
+              graph.calledBySites![callee.symbol].push({ symbol: fullName, file: relPath, line: callee.line });
+            }
           }
         }
 
@@ -239,20 +254,30 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
             const methodName = nodeName(member.name);
             if (!methodName) continue;
             const sym = `${fullClassName}::${methodName}`;
-            const calls = extractPhpCalls(member.body ?? member);
+            const calls = extractPhpCalls(member.body ?? member, relPath);
             // Qualify $this->foo() as ClassName::foo when possible
             const qualifiedCalls = calls.map(c =>
               // If bare name and there's a method of same name in the class, qualify it
-              !c.includes('::') && !c.includes('\\') &&
-              body.some(m => m.kind === 'method' && nodeName(m.name) === c)
-                ? `${fullClassName}::${c}`
+              !c.symbol.includes('::') && !c.symbol.includes('\\') &&
+              body.some(m => m.kind === 'method' && nodeName(m.name) === c.symbol)
+                ? { ...c, symbol: `${fullClassName}::${c.symbol}` }
                 : c
             );
-            graph.symbols[sym] = [...new Set([...(graph.symbols[sym] ?? []), ...qualifiedCalls])];
+            graph.symbols[sym] = [...new Set([...(graph.symbols[sym] ?? []), ...qualifiedCalls.map(call => call.symbol)])];
+            for (const call of qualifiedCalls) {
+              (graph.callSites![sym] ??= []);
+              if (!graph.callSites![sym].some(entry => entry.symbol === call.symbol && entry.file === call.file && entry.line === call.line)) {
+                graph.callSites![sym].push(call);
+              }
+            }
             graph.symbolFile[sym] = relPath;
             for (const callee of qualifiedCalls) {
-              (graph.callers[callee] ??= []);
-              if (!graph.callers[callee].includes(sym)) graph.callers[callee].push(sym);
+              (graph.callers[callee.symbol] ??= []);
+              if (!graph.callers[callee.symbol].includes(sym)) graph.callers[callee.symbol].push(sym);
+              (graph.calledBySites![callee.symbol] ??= []);
+              if (!graph.calledBySites![callee.symbol].some(entry => entry.symbol === sym && entry.file === relPath && entry.line === callee.line)) {
+                graph.calledBySites![callee.symbol].push({ symbol: sym, file: relPath, line: callee.line });
+              }
             }
           }
         }

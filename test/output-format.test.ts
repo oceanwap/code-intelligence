@@ -14,8 +14,43 @@ test('serializeQueryProjectResponse exposes an explicit ranking contract', () =>
       symbol: 'AuthService.login',
       type: 'method',
       code: 'login() { return true; }',
+      lineStart: 12,
+      lineEnd: 18,
       score: 12.4,
       semanticScore: 0.72,
+      freshness: {
+        sliceStartLine: 12,
+        sliceEndLine: 18,
+        indexRefreshedAt: '2026-05-06T12:00:00.000Z',
+        indexedFileMtimeMs: 100,
+        currentFileMtimeMs: 100,
+        latestChange: {
+          sha: 'auth1234def567890',
+          title: 'Improve auth login flow',
+          timestamp: '2026-05-06T11:00:00.000Z',
+          authorName: 'Test User',
+          changedLines: [{ startLine: 14, endLine: 15 }],
+        },
+        needsReindex: false,
+        reasons: [],
+      },
+      graphSummary: {
+        calls: { total: 2, symbols: ['SessionStore.issue', 'AuditLog.record'], sites: [{ symbol: 'SessionStore.issue', file: 'src/session.ts', line: 21 }] },
+        usedBy: { total: 3, symbols: ['AuthController.handle', 'LoginRoute.post', 'CliAuthCommand.run'], sites: [{ symbol: 'AuthController.handle', file: 'src/controller.ts', line: 44 }] },
+        supertypes: { total: 1, symbols: ['BaseAuthService'] },
+        subtypes: { total: 0, symbols: [] },
+        implements: { total: 1, symbols: ['AuthPort.login'] },
+        implementedBy: { total: 0, symbols: [] },
+      },
+      connectionsWithinResults: {
+        total: 2,
+        calls: ['SessionStore.issue'],
+        usedBy: ['AuthController.handle'],
+        supertypes: [],
+        subtypes: [],
+        implements: [],
+        implementedBy: [],
+      },
       rankingSignals: ['strong semantic match', 'supported by project memory'],
       scoreBreakdown: {
         semantic: 7.2,
@@ -28,10 +63,28 @@ test('serializeQueryProjectResponse exposes an explicit ranking contract', () =>
     },
   ];
 
-  const response = serializeQueryProjectResponse('auth login flow', results);
+  const response = serializeQueryProjectResponse('auth login flow', results, {
+    memoryRefreshedAt: '2026-05-06T12:00:00.000Z',
+    indexedHeadSha: 'head123',
+    currentHeadSha: 'head123',
+    dirtyFileCount: 0,
+    dirtyFilesNewerThanMemory: 0,
+    needsReindex: false,
+    reasons: [],
+  });
 
   assert.equal(response.question, 'auth login flow');
+  assert.equal(response.memory.refreshedAt, '2026-05-06T12:00:00.000Z');
   assert.equal(response.resultCount, 1);
+  assert.equal(response.results[0]?.location.startLine, 12);
+  assert.equal(response.results[0]?.freshness.indexRefreshedAt, '2026-05-06T12:00:00.000Z');
+  assert.equal(response.results[0]?.freshness.latestChange?.changedLines[0]?.startLine, 14);
+  assert.equal(response.results[0]?.graph.usedBy.total, 3);
+  assert.deepEqual(response.results[0]?.graph.calls.symbols, ['SessionStore.issue', 'AuditLog.record']);
+  assert.equal(response.results[0]?.graph.calls.sites[0]?.line, 21);
+  assert.equal(response.results[0]?.graph.usedBy.sites[0]?.file, 'src/controller.ts');
+  assert.equal(response.results[0]?.connectionsWithinResults.total, 2);
+  assert.deepEqual(response.results[0]?.connectionsWithinResults.usedBy, ['AuthController.handle']);
   assert.equal(response.results[0]?.ranking.hybridScore, 12.4);
   assert.equal(response.results[0]?.ranking.semanticScore, 0.72);
   assert.deepEqual(response.results[0]?.ranking.signals, ['strong semantic match', 'supported by project memory']);

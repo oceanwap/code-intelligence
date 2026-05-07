@@ -109,6 +109,8 @@ export function indexPhpFiles(rootDir: string): CodeChunk[] {
         type: 'file',
         code: src.slice(0, 32_000),
         imports: [],
+        lineStart: 1,
+        lineEnd: Math.max(1, lines.length),
       });
       continue;
     }
@@ -147,6 +149,8 @@ export function indexPhpFiles(rootDir: string): CodeChunk[] {
             type: 'function',
             code: loc ? sliceLines(lines, loc.start.line, loc.end.line) : `function ${name}(...) { ... }`,
             imports,
+            lineStart: loc?.start.line ?? 1,
+            lineEnd: loc?.end.line ?? Math.max(1, lines.length),
           });
         }
 
@@ -164,6 +168,8 @@ export function indexPhpFiles(rootDir: string): CodeChunk[] {
             type: 'class',
             code: classLoc ? sliceLines(lines, classLoc.start.line, classLoc.end.line) : `class ${className} { ... }`,
             imports,
+            lineStart: classLoc?.start.line ?? 1,
+            lineEnd: classLoc?.end.line ?? Math.max(1, lines.length),
           });
 
           // Methods
@@ -181,6 +187,8 @@ export function indexPhpFiles(rootDir: string): CodeChunk[] {
               type: 'method',
               code: mLoc ? sliceLines(lines, mLoc.start.line, mLoc.end.line) : `public function ${methodName}(...) { ... }`,
               imports,
+              lineStart: mLoc?.start.line ?? 1,
+              lineEnd: mLoc?.end.line ?? Math.max(1, lines.length),
             });
           }
         }

@@ -57,6 +57,8 @@ test('buildGraph tracks TypeScript implementations and method overrides', t => {
   assert.deepEqual(new Set(graph.implementedFrom['ConcreteWorker.run']), new Set(['Worker.run', 'AdvancedWorker.run', 'BaseWorker.run']));
   assert.ok(graph.callers['helper']?.includes('BaseWorker.run'));
   assert.ok(graph.callers['helper']?.includes('ConcreteWorker.run'));
+  assert.ok(graph.callSites?.['BaseWorker.run']?.some(site => site.symbol === 'helper' && site.line === 11));
+  assert.ok(graph.calledBySites?.['helper']?.some(site => site.symbol === 'ConcreteWorker.run' && site.line === 17));
 });
 
 test('buildGraph tracks PHP implementations and method overrides', t => {
@@ -105,4 +107,6 @@ test('buildGraph tracks PHP implementations and method overrides', t => {
   assert.deepEqual(new Set(graph.implementedFrom['App\\ConcreteRunner::run']), new Set(['App\\Runner::run', 'App\\AdvancedRunner::run', 'App\\BaseRunner::run']));
   assert.ok(graph.callers['helper']?.includes('App\\BaseRunner::run'));
   assert.ok(graph.callers['helper']?.includes('App\\ConcreteRunner::run'));
+  assert.ok(graph.callSites?.['App\\BaseRunner::run']?.some(site => site.symbol === 'helper' && site.line === 15));
+  assert.ok(graph.calledBySites?.['helper']?.some(site => site.symbol === 'App\\ConcreteRunner::run' && site.line === 21));
 });

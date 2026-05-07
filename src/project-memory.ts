@@ -90,6 +90,16 @@ export interface ProjectMemorySyncResult {
     latestChangeSha: string | null;
 }
 
+export interface ProjectMemoryFreshness {
+    memoryRefreshedAt: string | null;
+    indexedHeadSha: string | null;
+    currentHeadSha: string | null;
+    dirtyFileCount: number;
+    dirtyFilesNewerThanMemory: number;
+    needsReindex: boolean;
+    reasons: string[];
+}
+
 export interface ProjectMemoryBuildResult {
     branch: string | null;
     headSha: string | null;
@@ -1051,6 +1061,46 @@ export function getProjectMemoryCount(projectRoot: string): number {
 
 export function getProjectMemoryEntries(projectRoot: string): ProjectMemoryEntry[] {
     return loadMemorySnapshot(path.resolve(projectRoot))?.entries ?? [];
+}
+
+export function getProjectMemoryFreshness(projectRoot: string): ProjectMemoryFreshness {
+    const root = path.resolve(projectRoot);
+    const snapshot = loadMemorySnapshot(root);
+    const currentHeadSha = getHeadCommit(root);
+    const dirtyFiles = getWorkingTreeChanges(root);
+    const memoryRefreshedAt = snapshot?.syncedAt ?? null;
+    const refreshedAtMs = memoryRefreshedAt ? Date.parse(memoryRefreshedAt) : null;
+    const dirtyFilesNewerThanMemory = refreshedAtMs === null
+        ? dirtyFiles.length
+        : dirtyFiles.filter(file => {
+            try {
+                return fs.statSync(path.join(root, file.path)).mtimeMs > refreshedAtMs;
+            } catch {
+                return true;
+            }
+        }).length;
+
+    const reasons: string[] = [];
+    if (!snapshot) {
+        reasons.push('project memory has not been refreshed yet');
+    } else {
+        if (snapshot.headSha !== currentHeadSha) {
+            reasons.push('current HEAD is newer than the indexed memory snapshot');
+        }
+        if (dirtyFilesNewerThanMemory > 0) {
+            reasons.push(`${dirtyFilesNewerThanMemory} dirty file(s) changed after the last memory refresh`);
+        }
+    }
+
+    return {
+        memoryRefreshedAt,
+        indexedHeadSha: snapshot?.headSha ?? null,
+        currentHeadSha,
+        dirtyFileCount: dirtyFiles.length,
+        dirtyFilesNewerThanMemory,
+        needsReindex: reasons.length > 0,
+        reasons,
+    };
 }
 
 export function getWhyChanged(
