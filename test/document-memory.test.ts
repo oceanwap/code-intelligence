@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import { buildDocumentEntries } from '../src/document-memory.js';
+import { buildDocumentEntriesAsync } from '../src/document-memory.js';
 
 function makeTempDir(t: TestContext): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-intel-doc-test-'));
@@ -13,7 +13,7 @@ function makeTempDir(t: TestContext): string {
     return dir;
 }
 
-test('buildDocumentEntries ignores headings inside fenced code blocks', t => {
+test('buildDocumentEntries ignores headings inside fenced code blocks', async t => {
     const dir = makeTempDir(t);
     fs.writeFileSync(
         path.join(dir, 'README.md'),
@@ -38,7 +38,7 @@ test('buildDocumentEntries ignores headings inside fenced code blocks', t => {
         ].join('\n')
     );
 
-    const entries = buildDocumentEntries(dir);
+    const entries = await buildDocumentEntriesAsync(dir);
     const titles = entries.map(entry => entry.title);
 
     assert.ok(titles.includes('Product Brain'));
@@ -59,7 +59,7 @@ test('buildDocumentEntries ignores headings inside fenced code blocks', t => {
     assert.equal(architecture.docType, 'architecture');
 });
 
-test('buildDocumentEntries classifies changelog files from their path', t => {
+test('buildDocumentEntries classifies changelog files from their path', async t => {
     const dir = makeTempDir(t);
     fs.writeFileSync(
         path.join(dir, 'CHANGELOG.md'),
@@ -74,7 +74,7 @@ test('buildDocumentEntries classifies changelog files from their path', t => {
         ].join('\n')
     );
 
-    const entries = buildDocumentEntries(dir);
+    const entries = await buildDocumentEntriesAsync(dir);
     const releaseEntry = entries.find(entry => entry.title === '1.2.0');
 
     assert.ok(releaseEntry);
@@ -82,7 +82,7 @@ test('buildDocumentEntries classifies changelog files from their path', t => {
     assert.ok(releaseEntry.summary.includes('offline project memory'));
 });
 
-test('buildDocumentEntries stores a compact body excerpt instead of the full section', t => {
+test('buildDocumentEntries stores a compact body excerpt instead of the full section', async t => {
     const dir = makeTempDir(t);
     fs.writeFileSync(
         path.join(dir, 'README.md'),
@@ -100,7 +100,7 @@ test('buildDocumentEntries stores a compact body excerpt instead of the full sec
         ].join('\n')
     );
 
-    const entries = buildDocumentEntries(dir);
+    const entries = await buildDocumentEntriesAsync(dir);
     const deepDive = entries.find(entry => entry.title === 'Deep Dive');
 
     assert.ok(deepDive);

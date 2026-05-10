@@ -1,8 +1,8 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
-import { loadGraph, type GraphCallSite, type GraphData } from './graph.js';
-import { collectionName, embedQuery } from './embedder.js';
-import { getProjectMemoryEntries, type ProjectMemoryEntry } from './project-memory.js';
-import { getRetrievedSliceFreshness, type RetrievedSliceFreshness } from './query-freshness.js';
+import { loadGraphAsync, type GraphCallSite, type GraphData } from './graph.js';
+import { collectionNameAsync, embedQuery } from './embedder.js';
+import { getProjectMemoryEntriesAsync, type ProjectMemoryEntry } from './project-memory.js';
+import { getRetrievedSliceFreshnessAsync, type RetrievedSliceFreshness } from './query-freshness.js';
 
 const MAX_CHARS = 3000 * 4; // ~3000 tokens (1 token ≈ 4 chars)
 const STOP_WORDS = new Set([
@@ -49,6 +49,8 @@ export interface RetrievedChunk {
     connectivity: number;
   };
 }
+
+export type RetrievalMode = 'default' | 'architecture';
 
 function tokenize(text: string | null | undefined): string[] {
   if (!text) return [];
@@ -185,12 +187,15 @@ export function rankRetrievedChunks(
   query: string,
   results: RetrievedChunk[],
   graph: GraphData | null,
-  memoryEntries: ProjectMemoryEntry[] = []
+  memoryEntries: ProjectMemoryEntry[] = [],
+  mode: RetrievalMode = 'default'
 ): RetrievedChunk[] {
   const queryTokens = new Set(tokenize(query));
   if (queryTokens.size === 0) return results;
 
   const { symbolSupport, fileSupport } = buildMemorySupport(queryTokens, memoryEntries);
+
+  const architectureIntent = mode === 'architecture';
 
   return [...results]
     .map(result => {
@@ -201,15 +206,16 @@ export function rankRetrievedChunks(
       const neighbors = graphNeighbors(graph, result.symbol);
       const neighborSupport = neighbors.reduce((total, symbol) => total + (symbolSupport.get(symbol) ?? 0), 0);
       const connectivity = neighbors.length;
-      const semanticContribution = semanticScore * 10;
-      const symbolOverlapContribution = symbolOverlap * 3;
-      const fileOverlapContribution = fileOverlap * 2;
-      const neighborContribution = Math.min(6, neighborSupport * 0.15);
+      const semanticContribution = architectureIntent ? semanticScore * 8 : semanticScore * 10;
+      const symbolOverlapContribution = architectureIntent ? symbolOverlap * 4 : symbolOverlap * 3;
+      const fileOverlapContribution = architectureIntent ? fileOverlap * 4 : fileOverlap * 2;
+      const directMemoryContribution = architectureIntent ? Math.min(8, directMemory * 0.15) : directMemory;
+      const neighborContribution = architectureIntent ? Math.min(8, neighborSupport * 0.2) : Math.min(6, neighborSupport * 0.15);
       const connectivityContribution = Math.min(3, connectivity * 0.3);
       const hybridScore = semanticContribution
         + symbolOverlapContribution
         + fileOverlapContribution
-        + directMemory
+        + directMemoryContribution
         + neighborContribution
         + connectivityContribution;
 
@@ -217,7 +223,8 @@ export function rankRetrievedChunks(
       if (semanticScore >= 0.5) rankingSignals.push('strong semantic match');
       if (symbolOverlapContribution > 0) rankingSignals.push('symbol token overlap');
       if (fileOverlapContribution > 0) rankingSignals.push('file token overlap');
-      if (directMemory > 0) rankingSignals.push('supported by project memory');
+      if (directMemoryContribution > 0) rankingSignals.push('supported by project memory');
+      if (architectureIntent) rankingSignals.push('architecture-first ranking mode');
       if (neighborContribution > 0) rankingSignals.push('connected to relevant symbols');
       if (connectivityContribution > 0) rankingSignals.push(`graph connectivity ${connectivity}`);
 
@@ -230,7 +237,7 @@ export function rankRetrievedChunks(
           semantic: semanticContribution,
           symbolOverlap: symbolOverlapContribution,
           fileOverlap: fileOverlapContribution,
-          directMemory,
+          directMemory: directMemoryContribution,
           neighborSupport: neighborContribution,
           connectivity: connectivityContribution,
         },
@@ -243,10 +250,11 @@ export async function retrieve(
   query: string,
   projectRoot: string,
   graphPath: string,
-  qdrantUrl = 'http://localhost:6333'
+  qdrantUrl = 'http://localhost:6333',
+  mode: RetrievalMode = 'default'
 ): Promise<RetrievedChunk[]> {
   const qdrant = new QdrantClient({ url: qdrantUrl });
-  const collection = collectionName(projectRoot);
+  const collection = await collectionNameAsync(projectRoot);
 
   // 1. Embed the query locally (no API key needed)
   const queryVec = await embedQuery(query);
@@ -270,7 +278,7 @@ export async function retrieve(
   }));
 
   // 3. Expand via dependency graph: 2-hop outbound + 1-hop inbound (callers)
-  const graph = loadGraph(graphPath);
+  const graph = await loadGraphAsync(graphPath);
   if (graph) {
     const seen = new Set(results.map(r => r.symbol));
     const relatedSymbols = new Set<string>();
@@ -369,13 +377,15 @@ export async function retrieve(
     }
   }
 
-  const memoryEntries = getProjectMemoryEntries(projectRoot);
-  const ranked = rankRetrievedChunks(query, results, graph, memoryEntries)
-    .map(result => ({
-      ...result,
-      graphSummary: buildGraphSummary(graph, result.symbol),
-      freshness: getRetrievedSliceFreshness(projectRoot, result.file, result.lineStart, result.lineEnd),
-    }));
+  const memoryEntries = await getProjectMemoryEntriesAsync(projectRoot);
+  const ranked = await Promise.all(
+    rankRetrievedChunks(query, results, graph, memoryEntries, mode)
+      .map(async result => ({
+        ...result,
+        graphSummary: buildGraphSummary(graph, result.symbol),
+        freshness: await getRetrievedSliceFreshnessAsync(projectRoot, result.file, result.lineStart, result.lineEnd),
+      }))
+  );
 
   // 5. Truncate to ~3000 tokens
   let total = 0;

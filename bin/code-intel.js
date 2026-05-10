@@ -1,11 +1,4 @@
-#!/usr/bin/env node
-import { spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
-import { dirname, resolve } from 'path';
+#!/usr/bin/env bun
 
-const dir = dirname(fileURLToPath(import.meta.url));
-const tsx = resolve(dir, '../node_modules/.bin/tsx');
-const cli = resolve(dir, '../src/cli.ts');
-
-const { status } = spawnSync(tsx, [cli, ...process.argv.slice(2)], { stdio: 'inherit' });
-process.exit(status ?? 1);
+// Bun-native entrypoint: execute the TypeScript CLI directly.
+await import(new URL('../src/cli.ts', import.meta.url).href);

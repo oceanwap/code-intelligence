@@ -1,16 +1,48 @@
 import { EmbeddingModel, FlagEmbedding } from 'fastembed';
 import { QdrantClient } from '@qdrant/js-client-rest';
-import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { mkdir } from 'node:fs/promises';
 import type { CodeChunk } from './indexer.js';
 import { toUUID } from './indexer.js';
-import { getCurrentBranch } from './git.js';
+import { getCurrentBranchAsync } from './git.js';
 
 export const VECTOR_SIZE = 384; // BGE-small-en-v1.5 (local, no API key, ~33 MB, ~3x faster than base)
 const UPSERT_BATCH_SIZE = 25;
 const MAX_UPSERT_RETRIES = 3;
+const EMBED_BATCH_SIZE = (() => {
+  const override = Number(process.env.CODE_INTEL_EMBED_BATCH ?? '');
+  if (Number.isFinite(override) && override >= 4 && override <= 128) {
+    return Math.floor(override);
+  }
+
+  const cpuCount = os.cpus().length;
+  if (cpuCount <= 4) return 16;
+  if (cpuCount <= 8) return 24;
+  return 32;
+})();
+const MAX_EMBED_TEXT_CHARS = 6000;
+const EMBED_DEBUG = process.env.CODE_INTEL_EMBED_DEBUG === '1';
+
+function nowMs(): number {
+  return performance.now();
+}
+
+async function readVectorCache(cacheFile: string): Promise<Record<string, number[]>> {
+  try {
+    const raw = await Bun.file(cacheFile).text();
+    return JSON.parse(raw) as Record<string, number[]>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeVectorCache(cacheFile: string, cache: Record<string, number[]>): Promise<void> {
+  await mkdir(path.dirname(cacheFile), { recursive: true });
+  const payload = JSON.stringify(cache);
+  await Bun.write(cacheFile, payload);
+}
 
 // Store the model in a shared user-level cache so it is downloaded only once
 // regardless of which directory `code-intel` is run from.
@@ -20,7 +52,7 @@ const MODEL_CACHE_DIR = path.join(os.homedir(), '.cache', 'code-intelligence', '
 let _model: FlagEmbedding | null = null;
 async function getModel(): Promise<FlagEmbedding> {
   if (!_model) {
-    fs.mkdirSync(MODEL_CACHE_DIR, { recursive: true });
+    await mkdir(MODEL_CACHE_DIR, { recursive: true });
     _model = await FlagEmbedding.init({
       model: EmbeddingModel.BGESmallENV15,
       cacheDir: MODEL_CACHE_DIR,
@@ -40,11 +72,17 @@ export async function embedTexts(
 ): Promise<number[][]> {
   const model = await getModel();
   const results: number[][] = [];
-  for await (const batch of model.embed(texts, 32)) {
+  for await (const batch of model.embed(texts, EMBED_BATCH_SIZE)) {
     for (const vec of batch) results.push(Array.from(vec));
     onProgress?.(Math.min(results.length, texts.length), texts.length);
   }
   return results;
+}
+
+function toEmbeddingText(chunk: CodeChunk): string {
+  const head = `file: ${chunk.file}\n${chunk.symbol}\n\n`;
+  if (chunk.code.length <= MAX_EMBED_TEXT_CHARS) return `${head}${chunk.code}`;
+  return `${head}${chunk.code.slice(0, MAX_EMBED_TEXT_CHARS)}\n/* truncated for embedding */`;
 }
 
 export async function embedQuery(text: string): Promise<number[]> {
@@ -71,12 +109,12 @@ function isMissingCollectionError(error: unknown): boolean {
   return candidate.status === 404 && detail.includes('collection') && detail.includes("doesn't exist");
 }
 
-function clearCache(cache: Record<string, number[]>, cacheFile: string): void {
+async function clearCache(cache: Record<string, number[]>, cacheFile: string): Promise<void> {
   Object.keys(cache).forEach(key => delete cache[key]);
-  if (fs.existsSync(cacheFile)) fs.unlinkSync(cacheFile);
+  await writeVectorCache(cacheFile, cache);
 }
 
-function pruneInvalidVectors(cache: Record<string, number[]>, cacheFile: string): void {
+async function pruneInvalidVectors(cache: Record<string, number[]>, cacheFile: string): Promise<void> {
   let changed = false;
   for (const [id, vector] of Object.entries(cache)) {
     if (vector.length !== VECTOR_SIZE) {
@@ -84,7 +122,7 @@ function pruneInvalidVectors(cache: Record<string, number[]>, cacheFile: string)
       changed = true;
     }
   }
-  if (changed && fs.existsSync(cacheFile)) fs.writeFileSync(cacheFile, JSON.stringify(cache));
+  if (changed) await writeVectorCache(cacheFile, cache);
 }
 
 async function deleteQdrantPoints(
@@ -117,14 +155,10 @@ async function upsertWithRetry(
   }
 }
 
-// Each project+branch gets its own Qdrant collection so switching branches
-// never serves stale embeddings from a different branch's index.
-// Non-git projects are scoped by root path only (no branch component).
-export function scopedCollectionName(projectRoot: string, scope: 'code' | 'memory'): string {
-  const branch = getCurrentBranch(path.resolve(projectRoot));
-  const key = branch !== null
-    ? path.resolve(projectRoot) + '\n' + branch
-    : path.resolve(projectRoot);
+export async function scopedCollectionNameAsync(projectRoot: string, scope: 'code' | 'memory'): Promise<string> {
+  const branch = await getCurrentBranchAsync(path.resolve(projectRoot));
+  const root = path.resolve(projectRoot);
+  const key = branch !== null ? root + '\n' + branch : root;
   const hash = crypto
     .createHash('sha256')
     .update(key)
@@ -133,8 +167,8 @@ export function scopedCollectionName(projectRoot: string, scope: 'code' | 'memor
   return `${scope}-${hash}`;
 }
 
-export function collectionName(projectRoot: string): string {
-  return scopedCollectionName(projectRoot, 'code');
+export async function collectionNameAsync(projectRoot: string): Promise<string> {
+  return await scopedCollectionNameAsync(projectRoot, 'code');
 }
 
 export async function embedAndStore(
@@ -144,14 +178,20 @@ export async function embedAndStore(
   qdrantUrl = 'http://localhost:6333',
   onProgress?: (stage: 'loading-model' | 'embedding' | 'storing', done: number, total: number) => void
 ): Promise<void> {
+  const startedAt = nowMs();
+  const marks: Record<string, number> = {};
+  const mark = (name: string): void => {
+    marks[name] = Math.round((nowMs() - startedAt) * 100) / 100;
+  };
+
   const qdrant = new QdrantClient({ url: qdrantUrl });
-  const collection = collectionName(projectRoot);
+  const collection = await collectionNameAsync(projectRoot);
+  mark('qdrant-client-ready');
 
   // Load local embedding cache to skip re-embedding unchanged chunks
-  const cache: Record<string, number[]> = fs.existsSync(cacheFile)
-    ? (JSON.parse(fs.readFileSync(cacheFile, 'utf-8')) as Record<string, number[]>)
-    : {};
-  pruneInvalidVectors(cache, cacheFile);
+  const cache = await readVectorCache(cacheFile);
+  await pruneInvalidVectors(cache, cacheFile);
+  mark('cache-ready');
 
   const existing = await qdrant.getCollections();
   let collectionNeedsFullSync = false;
@@ -162,7 +202,7 @@ export async function embedAndStore(
     if (dim !== undefined && dim !== VECTOR_SIZE) {
       console.log(`Collection dim mismatch (${dim} → ${VECTOR_SIZE}), recreating...`);
       await qdrant.deleteCollection(collection);
-      clearCache(cache, cacheFile);
+      await clearCache(cache, cacheFile);
       await qdrant.createCollection(collection, {
         vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
       });
@@ -174,6 +214,7 @@ export async function embedAndStore(
     });
     collectionNeedsFullSync = true;
   }
+  mark('collection-ready');
 
   const points: Array<{
     id: string;
@@ -183,13 +224,18 @@ export async function embedAndStore(
 
   // Batch-embed only chunks missing from cache
   const uncached = chunks.filter(c => !cache[c.id]);
+  mark('uncached-filtered');
   if (uncached.length > 0) {
     onProgress?.('loading-model', 0, 1);
-    const texts = uncached.map(c => `file: ${c.file}\n${c.symbol}\n\n${c.code}`);
+    const texts = uncached.map(toEmbeddingText);
     const vecs = await embedTexts(texts, (d, t) => onProgress?.('embedding', d, t));
+    mark('embedding-done');
     uncached.forEach((c, i) => { cache[c.id] = vecs[i]; });
-    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-    fs.writeFileSync(cacheFile, JSON.stringify(cache));
+    await writeVectorCache(cacheFile, cache);
+    mark('cache-written');
+  } else {
+    mark('embedding-done');
+    mark('cache-written');
   }
 
   // Only upsert newly-embedded chunks — unchanged chunks are already in Qdrant
@@ -218,11 +264,17 @@ export async function embedAndStore(
     await upsertWithRetry(qdrant, collection, points.slice(i, i + UPSERT_BATCH_SIZE));
     onProgress?.('storing', Math.min(i + UPSERT_BATCH_SIZE, points.length), points.length);
   }
+  mark('upsert-done');
 
   if (points.length > 0) {
     console.log(`Upserted ${points.length} chunk(s) into "${collection}"`);
   } else {
     console.log(`No changes — collection "${collection}" is up to date`);
+  }
+
+  if (EMBED_DEBUG) {
+    console.log(`[embed-debug] runtime=bun uncached=${uncached.length}/${chunks.length} points=${points.length} batch=${EMBED_BATCH_SIZE}`);
+    console.log(`[embed-debug] timings(ms) ${Object.entries(marks).map(([k, v]) => `${k}=${v}`).join(', ')}`);
   }
 }
 
@@ -235,14 +287,12 @@ export async function deletePoints(
 ): Promise<void> {
   if (chunkIds.length === 0) return;
   const qdrant = new QdrantClient({ url: qdrantUrl });
-  const collection = collectionName(projectRoot);
+  const collection = await collectionNameAsync(projectRoot);
 
   // Remove from local cache
-  if (fs.existsSync(cacheFile)) {
-    const cache = JSON.parse(fs.readFileSync(cacheFile, 'utf-8')) as Record<string, number[]>;
-    for (const id of chunkIds) delete cache[id];
-    fs.writeFileSync(cacheFile, JSON.stringify(cache));
-  }
+  const cache = await readVectorCache(cacheFile);
+  for (const id of chunkIds) delete cache[id];
+  await writeVectorCache(cacheFile, cache);
 
   // Delete from Qdrant
   await deleteQdrantPoints(qdrant, collection, chunkIds.map(toUUID));
@@ -261,7 +311,7 @@ export async function deleteOrphanPoints(
   qdrantUrl = 'http://localhost:6333'
 ): Promise<number> {
   const qdrant = new QdrantClient({ url: qdrantUrl });
-  const collection = collectionName(projectRoot);
+  const collection = await collectionNameAsync(projectRoot);
 
   const existing = await qdrant.getCollections();
   if (!existing.collections.find(c => c.name === collection)) return 0;
@@ -289,11 +339,9 @@ export async function deleteOrphanPoints(
   }
 
   if (orphanIds.length > 0) {
-    if (fs.existsSync(cacheFile)) {
-      const cache = JSON.parse(fs.readFileSync(cacheFile, 'utf-8')) as Record<string, number[]>;
-      for (const id of orphanIds) delete cache[id];
-      fs.writeFileSync(cacheFile, JSON.stringify(cache));
-    }
+    const cache = await readVectorCache(cacheFile);
+    for (const id of orphanIds) delete cache[id];
+    await writeVectorCache(cacheFile, cache);
     await deleteQdrantPoints(qdrant, collection, orphanIds.map(toUUID));
   }
 

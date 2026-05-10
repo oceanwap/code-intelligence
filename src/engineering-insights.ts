@@ -1,7 +1,7 @@
 import * as path from 'path';
-import { loadGraph, type GraphData } from './graph.js';
+import { loadGraphAsync, type GraphData } from './graph.js';
 import { getDataDir } from './git.js';
-import { getProjectMemoryEntries, type ChangeMemoryEntry, type ProjectMemoryEntry } from './project-memory.js';
+import { getProjectMemoryEntriesAsync, type ChangeMemoryEntry, type ProjectMemoryEntry } from './project-memory.js';
 
 type ImpactDirection = 'out' | 'in' | 'both';
 type RelationKind = 'calls' | 'calledBy' | 'implements' | 'implementedFrom';
@@ -212,19 +212,19 @@ function graphFile(projectRoot: string): string {
   return path.join(getDataDir(projectRoot), 'graph.json');
 }
 
-export function getAffectedSymbols(
+export async function getAffectedSymbols(
   projectRoot: string,
   seeds: string[],
   opts?: { hops?: number; direction?: ImpactDirection; limit?: number }
-): AffectedSymbolsResult | null {
+): Promise<AffectedSymbolsResult | null> {
   const root = path.resolve(projectRoot);
-  const graph = loadGraph(graphFile(root));
+  const graph = await loadGraphAsync(graphFile(root));
   if (!graph) return null;
 
   const hops = opts?.hops ?? 2;
   const direction = opts?.direction ?? 'both';
   const limit = opts?.limit ?? 20;
-  const entries = getProjectMemoryEntries(root);
+  const entries = await getProjectMemoryEntriesAsync(root);
   const { symbolStats } = buildChangeStats(entries);
 
   const queue: Array<{ symbol: string; distance: number }> = [];
@@ -317,15 +317,15 @@ export function renderAffectedSymbols(result: AffectedSymbolsResult): string {
   return sections.join('\n\n');
 }
 
-export function getRiskHotspots(projectRoot: string, opts: number | RiskHotspotsOptions = 10): RiskHotspotsResult | null {
+export async function getRiskHotspots(projectRoot: string, opts: number | RiskHotspotsOptions = 10): Promise<RiskHotspotsResult | null> {
   const root = path.resolve(projectRoot);
-  const graph = loadGraph(graphFile(root));
+  const graph = await loadGraphAsync(graphFile(root));
   if (!graph) return null;
 
   const { limit: maxResults, topic } = typeof opts === 'number'
     ? { limit: opts, topic: undefined as string | undefined }
     : { limit: opts.limit ?? 10, topic: opts.topic?.toLowerCase() };
-  const entries = getProjectMemoryEntries(root)
+  const entries = (await getProjectMemoryEntriesAsync(root))
     .filter(entry => !topic || (isChangeEntry(entry) && entry.topics.some(item => item.includes(topic))));
   const { changeEntries, symbolStats, fileStats } = buildChangeStats(entries);
   const symbolHotspots = [...symbolStats.entries()]

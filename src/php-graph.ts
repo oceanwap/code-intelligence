@@ -3,7 +3,6 @@
  * Extracts outbound calls and inbound callers for PHP functions/methods.
  */
 import * as path from 'path';
-import * as fs from 'fs';
 import { createRequire } from 'module';
 import { walkFiles } from './indexer.js';
 import type { GraphCallSite, GraphData } from './graph.js';
@@ -152,16 +151,21 @@ function extractPhpCalls(node: Node, relPath: string): GraphCallSite[] {
   return calls;
 }
 
-export function buildPhpGraph(rootDir: string, graph: GraphData): void {
-  const files = walkFiles(rootDir, ['.php']);
+export async function buildPhpGraphAsync(rootDir: string, graph: GraphData, options?: { includeFiles?: Set<string> }): Promise<void> {
+  const includeFiles = options?.includeFiles;
+  const files = await walkFiles(rootDir, ['.php']);
   const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
   const typeNames = new Set<string>();
 
   for (const absPath of files) {
     const relPath = path.relative(rootDir, absPath);
+    if (includeFiles && !includeFiles.has(relPath)) continue;
+
+    const file = Bun.file(absPath);
     let src: string;
     try {
-      src = fs.readFileSync(absPath, 'utf-8');
+      if (!(await file.exists())) continue;
+      src = await file.text();
     } catch {
       continue;
     }
@@ -174,7 +178,6 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
       continue;
     }
 
-    // Collect imports from use statements for the file entry
     const fileImports: string[] = [];
     walk(ast, n => {
       if (n.kind === 'usegroup') {
@@ -186,7 +189,6 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
     });
     graph.files[relPath] = fileImports;
 
-    // Flatten namespace wrappers
     const topLevel: Node[] = ast.kind === 'program' ? (ast.children ?? []) : [];
     const containers: Array<{ children: Node[]; nsPrefix: string }> = [];
 
@@ -204,7 +206,6 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
 
     for (const { children, nsPrefix } of containers) {
       for (const n of children) {
-        // Top-level functions
         if (n.kind === 'function') {
           const name = nodeName(n.name);
           if (!name) continue;
@@ -228,7 +229,6 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
           }
         }
 
-        // Classes / interfaces / traits
         if (n.kind === 'class' || n.kind === 'interface' || n.kind === 'trait') {
           const className = nodeName(n.name);
           if (!className) continue;
@@ -255,9 +255,7 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
             if (!methodName) continue;
             const sym = `${fullClassName}::${methodName}`;
             const calls = extractPhpCalls(member.body ?? member, relPath);
-            // Qualify $this->foo() as ClassName::foo when possible
             const qualifiedCalls = calls.map(c =>
-              // If bare name and there's a method of same name in the class, qualify it
               !c.symbol.includes('::') && !c.symbol.includes('\\') &&
               body.some(m => m.kind === 'method' && nodeName(m.name) === c.symbol)
                 ? { ...c, symbol: `${fullClassName}::${c.symbol}` }
@@ -272,9 +270,9 @@ export function buildPhpGraph(rootDir: string, graph: GraphData): void {
             }
             graph.symbolFile[sym] = relPath;
             for (const callee of qualifiedCalls) {
-              (graph.callers[callee.symbol] ??= []);
+              graph.callers[callee.symbol] ??= [];
               if (!graph.callers[callee.symbol].includes(sym)) graph.callers[callee.symbol].push(sym);
-              (graph.calledBySites![callee.symbol] ??= []);
+              graph.calledBySites![callee.symbol] ??= [];
               if (!graph.calledBySites![callee.symbol].some(entry => entry.symbol === sym && entry.file === relPath && entry.line === callee.line)) {
                 graph.calledBySites![callee.symbol].push({ symbol: sym, file: relPath, line: callee.line });
               }

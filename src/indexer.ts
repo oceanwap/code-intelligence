@@ -1,8 +1,7 @@
 import { Project, type Node as MorphNode, type SourceFile, SyntaxKind } from 'ts-morph';
 import * as path from 'path';
-import * as fs from 'fs';
 import * as crypto from 'crypto';
-import { indexPhpFiles } from './php-indexer.js';
+import { indexPhpFilesAsync } from './php-indexer.js';
 
 export interface CodeChunk {
   id: string;
@@ -13,6 +12,12 @@ export interface CodeChunk {
   imports: string[];
   lineStart: number;
   lineEnd: number;
+}
+
+export type IndexingMode = 'fast' | 'full';
+export interface IndexDirectoryOptions {
+  mode?: IndexingMode;
+  includeFiles?: Set<string>;
 }
 
 // Extensions indexed as whole-file plain-text chunks (no AST)
@@ -33,6 +38,191 @@ function isPlainFile(filePath: string): boolean {
   return PLAIN_NAMES.has(base) || PLAIN_EXTS.has(path.extname(filePath).toLowerCase());
 }
 
+function isTestLikePath(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, '/').toLowerCase();
+  const base = path.basename(normalized);
+  return normalized.startsWith('test/')
+    || normalized.startsWith('tests/')
+    || normalized.startsWith('__tests__/')
+    || normalized.includes('/__tests__/')
+    || /\.(test|spec)\.[a-z0-9]+$/.test(base);
+}
+
+interface WalkFilters {
+  gitignoreInclude: RegExp[];
+  gitignoreExclude: RegExp[];
+  tsInclude: RegExp[];
+  tsExclude: RegExp[];
+}
+
+const walkFilterCache = new Map<string, WalkFilters>();
+
+function stripJsonComments(text: string): string {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+}
+
+function globToRegExp(glob: string): RegExp {
+  let normalized = glob.trim().replace(/^\.\//, '').replace(/\\/g, '/');
+  normalized = normalized.replace(/^\//, '');
+  
+  // If pattern ends with /, it's a directory pattern - match dir and everything in it
+  if (normalized.endsWith('/')) normalized = `${normalized}**`;
+
+  // Handle ** patterns by splitting and reconstructing
+  let source = '';
+  let remaining = normalized;
+  
+  while (remaining) {
+    const doubleStarIdx = remaining.indexOf('**');
+    
+    if (doubleStarIdx === -1) {
+      // No more ** patterns, process the rest
+      source += remaining
+        .split('*')
+        .map(escapeRegex)
+        .join('[^/]*')
+        .replace(/\?/g, '[^/]');
+      break;
+    }
+    
+    // Process everything before **
+    const before = remaining.substring(0, doubleStarIdx);
+    source += before
+      .split('*')
+      .map(escapeRegex)
+      .join('[^/]*')
+      .replace(/\?/g, '[^/]');
+    
+    // Skip the **
+    remaining = remaining.substring(doubleStarIdx + 2);
+    
+    // Handle **/ and /** patterns
+    if (remaining.startsWith('/')) {
+      // **/ means zero or more path segments followed by /
+      source += '(?:.*/)?';
+      remaining = remaining.substring(1);
+    } else if (before.endsWith('/')) {
+      // Pattern is like foo/** (match everything under foo/)
+      source += '.*';
+    } else {
+      // Pattern is like foo** with no surrounding slashes (rare, treat as .*/)
+      source += '(?:.*/)?';
+    }
+  }
+
+  return new RegExp(`^${source}$`);
+}
+
+async function parseGitignorePatterns(rootDir: string): Promise<{ include: RegExp[]; exclude: RegExp[] }> {
+  const ignoreFile = path.join(rootDir, '.gitignore');
+  try {
+    const file = Bun.file(ignoreFile);
+    if (!(await file.exists())) return { include: [], exclude: [] };
+    const content = await file.text();
+    const lines = content.split(/\r?\n/);
+    const includePatterns: RegExp[] = [];
+    const excludePatterns: RegExp[] = [];
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      
+      // Handle negation patterns (un-ignore)
+      if (trimmed.startsWith('!')) {
+        const raw = trimmed.slice(1).replace(/^\//, '');
+        if (!raw) continue;
+        
+        if (!raw.includes('/')) {
+          excludePatterns.push(globToRegExp(`**/${raw}`));
+          excludePatterns.push(new RegExp(`(^|/)${escapeRegex(raw)}($|/)`));
+        } else {
+          excludePatterns.push(globToRegExp(raw));
+        }
+        continue;
+      }
+      
+      // Handle positive patterns (ignore)
+      const raw = trimmed.replace(/^\//, '');
+      if (!raw.includes('/')) {
+        includePatterns.push(globToRegExp(`**/${raw}`));
+        includePatterns.push(new RegExp(`(^|/)${escapeRegex(raw)}($|/)`));
+      } else {
+        includePatterns.push(globToRegExp(raw));
+      }
+    }
+
+    return { include: includePatterns, exclude: excludePatterns };
+  } catch {
+    return { include: [], exclude: [] };
+  }
+}
+
+async function parseTsConfigFilters(rootDir: string): Promise<{ include: RegExp[]; exclude: RegExp[] }> {
+  const tsconfigPath = path.join(rootDir, 'tsconfig.json');
+  try {
+    const file = Bun.file(tsconfigPath);
+    if (!(await file.exists())) return { include: [], exclude: [] };
+    const raw = await file.text();
+    const parsed = JSON.parse(stripJsonComments(raw)) as {
+      include?: string[];
+      exclude?: string[];
+      files?: string[];
+    };
+
+    // Only filter by tsconfig if include/files patterns are explicitly specified
+    const hasIncludePatterns = (parsed.include?.length ?? 0) > 0 || (parsed.files?.length ?? 0) > 0;
+    
+    const includeGlobs = hasIncludePatterns ? [
+      ...(parsed.include ?? []),
+      ...((parsed.files ?? []).map(file => file.replace(/\\/g, '/'))),
+    ].map(glob => globToRegExp(glob)) : [];
+
+    const excludeGlobs = (parsed.exclude ?? []).map(glob => globToRegExp(glob));
+    return { include: includeGlobs, exclude: excludeGlobs };
+  } catch {
+    return { include: [], exclude: [] };
+  }
+}
+
+async function getWalkFilters(rootDir: string): Promise<WalkFilters> {
+  const key = path.resolve(rootDir);
+  const cached = walkFilterCache.get(key);
+  if (cached) return cached;
+
+  const gitignorePatterns = await parseGitignorePatterns(key);
+  const tsconfig = await parseTsConfigFilters(key);
+  const filters: WalkFilters = {
+    gitignoreInclude: gitignorePatterns.include,
+    gitignoreExclude: gitignorePatterns.exclude,
+    tsInclude: tsconfig.include,
+    tsExclude: tsconfig.exclude,
+  };
+
+  walkFilterCache.set(key, filters);
+  return filters;
+}
+
+function shouldFilterByGitignore(relPath: string, filters: WalkFilters): boolean {
+  const normalized = relPath.replace(/\\/g, '/');
+  // First check if explicitly un-ignored (negation pattern)
+  if (filters.gitignoreExclude.some(re => re.test(normalized))) return false;
+  // Then check if ignored
+  return filters.gitignoreInclude.some(re => re.test(normalized));
+}
+
+function shouldFilterByTsConfig(relPath: string, filters: WalkFilters): boolean {
+  const normalized = relPath.replace(/\\/g, '/');
+  if (filters.tsExclude.some(re => re.test(normalized))) return true;
+  if (filters.tsInclude.length === 0) return false;
+  return !filters.tsInclude.some(re => re.test(normalized));
+}
+
 const MAX_PLAIN_BYTES = 32_000; // skip huge generated files
 
 function lineRangeForNode(sourceFile: SourceFile, node: MorphNode): { lineStart: number; lineEnd: number } {
@@ -49,15 +239,48 @@ function lineRangeForText(text: string): { lineStart: number; lineEnd: number } 
   };
 }
 
-function indexPlainFiles(rootDir: string): CodeChunk[] {
+function isLowSignalPathForFast(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, '/').toLowerCase();
+  return normalized.startsWith('test/')
+    || normalized.startsWith('tests/')
+    || normalized.startsWith('docs/')
+    || normalized.startsWith('examples/')
+    || normalized.startsWith('scripts/')
+    || normalized.includes('/fixtures/')
+    || normalized.includes('/__snapshots__/')
+    || normalized.endsWith('.snap');
+}
+
+function isHighValuePlainFile(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, '/').toLowerCase();
+  return normalized === 'readme.md'
+    || normalized === 'package.json'
+    || normalized === 'tsconfig.json'
+    || normalized === 'dockerfile'
+    || normalized.endsWith('/dockerfile');
+}
+
+async function indexPlainFilesAsync(rootDir: string, mode: IndexingMode, includeFiles?: Set<string>): Promise<CodeChunk[]> {
   const chunks: CodeChunk[] = [];
-  const allFiles = walkFiles(rootDir, [...PLAIN_EXTS], PLAIN_NAMES);
+  const allFiles = await walkFiles(rootDir, [...PLAIN_EXTS], PLAIN_NAMES);
   for (const absPath of allFiles) {
     if (!isPlainFile(absPath)) continue;
-    const stat = fs.statSync(absPath);
-    if (stat.size > MAX_PLAIN_BYTES) continue;
     const relPath = path.relative(rootDir, absPath);
-    const code = fs.readFileSync(absPath, 'utf-8');
+    if (includeFiles && !includeFiles.has(relPath)) continue;
+    if (mode === 'fast' && (isLowSignalPathForFast(relPath) || !isHighValuePlainFile(relPath))) continue;
+    const file = Bun.file(absPath);
+    try {
+      if (!(await file.exists())) continue;
+    } catch {
+      continue;
+    }
+    if (file.size > MAX_PLAIN_BYTES) continue;
+    let code = '';
+    try {
+      code = await file.text();
+    } catch {
+      continue;
+    }
     chunks.push({
       id: chunkId(relPath, '<file>'),
       file: relPath,
@@ -71,15 +294,21 @@ function indexPlainFiles(rootDir: string): CodeChunk[] {
   return chunks;
 }
 
-export function indexDirectory(rootDir: string): CodeChunk[] {
+export async function indexDirectory(rootDir: string, options?: IndexDirectoryOptions): Promise<CodeChunk[]> {
+  const mode = options?.mode ?? 'full';
+  const includeFiles = options?.includeFiles;
   const project = new Project({
     skipAddingFilesFromTsConfig: true,
     compilerOptions: { allowJs: true },
   });
 
-  walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']).forEach(f =>
-    project.addSourceFileAtPath(f)
-  );
+  const tsFiles = await walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']);
+  tsFiles.forEach(f => {
+    const relPath = path.relative(rootDir, f);
+    if (includeFiles && !includeFiles.has(relPath)) return;
+    if (mode === 'fast' && isLowSignalPathForFast(relPath)) return;
+    project.addSourceFileAtPath(f);
+  });
 
   const chunks: CodeChunk[] = [];
 
@@ -130,51 +359,54 @@ export function indexDirectory(rootDir: string): CodeChunk[] {
     }
   }
 
-  return [...chunks, ...indexPhpFiles(rootDir), ...indexPlainFiles(rootDir)];
+  const phpChunks = (await indexPhpFilesAsync(rootDir, { includeFiles })).filter(chunk => mode === 'full' || !isLowSignalPathForFast(chunk.file));
+  return [...chunks, ...phpChunks, ...(await indexPlainFilesAsync(rootDir, mode, includeFiles))];
 }
 
-export function walkFiles(dir: string, exts: string[], extraNames?: Set<string>): string[] {
-  const SKIP = new Set(['node_modules', '.git', '.code-intelligence', 'dist']);
+export async function listIndexableFiles(rootDir: string): Promise<string[]> {
+  const tsJs = await walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']);
+  const php = await walkFiles(rootDir, ['.php']);
+  const plain = (await walkFiles(rootDir, [...PLAIN_EXTS], PLAIN_NAMES)).filter(isPlainFile);
+  return [...new Set([...tsJs, ...php, ...plain])];
+}
+
+export async function walkFiles(dir: string, exts: string[], extraNames?: Set<string>): Promise<string[]> {
+  const SKIP = new Set([
+    'node_modules',
+    '.git',
+    '.code-intelligence',
+    'dist',
+    'build',
+    'coverage',
+    '.next',
+    '.nuxt',
+    '.svelte-kit',
+    '.turbo',
+    '.cache',
+    '.parcel-cache',
+    '.vercel',
+    '.expo',
+    'out',
+    'target',
+    'tmp',
+    'temp',
+  ]);
   const results: string[] = [];
+  const filters = await getWalkFilters(dir);
 
-  function readIgnorePatterns(dirPath: string): RegExp[] {
-    const ignoreFile = path.join(dirPath, '.gitignore');
-    if (!fs.existsSync(ignoreFile)) return [];
-    return fs.readFileSync(ignoreFile, 'utf-8')
-      .split('\n')
-      .map(l => l.trim())
-      .filter(l => l && !l.startsWith('#'))
-      .map(pattern => {
-        // Convert gitignore glob pattern to a RegExp
-        const anchored = pattern.startsWith('/');
-        const p = pattern
-          .replace(/^\//, '')  // strip leading slash
-          .replace(/\/$/, ''); // strip trailing slash (dir-only markers — match name itself)
-        const escaped = p
-          .replace(/[.+^${}()|[\]\\]/g, '\\$&') // escape regex specials (except * ?)
-          .replace(/\*\*/g, '\x00')              // placeholder for **
-          .replace(/\*/g, '[^/]*')               // * matches within segment
-          .replace(/\?/g, '[^/]')                // ? matches single char
-          .replace(/\x00/g, '.*');               // ** matches across segments
-        return anchored
-          ? new RegExp(`^${escaped}(/|$)`)
-          : new RegExp(`(^|/)${escaped}(/|$)`);
-      });
-  }
-
-  function walk(currentDir: string, ignorePatterns: RegExp[]): void {
-    const localPatterns = [...ignorePatterns, ...readIgnorePatterns(currentDir)];
-    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
-      if (SKIP.has(entry.name)) continue;
-      const relToRoot = path.relative(dir, path.join(currentDir, entry.name)).replace(/\\/g, '/');
-      if (localPatterns.some(re => re.test(relToRoot))) continue;
-      const full = path.join(currentDir, entry.name);
-      if (entry.isDirectory()) walk(full, localPatterns);
-      else if (exts.includes(path.extname(entry.name)) || extraNames?.has(entry.name)) results.push(full);
+  const glob = new Bun.Glob('**/*');
+  for (const rel of glob.scanSync({ cwd: dir, onlyFiles: true, dot: true })) {
+    const relPath = rel.replace(/\\/g, '/');
+    if ([...SKIP].some(skip => relPath === skip || relPath.startsWith(`${skip}/`))) continue;
+    if (shouldFilterByGitignore(relPath, filters)) continue;
+    if (shouldFilterByTsConfig(relPath, filters)) continue;
+    if (isTestLikePath(relPath)) continue;
+    const base = path.basename(relPath);
+    if (exts.includes(path.extname(base)) || extraNames?.has(base)) {
+      results.push(path.join(dir, relPath));
     }
   }
 
-  walk(dir, []);
   return results;
 }
 
@@ -189,29 +421,35 @@ export interface Manifest {
   fileChunks: Record<string, string[]>;
 }
 
-export function loadManifest(manifestFile: string): Manifest {
-  if (!fs.existsSync(manifestFile)) return { mtimes: {}, fileChunks: {} };
-  return JSON.parse(fs.readFileSync(manifestFile, 'utf-8')) as Manifest;
+export async function loadManifestAsync(manifestFile: string): Promise<Manifest> {
+  try {
+    const file = Bun.file(manifestFile);
+    if (!(await file.exists())) return { mtimes: {}, fileChunks: {} };
+    return JSON.parse(await file.text()) as Manifest;
+  } catch {
+    return { mtimes: {}, fileChunks: {} };
+  }
 }
 
-export function saveManifest(manifest: Manifest, manifestFile: string): void {
-  fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
-  fs.writeFileSync(manifestFile, JSON.stringify(manifest));
+export async function saveManifestAsync(manifest: Manifest, manifestFile: string): Promise<void> {
+  await Bun.write(manifestFile, JSON.stringify(manifest));
 }
 
 /** Build a fresh manifest from the current state of the directory + extracted chunks */
-export function buildManifest(rootDir: string, chunks: CodeChunk[]): Manifest {
-  // Derive mtimes from every indexed file (all types: AST + plain)
-  // Using chunks as the source means mtimes covers exactly what is indexed.
+export async function buildManifestAsync(rootDir: string, chunks: CodeChunk[]): Promise<Manifest> {
   const seen = new Set<string>();
   const mtimes: Record<string, number> = {};
   const fileChunks: Record<string, string[]> = {};
   for (const c of chunks) {
     (fileChunks[c.file] ??= []).push(c.id);
-    if (!seen.has(c.file)) {
-      seen.add(c.file);
-      const abs = path.join(rootDir, c.file);
-      if (fs.existsSync(abs)) mtimes[c.file] = fs.statSync(abs).mtimeMs;
+    if (seen.has(c.file)) continue;
+    seen.add(c.file);
+    const abs = path.join(rootDir, c.file);
+    try {
+      const file = Bun.file(abs);
+      if (await file.exists()) mtimes[c.file] = file.lastModified;
+    } catch {
+      // ignore missing files during differential manifest building
     }
   }
   return { indexedAt: new Date().toISOString(), mtimes, fileChunks };

@@ -5,12 +5,15 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "build": "swc src -d dist --strip-leading-paths",
-    "test": "node --import tsx --test ./test/*.test.ts",
-    "typecheck": "tsc --noEmit",
-    "dev": "tsx src/cli.ts",
-    "mcp": "tsx src/mcp-server.ts",
-    "start": "tsx src/mcp-server.ts --http"
+    "build": "bunx swc src -d dist --strip-leading-paths",
+    "test": "bun test ./test/*.test.ts",
+    "typecheck": "bunx tsc --noEmit",
+    "dev": "bun src/cli.ts",
+    "mcp": "bun src/mcp-server.ts",
+    "start": "bun src/mcp-server.ts --http",
+    "bench:runtime": "bun scripts/bench-runtime.ts",
+    "bench:runtime:full": "bun scripts/bench-runtime.ts --mode full",
+    "bench:runtime:fresh": "bun scripts/bench-runtime.ts --from-scratch"
   },
   "bin": {
     "code-intel": "./bin/code-intel.js"
@@ -26,7 +29,7 @@
   "devDependencies": {
     "@swc/cli": "^0.8.0",
     "@swc/core": "^1.15.21",
-    "@types/node": "^20.14.0",
+    "@types/bun": "^1.3.13",
     "tsx": "^4.11.0",
     "typescript": "^5.4.5"
   }

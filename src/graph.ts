@@ -1,8 +1,9 @@
 import { Project, SyntaxKind, Node, FunctionDeclaration, ArrowFunction, FunctionExpression, MethodDeclaration } from 'ts-morph';
 import * as path from 'path';
-import * as fs from 'fs';
+import { mkdir } from 'node:fs/promises';
 import { walkFiles } from './indexer.js';
-import { buildPhpGraph } from './php-graph.js';
+import { buildPhpGraphAsync } from './php-graph.js';
+import type { IndexingMode } from './indexer.js';
 
 export interface GraphCallSite {
   symbol: string;
@@ -142,15 +143,33 @@ function extractCalls(node: FnLike, relPath: string): GraphCallSite[] {
   return calls;
 }
 
-export function buildGraph(rootDir: string): GraphData {
+function isLowSignalPathForFast(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, '/').toLowerCase();
+  return normalized.startsWith('test/')
+    || normalized.startsWith('tests/')
+    || normalized.startsWith('docs/')
+    || normalized.startsWith('examples/')
+    || normalized.startsWith('scripts/')
+    || normalized.includes('/fixtures/')
+    || normalized.includes('/__snapshots__/')
+    || normalized.endsWith('.snap');
+}
+
+export async function buildGraph(rootDir: string, options?: { mode?: IndexingMode; includeFiles?: Set<string> }): Promise<GraphData> {
+  const mode = options?.mode ?? 'full';
+  const includeFiles = options?.includeFiles;
   const project = new Project({
     skipAddingFilesFromTsConfig: true,
     compilerOptions: { allowJs: true },
   });
 
-  walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']).forEach(f =>
-    project.addSourceFileAtPath(f)
-  );
+  const tsFiles = await walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']);
+  tsFiles.forEach(f => {
+    const relPath = path.relative(rootDir, f);
+    if (includeFiles && !includeFiles.has(relPath)) return;
+    if (mode === 'fast' && isLowSignalPathForFast(relPath)) return;
+    project.addSourceFileAtPath(f);
+  });
 
   const graph: GraphData = {
     symbols: Object.create(null) as Record<string, string[]>,
@@ -246,18 +265,143 @@ export function buildGraph(rootDir: string): GraphData {
     }
   }
 
-  // PHP: add symbols, callers, files, symbolFile from PHP sources
-  buildPhpGraph(rootDir, graph);
+  return graph;
+}
+
+export async function buildGraphAsync(rootDir: string, options?: { mode?: IndexingMode; includeFiles?: Set<string> }): Promise<GraphData> {
+  const mode = options?.mode ?? 'full';
+  const includeFiles = options?.includeFiles;
+  const project = new Project({
+    skipAddingFilesFromTsConfig: true,
+    compilerOptions: { allowJs: true },
+  });
+
+  const tsFiles = await walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']);
+  tsFiles.forEach(f => {
+    const relPath = path.relative(rootDir, f);
+    if (includeFiles && !includeFiles.has(relPath)) return;
+    if (mode === 'fast' && isLowSignalPathForFast(relPath)) return;
+    project.addSourceFileAtPath(f);
+  });
+
+  const graph: GraphData = {
+    symbols: Object.create(null) as Record<string, string[]>,
+    callSites: Object.create(null) as Record<string, GraphCallSite[]>,
+    callers: Object.create(null) as Record<string, string[]>,
+    calledBySites: Object.create(null) as Record<string, GraphCallSite[]>,
+    files: Object.create(null) as Record<string, string[]>,
+    symbolFile: Object.create(null) as Record<string, string>,
+    supertypes: Object.create(null) as Record<string, string[]>,
+    subtypes: Object.create(null) as Record<string, string[]>,
+    implementations: Object.create(null) as Record<string, string[]>,
+    implementedFrom: Object.create(null) as Record<string, string[]>,
+  };
+
+  const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
+  const typeNames = new Set<string>();
+
+  for (const sf of project.getSourceFiles()) {
+    const relPath = path.relative(rootDir, sf.getFilePath());
+
+    graph.files[relPath] = sf
+      .getImportDeclarations()
+      .map(d => d.getModuleSpecifierValue());
+
+    for (const iface of sf.getInterfaces()) {
+      const interfaceName = iface.getName();
+      if (!interfaceName) continue;
+
+      graph.symbolFile[interfaceName] = relPath;
+      typeNames.add(interfaceName);
+      typeMembers[interfaceName] = new Set(iface.getMethods().map(method => method.getName()));
+      registerSupertypes(
+        graph,
+        interfaceName,
+        directTypeReferences(iface.getExtends().map(expr => expr.getExpression().getText()))
+      );
+    }
+
+    const fnNodes: FnLike[] = [
+      ...sf.getFunctions(),
+      ...sf.getDescendantsOfKind(SyntaxKind.ArrowFunction),
+      ...sf.getDescendantsOfKind(SyntaxKind.FunctionExpression),
+      ...sf.getClasses().flatMap(cls => cls.getMethods()),
+    ];
+
+    for (const fn of fnNodes) {
+      const name = getFnName(fn as FnLike);
+      if (!name) continue;
+
+      const calls = extractCalls(fn as FnLike, relPath);
+      graph.symbols[name] = [...new Set([...(graph.symbols[name] ?? []), ...calls.map(call => call.symbol)])];
+      for (const call of calls) addCallSite(graph.callSites!, name, call);
+      graph.symbolFile[name] = relPath;
+
+      for (const callee of calls) {
+        (graph.callers[callee.symbol] ??= []);
+        if (!graph.callers[callee.symbol].includes(name)) {
+          graph.callers[callee.symbol].push(name);
+        }
+        addCallSite(graph.calledBySites!, callee.symbol, { symbol: name, file: relPath, line: callee.line });
+      }
+    }
+
+    for (const cls of sf.getClasses()) {
+      const className = cls.getName();
+      if (!className) continue;
+
+      typeNames.add(className);
+      typeMembers[className] = new Set(cls.getMethods().map(method => method.getName()));
+      const directSupertypes = directTypeReferences([
+        cls.getExtends()?.getExpression().getText(),
+        ...cls.getImplements().map(expr => expr.getExpression().getText()),
+      ]);
+      registerSupertypes(graph, className, directSupertypes);
+    }
+  }
+
+  for (const typeName of typeNames) {
+    const allSupertypes = collectAllSupertypes(typeName, graph.supertypes);
+
+    for (const supertype of allSupertypes) {
+      registerImplementation(graph, supertype, typeName);
+    }
+
+    for (const memberName of typeMembers[typeName] ?? []) {
+      const implementationSymbol = `${typeName}.${memberName}`;
+      for (const supertype of allSupertypes) {
+        if (!(typeMembers[supertype]?.has(memberName))) continue;
+        registerImplementation(graph, `${supertype}.${memberName}`, implementationSymbol);
+      }
+    }
+  }
+
+  await buildPhpGraphAsync(rootDir, graph, { includeFiles });
 
   return graph;
 }
 
-export function saveGraph(graph: GraphData, outPath: string): void {
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  fs.writeFileSync(outPath, JSON.stringify(graph, null, 2));
+export async function saveGraph(graph: GraphData, outPath: string): Promise<void> {
+  await mkdir(path.dirname(outPath), { recursive: true });
+  await Bun.write(outPath, JSON.stringify(graph, null, 2));
 }
 
-export function loadGraph(graphPath: string): GraphData | null {
-  if (!fs.existsSync(graphPath)) return null;
-  return JSON.parse(fs.readFileSync(graphPath, 'utf-8')) as GraphData;
+export async function loadGraphAsync(graphPath: string): Promise<GraphData | null> {
+  try {
+    const raw = await Bun.file(graphPath).text();
+    return JSON.parse(raw) as GraphData;
+  } catch {
+    return null;
+  }
 }
+
+export async function loadGraphAsyncStrict(graphPath: string): Promise<GraphData | null> {
+  try {
+    const file = Bun.file(graphPath);
+    if (!(await file.exists())) return null;
+    return JSON.parse(await file.text()) as GraphData;
+  } catch {
+    return null;
+  }
+}
+

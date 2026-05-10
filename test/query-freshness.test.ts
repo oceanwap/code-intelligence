@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import { getRetrievedSliceFreshness } from '../src/query-freshness.js';
+import { getRetrievedSliceFreshnessAsync } from '../src/query-freshness.js';
 
 function makeTempDir(t: TestContext): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-intel-query-freshness-test-'));
@@ -25,7 +25,7 @@ function runGit(dir: string, args: string[], env?: Record<string, string>): stri
   }).trim();
 }
 
-test('getRetrievedSliceFreshness uses exact git line history and returns changed line ranges', t => {
+test('getRetrievedSliceFreshness uses exact git line history and returns changed line ranges', async t => {
   const dir = makeTempDir(t);
   const srcDir = path.join(dir, 'src');
   fs.mkdirSync(srcDir, { recursive: true });
@@ -59,7 +59,7 @@ test('getRetrievedSliceFreshness uses exact git line history and returns changed
     })
   );
 
-  const freshness = getRetrievedSliceFreshness(dir, 'src/auth.ts', 2, 4);
+  const freshness = await getRetrievedSliceFreshnessAsync(dir, 'src/auth.ts', 2, 4);
 
   assert.equal(freshness.indexRefreshedAt, '2026-05-06T10:00:00.000Z');
   assert.equal(freshness.sliceStartLine, 2);

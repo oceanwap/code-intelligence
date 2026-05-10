@@ -1,6 +1,6 @@
 import type { GraphData } from './graph.js';
 import type { RetrievedSliceFreshness } from './query-freshness.js';
-import { getRetrievedSliceFreshness } from './query-freshness.js';
+import { getRetrievedSliceFreshnessAsync } from './query-freshness.js';
 
 export interface IndexedSymbolPoint {
   payload?: Record<string, unknown> | null;
@@ -65,12 +65,12 @@ function coerceNumber(payload: Record<string, unknown> | null | undefined, key: 
   return typeof value === 'number' ? value : null;
 }
 
-export function buildEnrichedSymbolContext(
+export async function buildEnrichedSymbolContextAsync(
   projectRoot: string,
   graph: GraphData | null,
   symbol: string,
   point?: IndexedSymbolPoint
-): EnrichedSymbolContext {
+): Promise<EnrichedSymbolContext> {
   const payload = point?.payload ?? null;
   const file = coerceString(payload, 'file') ?? graph?.symbolFile?.[symbol] ?? '?';
   const type = coerceString(payload, 'type') ?? 'unknown';
@@ -79,7 +79,7 @@ export function buildEnrichedSymbolContext(
   const lineEnd = coerceNumber(payload, 'lineEnd');
 
   const freshness = file !== '?'
-    ? getRetrievedSliceFreshness(projectRoot, file, lineStart, lineEnd)
+    ? await getRetrievedSliceFreshnessAsync(projectRoot, file, lineStart, lineEnd)
     : {
         sliceStartLine: lineStart,
         sliceEndLine: lineEnd,

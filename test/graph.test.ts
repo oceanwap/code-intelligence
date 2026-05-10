@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import { buildGraph } from '../src/graph.js';
+import { buildGraphAsync } from '../src/graph.js';
 
 function makeTempDir(t: TestContext): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-intel-graph-test-'));
@@ -13,7 +13,7 @@ function makeTempDir(t: TestContext): string {
   return dir;
 }
 
-test('buildGraph tracks TypeScript implementations and method overrides', t => {
+test('buildGraph tracks TypeScript implementations and method overrides', async t => {
   const dir = makeTempDir(t);
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.writeFileSync(
@@ -46,7 +46,7 @@ test('buildGraph tracks TypeScript implementations and method overrides', t => {
     ].join('\n')
   );
 
-  const graph = buildGraph(dir);
+  const graph = await buildGraphAsync(dir);
 
   assert.deepEqual(graph.supertypes['AdvancedWorker'], ['Worker']);
   assert.deepEqual(new Set(graph.supertypes['ConcreteWorker']), new Set(['BaseWorker', 'AdvancedWorker']));
@@ -61,7 +61,7 @@ test('buildGraph tracks TypeScript implementations and method overrides', t => {
   assert.ok(graph.calledBySites?.['helper']?.some(site => site.symbol === 'ConcreteWorker.run' && site.line === 17));
 });
 
-test('buildGraph tracks PHP implementations and method overrides', t => {
+test('buildGraph tracks PHP implementations and method overrides', async t => {
   const dir = makeTempDir(t);
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.writeFileSync(
@@ -98,7 +98,7 @@ test('buildGraph tracks PHP implementations and method overrides', t => {
     ].join('\n')
   );
 
-  const graph = buildGraph(dir);
+  const graph = await buildGraphAsync(dir);
 
   assert.deepEqual(new Set(graph.supertypes['App\\ConcreteRunner']), new Set(['App\\BaseRunner', 'App\\AdvancedRunner']));
   assert.deepEqual(new Set(graph.implementations['App\\Runner']), new Set(['App\\AdvancedRunner', 'App\\ConcreteRunner']));

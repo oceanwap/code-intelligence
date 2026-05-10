@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import test, { type TestContext } from 'node:test';
 import type { GraphData } from '../src/graph.js';
-import { buildEnrichedSymbolContext } from '../src/symbol-context.js';
+import { buildEnrichedSymbolContextAsync } from '../src/symbol-context.js';
 
 function makeTempDir(t: TestContext): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-intel-symbol-context-test-'));
@@ -26,7 +26,7 @@ function runGit(dir: string, args: string[], env?: Record<string, string>): void
   });
 }
 
-test('buildEnrichedSymbolContext adds freshness, graph callsites, and next-call guidance', t => {
+test('buildEnrichedSymbolContext adds freshness, graph callsites, and next-call guidance', async t => {
   const dir = makeTempDir(t);
   const srcDir = path.join(dir, 'src');
   const dataDir = path.join(dir, '.code-intelligence', 'master');
@@ -63,7 +63,7 @@ test('buildEnrichedSymbolContext adds freshness, graph callsites, and next-call 
     implementedFrom: {},
   };
 
-  const context = buildEnrichedSymbolContext(dir, graph, 'AuthService.login', {
+  const context = await buildEnrichedSymbolContextAsync(dir, graph, 'AuthService.login', {
     payload: {
       file: 'src/auth.ts',
       type: 'method',

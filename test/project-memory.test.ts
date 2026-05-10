@@ -6,12 +6,12 @@ import * as path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { DocumentMemoryEntry } from '../src/document-memory.js';
 import {
-    buildProjectMemoryEntries,
-    getBugBrief,
-    getFeatureMap,
-    getProjectStatus,
-    getWhyChanged,
-    listRecentBugs,
+    buildProjectMemoryEntriesAsync,
+    getBugBriefAsync,
+    getFeatureMapAsync,
+    getProjectStatusAsync,
+    getWhyChangedAsync,
+    listRecentBugsAsync,
     type BugMemoryEntry,
     type ChangeMemoryEntry,
     type ProjectMemoryEntry,
@@ -144,7 +144,7 @@ function commitAllWithBody(dir: string, subject: string, body: string, isoDate: 
     });
 }
 
-test('getFeatureMap prefers feature and architecture docs over setup docs', t => {
+test('getFeatureMap prefers feature and architecture docs over setup docs', async t => {
     const dir = makeTempDir(t);
     writeSnapshot(dir, [
         makeDocEntry({ id: 'doc:setup', title: 'Setup', section: 'Setup', summary: 'overview note: Setup.', topics: ['setup'] }),
@@ -153,7 +153,7 @@ test('getFeatureMap prefers feature and architecture docs over setup docs', t =>
         makeChangeEntry(),
     ]);
 
-    const featureMap = getFeatureMap(dir);
+    const featureMap = await getFeatureMapAsync(dir);
     assert.ok(featureMap);
 
     assert.deepEqual(
@@ -162,7 +162,7 @@ test('getFeatureMap prefers feature and architecture docs over setup docs', t =>
     );
     assert.equal(featureMap.recentFeatureChanges[0]?.title, 'Add offline memory');
 
-    const status = getProjectStatus(dir);
+    const status = await getProjectStatusAsync(dir);
     assert.ok(status);
     assert.deepEqual(
         status.featureDocs.map(entry => entry.title),
@@ -170,7 +170,7 @@ test('getFeatureMap prefers feature and architecture docs over setup docs', t =>
     );
 });
 
-test('buildProjectMemoryEntries ingests git history and maps commit changes to symbols', t => {
+test('buildProjectMemoryEntries ingests git history and maps commit changes to symbols', async t => {
     const dir = makeTempDir(t);
     initGitRepo(dir);
 
@@ -231,7 +231,7 @@ test('buildProjectMemoryEntries ingests git history and maps commit changes to s
         '2026-04-02T10:00:00Z'
     );
 
-    const result = buildProjectMemoryEntries(dir);
+    const result = await buildProjectMemoryEntriesAsync(dir);
     const changeEntries = result.entries.filter((entry): entry is ChangeMemoryEntry => entry.kind === 'change');
     const bugEntries = result.entries.filter((entry): entry is BugMemoryEntry => entry.kind === 'bug');
     const docEntries = result.entries.filter(entry => entry.kind === 'document');
@@ -258,7 +258,7 @@ test('buildProjectMemoryEntries ingests git history and maps commit changes to s
     assert.ok(docEntries.some(entry => entry.path === 'README.md'));
 });
 
-test('getWhyChanged finds recent changes for a symbol or file target', t => {
+test('getWhyChanged finds recent changes for a symbol or file target', async t => {
     const dir = makeTempDir(t);
     writeSnapshot(dir, [
         makeChangeEntry({
@@ -284,20 +284,20 @@ test('getWhyChanged finds recent changes for a symbol or file target', t => {
         }),
     ]);
 
-    const symbolResult = getWhyChanged(dir, { target: 'AuthService.login', mode: 'symbol' });
+    const symbolResult = await getWhyChangedAsync(dir, { target: 'AuthService.login', mode: 'symbol' });
     assert.ok(symbolResult);
     assert.equal(symbolResult.totalMatches, 1);
     assert.deepEqual(symbolResult.matches[0]?.matchedSymbols, ['AuthService.login']);
     assert.equal(symbolResult.matches[0]?.entry.title, 'Fix auth login guard');
 
-    const fileResult = getWhyChanged(dir, { target: 'cache.ts', mode: 'file' });
+    const fileResult = await getWhyChangedAsync(dir, { target: 'cache.ts', mode: 'file' });
     assert.ok(fileResult);
     assert.equal(fileResult.totalMatches, 1);
     assert.deepEqual(fileResult.matches[0]?.matchedFiles, ['src/cache.ts']);
     assert.equal(fileResult.matches[0]?.entry.title, 'Refactor cache refresh');
 });
 
-test('listRecentBugs and getBugBrief surface bug memory for exact targets', t => {
+test('listRecentBugs and getBugBrief surface bug memory for exact targets', async t => {
     const dir = makeTempDir(t);
     writeSnapshot(dir, [
         makeBugEntry(),
@@ -318,11 +318,11 @@ test('listRecentBugs and getBugBrief surface bug memory for exact targets', t =>
         makeChangeEntry(),
     ]);
 
-    const recentBugs = listRecentBugs(dir, { topic: 'auth' });
+    const recentBugs = await listRecentBugsAsync(dir, { topic: 'auth' });
     assert.equal(recentBugs.length, 1);
     assert.equal(recentBugs[0]?.title, 'Fix auth login guard');
 
-    const brief = getBugBrief(dir, { target: 'AuthService.login', mode: 'symbol' });
+    const brief = await getBugBriefAsync(dir, { target: 'AuthService.login', mode: 'symbol' });
     assert.ok(brief);
     assert.equal(brief.totalMatches, 1);
     assert.deepEqual(brief.matches[0]?.matchedSymbols, ['AuthService.login']);
@@ -330,7 +330,7 @@ test('listRecentBugs and getBugBrief surface bug memory for exact targets', t =>
     assert.deepEqual(brief.matches[0]?.entry.errorSignatures, ['TypeError']);
 });
 
-test('buildProjectMemoryEntries rebuilds stale noisy change entries instead of reusing them', t => {
+test('buildProjectMemoryEntries rebuilds stale noisy change entries instead of reusing them', async t => {
     const dir = makeTempDir(t);
     initGitRepo(dir);
 
@@ -356,11 +356,11 @@ test('buildProjectMemoryEntries rebuilds stale noisy change entries instead of r
         '2026-04-02T10:00:00Z'
     );
 
-    const fresh = buildProjectMemoryEntries(dir);
+    const fresh = await buildProjectMemoryEntriesAsync(dir);
     const freshChange = fresh.entries.find((entry): entry is ChangeMemoryEntry => entry.kind === 'change');
     assert.ok(freshChange);
 
-    const reused = buildProjectMemoryEntries(dir, [{
+    const reused = await buildProjectMemoryEntriesAsync(dir, [{
         ...freshChange,
         body: [
             'Handle TypeError when session state is missing.',

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import { Command } from 'commander';
 import * as path from 'path';
 import type { RetrievedChunk } from './indexer-run.js';
@@ -10,12 +10,12 @@ import {
 } from './engineering-insights.js';
 import { indexProject, queryProject } from './indexer-run.js';
 import {
-  getFeatureMap,
-  getBugBrief,
-  getProjectMemoryFreshness,
-  listRecentChanges,
-  listRecentBugs,
-  getWhyChanged,
+  getFeatureMapAsync,
+  getBugBriefAsync,
+  getProjectMemoryFreshnessAsync,
+  listRecentChangesAsync,
+  listRecentBugsAsync,
+  getWhyChangedAsync,
   queryProjectMemory,
   renderBugBrief,
   renderFeatureMap,
@@ -25,9 +25,10 @@ import {
   renderRecentChanges,
   renderWhyChanged,
   syncProjectMemory,
-  getProjectStatus,
+  getProjectStatusAsync,
 } from './project-memory.js';
 import { serializeQueryProjectResponse } from './output-format.js';
+import { buildProjectIntentSnapshot, renderProjectIntentSnapshot } from './project-intent.js';
 
 function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
   return ranges
@@ -139,25 +140,65 @@ program
   .command('index <dir>')
   .description('Index a codebase directory')
   .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
-  .action(async (dir: string, opts: { qdrant: string }) => {
+  .option('--from-scratch', 'Delete all previous index data and rebuild from zero', false)
+  .option('--full-index', 'Index all chunks, including lower-relevance docs/config/plain-file slices (default is fast mode)', false)
+  .action(async (dir: string, opts: { qdrant: string; fromScratch: boolean; fullIndex: boolean }) => {
     const root = path.resolve(dir);
+    const indexMode = opts.fullIndex ? 'full' : 'fast';
 
     console.log(`Scanning ${root}...`);
+    if (opts.fromScratch) {
+      console.log('⚠️  Full reindex mode: will delete all previous data');
+    }
+    console.log(`Index mode: ${indexMode}`);
+    
+    const stageLabels: Record<string, string> = {
+      'pre-scanning': 'Pre-scanning files',
+      'parsing': 'Parsing files',
+      'building-graph': 'Building call graph',
+      'building-manifest': 'Building manifest',
+      'cleaning': 'Cleaning stale data',
+      'loading-model': 'Loading embedding model',
+      'embedding': 'Embedding code',
+      'storing': 'Storing embeddings',
+      'syncing-memory': 'Syncing project memory',
+      'computing-cognition': 'Computing cognition layers',
+    };
+    
+    let lastStage = '';
+    
     const result = await indexProject(root, opts.qdrant, (stage, done, total) => {
-      if (stage === 'loading-model') {
-        process.stdout.write('  Loading model  ...\r');
-      } else {
-        drawBar(stage === 'embedding' ? 'Embedding' : 'Storing', done, total);
+      if (stage !== lastStage) {
+        if (lastStage) console.log(''); // newline after previous stage
+        lastStage = stage;
       }
-    });
+      
+      const label = stageLabels[stage] || stage;
+      if (total === 1) {
+        // Binary stage (on/off)
+        if (done === 0) {
+          process.stdout.write(`  ${label}...`);
+        }
+      } else {
+        // Progress with counter
+        drawBar(label, done, total);
+      }
+    }, opts.fromScratch, indexMode);
 
-    console.log(`  ${result.chunks} chunks extracted`);
+    console.log(''); // final newline
+    console.log(`  ${result.discoveredChunks} chunks discovered`);
+    console.log(`  ${result.indexedChunks} chunks indexed (${result.filteredOutChunks} filtered out in ${result.mode} mode)`);
     console.log(`  ${result.symbols} symbols, ${result.files} files in graph`);
-    if (result.staleRemoved > 0) console.log(`  Removing ${result.staleRemoved} stale chunk(s)...`);
-    if (result.orphansRemoved > 0) console.log(`  Removed ${result.orphansRemoved} orphaned chunk(s) from Qdrant...`);
+    const timingParts = Object.entries(result.stageDurationsMs)
+      .map(([stage, ms]) => `${stage}=${ms}ms`)
+      .join(', ');
+    console.log(`  Timing: total=${result.totalDurationMs}ms`);
+    if (timingParts.length > 0) console.log(`  Stage timings: ${timingParts}`);
+    if (result.staleRemoved > 0) console.log(`  Removed ${result.staleRemoved} stale chunk(s) from Qdrant`);
+    if (result.orphansRemoved > 0) console.log(`  Removed ${result.orphansRemoved} orphaned chunk(s) from Qdrant`);
     console.log(`  ${result.memoryEntries} project-memory entr${result.memoryEntries === 1 ? 'y' : 'ies'} indexed`);
-    if (result.newMemoryEntries > 0) console.log(`  Added ${result.newMemoryEntries} new project-memory entr${result.newMemoryEntries === 1 ? 'y' : 'ies'}...`);
-    if (result.staleMemoryRemoved > 0) console.log(`  Removed ${result.staleMemoryRemoved} stale project-memory entr${result.staleMemoryRemoved === 1 ? 'y' : 'ies'}...`);
+    if (result.newMemoryEntries > 0) console.log(`  Added ${result.newMemoryEntries} new project-memory entr${result.newMemoryEntries === 1 ? 'y' : 'ies'}`);
+    if (result.staleMemoryRemoved > 0) console.log(`  Removed ${result.staleMemoryRemoved} stale project-memory entr${result.staleMemoryRemoved === 1 ? 'y' : 'ies'}`);
     console.log('Indexing complete.');
   });
 
@@ -167,11 +208,13 @@ program
   .description('Retrieve relevant code for a natural language question')
   .option('--dir <path>', 'Project root directory', '.')
   .option('--format <format>', 'Output format: text|json', 'text')
+  .option('--mode <mode>', 'Retrieval mode: default|architecture', 'default')
   .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
-  .action(async (question: string, opts: { dir: string; format: 'text' | 'json'; qdrant: string }) => {
+  .action(async (question: string, opts: { dir: string; format: 'text' | 'json'; mode: 'default' | 'architecture'; qdrant: string }) => {
     const root = path.resolve(opts.dir);
-    const results = await queryProject(root, question, opts.qdrant);
-    const memoryFreshness = getProjectMemoryFreshness(root);
+    const mode = opts.mode === 'architecture' ? 'architecture' : 'default';
+    const results = await queryProject(root, question, opts.qdrant, mode);
+    const memoryFreshness = await getProjectMemoryFreshnessAsync(root);
     if (!results.length) {
       console.log('No results found.');
       return;
@@ -185,6 +228,19 @@ program
     console.log(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
     if (memoryFreshness.reasons.length > 0) {
       console.log(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);
+    }
+    if (mode === 'architecture') {
+      const snapshot = await buildProjectIntentSnapshot(root);
+      if (snapshot) {
+        const overviewClaims = snapshot.claims
+          .filter(claim => claim.category === 'architecture' || claim.category === 'patterns' || claim.category === 'entrypoints')
+          .slice(0, 6)
+          .map(claim => `- [${claim.evidenceTier}] ${claim.statement}`);
+        if (overviewClaims.length > 0) {
+          console.log('\nArchitecture overview:');
+          console.log(overviewClaims.join('\n'));
+        }
+      }
     }
 
     for (const r of results) {
@@ -200,7 +256,7 @@ program
   .action(async (opts: { dir: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const status = getProjectStatus(root);
+    const status = await getProjectStatusAsync(root);
     if (!status) {
       console.log('No project memory found. Run `code-intel index .` first.');
       return;
@@ -220,7 +276,7 @@ program
   .action(async (opts: { dir: string; limit: string; type?: 'feature' | 'fix' | 'refactor' | 'docs' | 'test' | 'ops' | 'chore'; topic?: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const entries = listRecentChanges(root, {
+    const entries = await listRecentChangesAsync(root, {
       limit: Number(opts.limit) || 10,
       type: opts.type,
       topic: opts.topic,
@@ -238,7 +294,7 @@ program
   .action(async (opts: { dir: string; limit: string; topic?: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const entries = listRecentBugs(root, {
+    const entries = await listRecentBugsAsync(root, {
       limit: Number(opts.limit) || 10,
       topic: opts.topic,
     });
@@ -253,13 +309,36 @@ program
   .action(async (opts: { dir: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const featureMap = getFeatureMap(root);
+    const featureMap = await getFeatureMapAsync(root);
     if (!featureMap) {
       console.log('No project memory found. Run `code-intel index .` first.');
       return;
     }
 
     console.log(renderFeatureMap(featureMap));
+  });
+
+program
+  .command('intent')
+  .description('Show structured project-understanding snapshot with evidence tiers and confidence')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .option('--json', 'Emit JSON output')
+  .action(async (opts: { dir: string; qdrant: string; json?: boolean }) => {
+    const root = path.resolve(opts.dir);
+    await syncProjectMemory(root, opts.qdrant);
+    const snapshot = await buildProjectIntentSnapshot(root);
+    if (!snapshot) {
+      console.log('Project not indexed. Run `code-intel index .` first.');
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(snapshot, null, 2));
+      return;
+    }
+
+    console.log(renderProjectIntentSnapshot(snapshot));
   });
 
 program
@@ -286,7 +365,7 @@ program
   .action(async (symbols: string[], opts: { dir: string; hops: string; direction: 'out' | 'in' | 'both'; limit: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const result = getAffectedSymbols(root, symbols, {
+    const result = await getAffectedSymbols(root, symbols, {
       hops: Number(opts.hops) || 2,
       direction: opts.direction,
       limit: Number(opts.limit) || 15,
@@ -309,7 +388,7 @@ program
   .action(async (opts: { dir: string; limit: string; topic?: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const result = getRiskHotspots(root, {
+    const result = await getRiskHotspots(root, {
       limit: Number(opts.limit) || 10,
       topic: opts.topic,
     });
@@ -332,7 +411,7 @@ program
   .action(async (target: string, opts: { dir: string; mode: 'auto' | 'symbol' | 'file'; topic?: string; limit: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const result = getWhyChanged(root, {
+    const result = await getWhyChangedAsync(root, {
       target,
       mode: opts.mode,
       topic: opts.topic,
@@ -357,7 +436,7 @@ program
   .action(async (target: string, opts: { dir: string; mode: 'auto' | 'symbol' | 'file'; topic?: string; limit: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     await syncProjectMemory(root, opts.qdrant);
-    const result = getBugBrief(root, {
+    const result = await getBugBriefAsync(root, {
       target,
       mode: opts.mode,
       topic: opts.topic,

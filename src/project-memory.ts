@@ -1,17 +1,16 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as path from 'path';
-import { buildDocumentEntries, type DocumentMemoryEntry } from './document-memory.js';
+import { buildDocumentEntriesAsync, type DocumentMemoryEntry } from './document-memory.js';
 import { extractSemanticTouch, prefersOldRevision } from './change-semantic.js';
-import { VECTOR_SIZE, embedQuery, embedTexts, scopedCollectionName } from './embedder.js';
+import { VECTOR_SIZE, embedQuery, embedTexts, scopedCollectionNameAsync } from './embedder.js';
 import {
-    getCommitPatch,
-    getCurrentBranch,
-    getHeadCommit,
-    getWorkingTreeChanges,
-    listRecentCommitMetadata,
-    readGitFile,
+    getCommitPatchAsync,
+    getCurrentBranchAsync,
+    getHeadCommitAsync,
+    getWorkingTreeChangesAsync,
+    listRecentCommitMetadataAsync,
+    readGitFileAsync,
     type GitCommitMetadata,
 } from './git.js';
 import { getDataDir } from './git.js';
@@ -152,7 +151,23 @@ export interface BugBriefResult {
     matches: BugBriefMatch[];
 }
 
-const MAX_COMMITS = 150;
+interface WhyChangedRankedMatch extends WhyChangedMatch {
+    score: number;
+    topicScore: number;
+}
+
+interface BugBriefRankedMatch extends BugBriefMatch {
+    score: number;
+    topicScore: number;
+}
+
+const MAX_COMMITS = (() => {
+    const override = Number(process.env.CODE_INTEL_MEMORY_MAX_COMMITS ?? '');
+    if (Number.isFinite(override) && override >= 20 && override <= 1000) {
+        return Math.floor(override);
+    }
+    return 150;
+})();
 const PROJECT_MEMORY_FILE = 'project-memory.json';
 const PROJECT_MEMORY_CACHE_FILE = 'project-memory-cache.json';
 const UPSERT_BATCH_SIZE = 25;
@@ -194,8 +209,8 @@ function projectMemoryCacheFile(projectRoot: string): string {
     return path.join(getDataDir(projectRoot), PROJECT_MEMORY_CACHE_FILE);
 }
 
-function memoryCollectionName(projectRoot: string): string {
-    return scopedCollectionName(projectRoot, 'memory');
+async function memoryCollectionNameAsync(projectRoot: string): Promise<string> {
+    return await scopedCollectionNameAsync(projectRoot, 'memory');
 }
 
 function memoryPointId(entryId: string): string {
@@ -207,23 +222,30 @@ function embeddingFingerprint(text: string): string {
     return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
-function loadMemorySnapshot(projectRoot: string): ProjectMemorySnapshot | null {
+async function loadMemorySnapshotAsync(projectRoot: string): Promise<ProjectMemorySnapshot | null> {
     const file = projectMemoryFile(projectRoot);
-    if (!fs.existsSync(file)) return null;
-    return JSON.parse(fs.readFileSync(file, 'utf-8')) as ProjectMemorySnapshot;
+    try {
+        const raw = await Bun.file(file).text();
+        return JSON.parse(raw) as ProjectMemorySnapshot;
+    } catch {
+        return null;
+    }
 }
 
-function saveMemorySnapshot(projectRoot: string, snapshot: ProjectMemorySnapshot): void {
+async function saveMemorySnapshot(projectRoot: string, snapshot: ProjectMemorySnapshot): Promise<void> {
     const file = projectMemoryFile(projectRoot);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(snapshot, null, 2));
+    await Bun.write(file, JSON.stringify(snapshot, null, 2));
 }
 
-function loadMemoryCache(cacheFile: string): Record<string, MemoryCacheEntry> {
-    if (!fs.existsSync(cacheFile)) return {};
-    const raw = JSON.parse(fs.readFileSync(cacheFile, 'utf-8')) as Record<string, number[] | MemoryCacheEntry>;
+async function loadMemoryCacheAsync(cacheFile: string): Promise<Record<string, MemoryCacheEntry>> {
+    let raw: Record<string, number[] | MemoryCacheEntry>;
+    try {
+        raw = JSON.parse(await Bun.file(cacheFile).text()) as Record<string, number[] | MemoryCacheEntry>;
+    } catch {
+        return {};
+    }
+
     const normalized: Record<string, MemoryCacheEntry> = {};
-
     for (const [id, value] of Object.entries(raw)) {
         if (Array.isArray(value)) {
             normalized[id] = { fingerprint: '', vector: value };
@@ -241,9 +263,8 @@ function loadMemoryCache(cacheFile: string): Record<string, MemoryCacheEntry> {
     return normalized;
 }
 
-function saveMemoryCache(cacheFile: string, cache: Record<string, MemoryCacheEntry>): void {
-    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
-    fs.writeFileSync(cacheFile, JSON.stringify(cache));
+async function saveMemoryCache(cacheFile: string, cache: Record<string, MemoryCacheEntry>): Promise<void> {
+    await Bun.write(cacheFile, JSON.stringify(cache));
 }
 
 function splitTokens(text: string): string[] {
@@ -488,6 +509,49 @@ function matchesFileTarget(file: string, target: string): boolean {
     return normalizeLookupValue(file).includes(target);
 }
 
+function keywordTopicRelevance(text: string, topic: string): number {
+    if (!topic) return 0;
+    const normalizedText = normalizeLookupValue(text);
+    const normalizedTopic = normalizeLookupValue(topic);
+    if (!normalizedText || !normalizedTopic) return 0;
+    if (normalizedText.includes(normalizedTopic)) return 3;
+
+    if (normalizedTopic === 'dependency' || normalizedTopic === 'dependencies') {
+        return /(dependency|import|module|resolve|circular|coupling|injection|provider)/.test(normalizedText) ? 2 : 0;
+    }
+    if (normalizedTopic === 'dto' || normalizedTopic === 'dtos') {
+        return /(dto|schema|payload|contract|serialization|validation|boundary)/.test(normalizedText) ? 2 : 0;
+    }
+
+    return 0;
+}
+
+function bugTopicScore(entry: BugMemoryEntry, topic: string | undefined): number {
+    if (!topic) return 1;
+    const topicHits = entry.topics.reduce((sum, value) => sum + keywordTopicRelevance(value, topic), 0);
+    const signatureHits = entry.errorSignatures.reduce((sum, value) => sum + keywordTopicRelevance(value, topic), 0);
+    const symptomHits = entry.symptoms.reduce((sum, value) => sum + keywordTopicRelevance(value, topic), 0);
+    const fileHits = entry.files.reduce((sum, value) => sum + keywordTopicRelevance(value, topic), 0);
+    return topicHits * 4 + signatureHits * 3 + symptomHits * 2 + fileHits;
+}
+
+function changeTopicScore(entry: ChangeMemoryEntry, topic: string | undefined): number {
+    if (!topic) return 1;
+    const topicHits = entry.topics.reduce((sum, value) => sum + keywordTopicRelevance(value, topic), 0);
+    const titleHits = keywordTopicRelevance(entry.title, topic);
+    const bodyHits = keywordTopicRelevance(entry.body, topic);
+    const impactHits = entry.impacts
+        .flatMap(impact => impact.hints)
+        .reduce((sum, value) => sum + keywordTopicRelevance(value, topic), 0);
+    return topicHits * 4 + titleHits * 3 + bodyHits * 2 + impactHits;
+}
+
+function recencyBoost(timestamp: string): number {
+    const ageMs = Math.max(0, Date.now() - Date.parse(timestamp));
+    const ageDays = ageMs / 86_400_000;
+    return Math.max(0, 1 - ageDays / 365);
+}
+
 async function wait(ms: number): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -516,8 +580,8 @@ function isFeatureDocumentEntry(entry: ProjectMemoryEntry): entry is DocumentMem
         .test(entry.title);
 }
 
-function buildCommitEntry(projectRoot: string, commit: GitCommitMetadata): ChangeMemoryEntry {
-    const patches = getCommitPatch(projectRoot, commit.sha);
+async function buildCommitEntryAsync(projectRoot: string, commit: GitCommitMetadata): Promise<ChangeMemoryEntry> {
+    const patches = await getCommitPatchAsync(projectRoot, commit.sha);
     const impacts: ProjectMemoryImpact[] = [];
     const files = dedupeStrings(patches.map(patch => patch.path));
 
@@ -525,7 +589,7 @@ function buildCommitEntry(projectRoot: string, commit: GitCommitMetadata): Chang
         const useOldRevision = prefersOldRevision(patch) && commit.parents.length > 0;
         const revision = useOldRevision ? commit.parents[0] : commit.sha;
         const revisionPath = useOldRevision ? (patch.oldPath ?? patch.path) : patch.path;
-        const source = readGitFile(projectRoot, revision, revisionPath);
+        const source = await readGitFileAsync(projectRoot, revision, revisionPath);
         const touch = extractSemanticTouch(
             { ...patch, path: revisionPath },
             source,
@@ -600,7 +664,7 @@ interface MemoryCollectionState {
 
 async function ensureMemoryCollection(projectRoot: string, qdrantUrl: string): Promise<MemoryCollectionState> {
     const qdrant = new QdrantClient({ url: qdrantUrl });
-    const collection = memoryCollectionName(projectRoot);
+    const collection = await memoryCollectionNameAsync(projectRoot);
     const existing = await qdrant.getCollections();
     let needsFullSync = false;
     let cacheInvalidated = false;
@@ -655,8 +719,8 @@ async function upsertMemoryEntries(
     if (entries.length === 0) return 0;
 
     const { qdrant, needsFullSync, cacheInvalidated } = await ensureMemoryCollection(projectRoot, qdrantUrl);
-    const collection = memoryCollectionName(projectRoot);
-    const cache = cacheInvalidated ? {} : loadMemoryCache(cacheFile);
+    const collection = await memoryCollectionNameAsync(projectRoot);
+    const cache = cacheInvalidated ? {} : await loadMemoryCacheAsync(cacheFile);
     const embeddingTexts = new Map(entries.map(entry => [entry.id, buildEmbeddingText(entry)]));
     const uncached = entries.filter(entry => {
         const text = embeddingTexts.get(entry.id) ?? '';
@@ -673,7 +737,7 @@ async function upsertMemoryEntries(
                 vector: vectors[index],
             };
         });
-        saveMemoryCache(cacheFile, cache);
+        await saveMemoryCache(cacheFile, cache);
     }
 
     const entriesToStore = needsFullSync ? entries : uncached;
@@ -717,12 +781,12 @@ async function deleteStaleMemoryEntries(
 ): Promise<number> {
     if (staleIds.length === 0) return 0;
 
-    const cache = loadMemoryCache(cacheFile);
+    const cache = await loadMemoryCacheAsync(cacheFile);
     for (const id of staleIds) delete cache[id];
-    saveMemoryCache(cacheFile, cache);
+    await saveMemoryCache(cacheFile, cache);
 
     const { qdrant } = await ensureMemoryCollection(projectRoot, qdrantUrl);
-    await qdrant.delete(memoryCollectionName(projectRoot), {
+    await qdrant.delete(await memoryCollectionNameAsync(projectRoot), {
         points: staleIds.map(memoryPointId),
     });
 
@@ -734,8 +798,8 @@ export async function syncProjectMemory(
     qdrantUrl = 'http://localhost:6333'
 ): Promise<ProjectMemorySyncResult> {
     const root = path.resolve(projectRoot);
-    const oldSnapshot = loadMemorySnapshot(root);
-    const { branch, headSha, entries, latestChangeSha } = buildProjectMemoryEntries(root, oldSnapshot?.entries ?? []);
+    const oldSnapshot = await loadMemorySnapshotAsync(root);
+    const { branch, headSha, entries, latestChangeSha } = await buildProjectMemoryEntriesAsync(root, oldSnapshot?.entries ?? []);
     const snapshot: ProjectMemorySnapshot = {
         branch,
         headSha,
@@ -752,7 +816,7 @@ export async function syncProjectMemory(
 
     await upsertMemoryEntries(root, entries, cacheFile, qdrantUrl);
     const staleRemoved = await deleteStaleMemoryEntries(root, staleIds, cacheFile, qdrantUrl);
-    saveMemorySnapshot(root, snapshot);
+    await saveMemorySnapshot(root, snapshot);
 
     return {
         totalEntries: entries.length,
@@ -762,14 +826,14 @@ export async function syncProjectMemory(
     };
 }
 
-export function buildProjectMemoryEntries(
+export async function buildProjectMemoryEntriesAsync(
     projectRoot: string,
     previousEntries: ProjectMemoryEntry[] = []
-): ProjectMemoryBuildResult {
+): Promise<ProjectMemoryBuildResult> {
     const root = path.resolve(projectRoot);
-    const branch = getCurrentBranch(root);
-    const headSha = getHeadCommit(root);
-    const commits = listRecentCommitMetadata(root, MAX_COMMITS);
+    const branch = await getCurrentBranchAsync(root);
+    const headSha = await getHeadCommitAsync(root);
+    const commits = await listRecentCommitMetadataAsync(root, MAX_COMMITS);
     const previousChangesBySha = new Map(
         previousEntries
             .filter(isChangeEntry)
@@ -777,12 +841,12 @@ export function buildProjectMemoryEntries(
             .map(entry => [entry.sha, entry])
     );
 
-    const changeEntries = commits.map(commit => previousChangesBySha.get(commit.sha) ?? buildCommitEntry(root, commit));
+    const changeEntries = await Promise.all(commits.map(async commit => previousChangesBySha.get(commit.sha) ?? await buildCommitEntryAsync(root, commit)));
     const bugEntries = changeEntries
         .filter(entry => entry.changeType === 'fix')
         .map(buildBugEntry)
         .filter(entry => entry.evidenceScore > 0);
-    const documentEntries = buildDocumentEntries(root);
+    const documentEntries = await buildDocumentEntriesAsync(root);
     const entries = [...bugEntries, ...changeEntries, ...documentEntries]
         .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
 
@@ -794,11 +858,11 @@ export function buildProjectMemoryEntries(
     };
 }
 
-export function listRecentChanges(
+export async function listRecentChangesAsync(
     projectRoot: string,
     opts?: { limit?: number; type?: ChangeMemoryEntry['changeType']; topic?: string }
-): ChangeMemoryEntry[] {
-    const snapshot = loadMemorySnapshot(path.resolve(projectRoot));
+): Promise<ChangeMemoryEntry[]> {
+    const snapshot = await loadMemorySnapshotAsync(path.resolve(projectRoot));
     if (!snapshot) return [];
 
     const typeFilter = opts?.type;
@@ -819,11 +883,11 @@ export async function queryProjectMemory(
     limit = 5
 ): Promise<ProjectMemorySearchHit[]> {
     const root = path.resolve(projectRoot);
-    const snapshot = loadMemorySnapshot(root);
+    const snapshot = await loadMemorySnapshotAsync(root);
     if (!snapshot || snapshot.entries.length === 0) return [];
 
     const { qdrant } = await ensureMemoryCollection(root, qdrantUrl);
-    const hits = await qdrant.search(memoryCollectionName(root), {
+    const hits = await qdrant.search(await memoryCollectionNameAsync(root), {
         vector: await embedQuery(question),
         limit: Math.max(limit * 2, 10),
         with_payload: true,
@@ -865,9 +929,9 @@ export async function queryProjectMemory(
         .slice(0, limit);
 }
 
-export function getProjectStatus(projectRoot: string): ProjectStatusSnapshot | null {
+export async function getProjectStatusAsync(projectRoot: string): Promise<ProjectStatusSnapshot | null> {
     const root = path.resolve(projectRoot);
-    const snapshot = loadMemorySnapshot(root);
+    const snapshot = await loadMemorySnapshotAsync(root);
     if (!snapshot) return null;
 
     const recentEntries = snapshot.entries.slice(0, 20);
@@ -893,7 +957,7 @@ export function getProjectStatus(projectRoot: string): ProjectStatusSnapshot | n
         headSha: snapshot.headSha,
         memoryEntries: snapshot.entries.length,
         latestChange: changeEntries[0] ?? null,
-        dirtyFiles: getWorkingTreeChanges(root),
+        dirtyFiles: await getWorkingTreeChangesAsync(root),
         recentFixes: changeEntries.filter(entry => entry.changeType === 'fix').slice(0, 3),
         activeTopics: [...topicCounts.entries()]
             .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
@@ -983,20 +1047,30 @@ export function renderMemoryQueryResults(results: ProjectMemorySearchHit[]): str
     }).join('\n\n---\n\n');
 }
 
-export function listRecentBugs(
+export async function listRecentBugsAsync(
     projectRoot: string,
     opts?: { limit?: number; topic?: string }
-): BugMemoryEntry[] {
-    const snapshot = loadMemorySnapshot(path.resolve(projectRoot));
+): Promise<BugMemoryEntry[]> {
+    const snapshot = await loadMemorySnapshotAsync(path.resolve(projectRoot));
     if (!snapshot) return [];
 
     const topicFilter = opts?.topic?.toLowerCase();
     const limit = opts?.limit ?? 10;
 
-    return snapshot.entries
+    const ranked = snapshot.entries
         .filter(isBugEntry)
-        .filter(entry => !topicFilter || entry.topics.some(topic => topic.includes(topicFilter)))
-        .slice(0, limit);
+        .map(entry => ({
+            entry,
+            score: bugTopicScore(entry, topicFilter) + recencyBoost(entry.timestamp),
+        }));
+
+    const hasTopicMatches = !topicFilter || ranked.some(item => item.score > 1);
+
+    return ranked
+        .filter(item => hasTopicMatches ? item.score > 1 || !topicFilter : true)
+        .sort((left, right) => right.score - left.score || Date.parse(right.entry.timestamp) - Date.parse(left.entry.timestamp))
+        .slice(0, limit)
+        .map(item => item.entry);
 }
 
 export function renderRecentBugs(entries: BugMemoryEntry[]): string {
@@ -1055,30 +1129,33 @@ export function renderProjectStatus(status: ProjectStatusSnapshot): string {
     return lines.join('\n');
 }
 
-export function getProjectMemoryCount(projectRoot: string): number {
-    return loadMemorySnapshot(path.resolve(projectRoot))?.entries.length ?? 0;
+export async function getProjectMemoryCountAsync(projectRoot: string): Promise<number> {
+    return (await loadMemorySnapshotAsync(path.resolve(projectRoot)))?.entries.length ?? 0;
 }
 
-export function getProjectMemoryEntries(projectRoot: string): ProjectMemoryEntry[] {
-    return loadMemorySnapshot(path.resolve(projectRoot))?.entries ?? [];
+export async function getProjectMemoryEntriesAsync(projectRoot: string): Promise<ProjectMemoryEntry[]> {
+    return (await loadMemorySnapshotAsync(path.resolve(projectRoot)))?.entries ?? [];
 }
-
-export function getProjectMemoryFreshness(projectRoot: string): ProjectMemoryFreshness {
+export async function getProjectMemoryFreshnessAsync(projectRoot: string): Promise<ProjectMemoryFreshness> {
     const root = path.resolve(projectRoot);
-    const snapshot = loadMemorySnapshot(root);
-    const currentHeadSha = getHeadCommit(root);
-    const dirtyFiles = getWorkingTreeChanges(root);
+    const snapshot = await loadMemorySnapshotAsync(root);
+    const currentHeadSha = await getHeadCommitAsync(root);
+    const dirtyFiles = await getWorkingTreeChangesAsync(root);
     const memoryRefreshedAt = snapshot?.syncedAt ?? null;
     const refreshedAtMs = memoryRefreshedAt ? Date.parse(memoryRefreshedAt) : null;
-    const dirtyFilesNewerThanMemory = refreshedAtMs === null
-        ? dirtyFiles.length
-        : dirtyFiles.filter(file => {
+    let dirtyFilesNewerThanMemory = dirtyFiles.length;
+    if (refreshedAtMs !== null) {
+        const dirtyFileChecks = await Promise.all(dirtyFiles.map(async file => {
             try {
-                return fs.statSync(path.join(root, file.path)).mtimeMs > refreshedAtMs;
+                const dirtyFile = Bun.file(path.join(root, file.path));
+                if (!(await dirtyFile.exists())) return true;
+                return dirtyFile.lastModified > refreshedAtMs;
             } catch {
                 return true;
             }
-        }).length;
+        }));
+        dirtyFilesNewerThanMemory = dirtyFileChecks.filter(Boolean).length;
+    }
 
     const reasons: string[] = [];
     if (!snapshot) {
@@ -1103,11 +1180,11 @@ export function getProjectMemoryFreshness(projectRoot: string): ProjectMemoryFre
     };
 }
 
-export function getWhyChanged(
+export async function getWhyChangedAsync(
     projectRoot: string,
     opts: { target: string; mode?: 'auto' | 'symbol' | 'file'; topic?: string; limit?: number }
-): WhyChangedResult | null {
-    const snapshot = loadMemorySnapshot(path.resolve(projectRoot));
+): Promise<WhyChangedResult | null> {
+    const snapshot = await loadMemorySnapshotAsync(path.resolve(projectRoot));
     if (!snapshot) return null;
 
     const mode = opts.mode ?? 'auto';
@@ -1118,7 +1195,6 @@ export function getWhyChanged(
 
     const allMatches = snapshot.entries
         .filter(isChangeEntry)
-        .filter(entry => !topicFilter || entry.topics.some(topic => topic.includes(topicFilter)))
         .map(entry => {
             const matchedSymbols = mode === 'file'
                 ? []
@@ -1128,34 +1204,50 @@ export function getWhyChanged(
                 : entry.files.filter(file => matchesFileTarget(file, normalizedTarget));
 
             if (matchedSymbols.length === 0 && matchedFiles.length === 0) return null;
-            for (const topic of entry.topics) {
-                topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
-            }
+            const topicScore = changeTopicScore(entry, topicFilter);
+            const impactScore = matchedSymbols.length * 6 + matchedFiles.length * 4 + Math.min(entry.files.length, 20) * 0.1;
             return {
                 entry,
                 matchedSymbols,
                 matchedFiles,
-            } satisfies WhyChangedMatch;
+                score: topicScore + impactScore + recencyBoost(entry.timestamp),
+                topicScore,
+            } satisfies WhyChangedRankedMatch;
         })
-        .filter((match): match is WhyChangedMatch => match !== null);
+        .filter((match): match is WhyChangedRankedMatch => match !== null);
+
+    const hasTopicMatches = !topicFilter || allMatches.some(match => match.topicScore > 0);
+    const filteredMatches = allMatches
+        .filter(match => hasTopicMatches ? match.topicScore > 0 || !topicFilter : true)
+        .sort((left, right) => right.score - left.score);
+
+    for (const match of filteredMatches) {
+        for (const topic of match.entry.topics) {
+            topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
+        }
+    }
 
     return {
         target: opts.target,
         mode,
-        totalMatches: allMatches.length,
+        totalMatches: filteredMatches.length,
         activeTopics: [...topicCounts.entries()]
             .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
             .slice(0, 5)
             .map(([topic, count]) => ({ topic, count })),
-        matches: allMatches.slice(0, limit),
+        matches: filteredMatches.slice(0, limit).map(match => ({
+            entry: match.entry,
+            matchedSymbols: match.matchedSymbols,
+            matchedFiles: match.matchedFiles,
+        })),
     };
 }
 
-export function getBugBrief(
+export async function getBugBriefAsync(
     projectRoot: string,
     opts: { target: string; mode?: 'auto' | 'symbol' | 'file'; topic?: string; limit?: number }
-): BugBriefResult | null {
-    const snapshot = loadMemorySnapshot(path.resolve(projectRoot));
+): Promise<BugBriefResult | null> {
+    const snapshot = await loadMemorySnapshotAsync(path.resolve(projectRoot));
     if (!snapshot) return null;
 
     const mode = opts.mode ?? 'auto';
@@ -1166,7 +1258,6 @@ export function getBugBrief(
 
     const allMatches = snapshot.entries
         .filter(isBugEntry)
-        .filter(entry => !topicFilter || entry.topics.some(topic => topic.includes(topicFilter)))
         .map(entry => {
             const matchedSymbols = mode === 'file'
                 ? []
@@ -1176,26 +1267,42 @@ export function getBugBrief(
                 : entry.files.filter(file => matchesFileTarget(file, normalizedTarget));
 
             if (matchedSymbols.length === 0 && matchedFiles.length === 0) return null;
-            for (const topic of entry.topics) {
-                topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
-            }
+            const topicScore = bugTopicScore(entry, topicFilter);
+            const impactScore = matchedSymbols.length * 6 + matchedFiles.length * 4 + entry.evidenceScore;
             return {
                 entry,
                 matchedSymbols,
                 matchedFiles,
-            } satisfies BugBriefMatch;
+                score: topicScore + impactScore + recencyBoost(entry.timestamp),
+                topicScore,
+            } satisfies BugBriefRankedMatch;
         })
-        .filter((match): match is BugBriefMatch => match !== null);
+        .filter((match): match is BugBriefRankedMatch => match !== null);
+
+    const hasTopicMatches = !topicFilter || allMatches.some(match => match.topicScore > 0);
+    const filteredMatches = allMatches
+        .filter(match => hasTopicMatches ? match.topicScore > 0 || !topicFilter : true)
+        .sort((left, right) => right.score - left.score);
+
+    for (const match of filteredMatches) {
+        for (const topic of match.entry.topics) {
+            topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
+        }
+    }
 
     return {
         target: opts.target,
         mode,
-        totalMatches: allMatches.length,
+        totalMatches: filteredMatches.length,
         activeTopics: [...topicCounts.entries()]
             .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
             .slice(0, 5)
             .map(([topic, count]) => ({ topic, count })),
-        matches: allMatches.slice(0, limit),
+        matches: filteredMatches.slice(0, limit).map(match => ({
+            entry: match.entry,
+            matchedSymbols: match.matchedSymbols,
+            matchedFiles: match.matchedFiles,
+        })),
     };
 }
 
@@ -1270,8 +1377,8 @@ export function renderBugBrief(result: BugBriefResult): string {
     return sections.join('\n\n');
 }
 
-export function getFeatureMap(projectRoot: string): ProjectFeatureMapSnapshot | null {
-    const snapshot = loadMemorySnapshot(path.resolve(projectRoot));
+export async function getFeatureMapAsync(projectRoot: string): Promise<ProjectFeatureMapSnapshot | null> {
+    const snapshot = await loadMemorySnapshotAsync(path.resolve(projectRoot));
     if (!snapshot) return null;
 
     const documentedFeatures = snapshot.entries

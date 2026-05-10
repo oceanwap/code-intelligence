@@ -1,7 +1,6 @@
-import * as fs from 'fs';
 import * as path from 'path';
-import { getDataDir, getLineCommitHistory, type GitLineRange } from './git.js';
-import { loadManifest } from './indexer.js';
+import { getDataDir, getLineCommitHistoryAsync, type GitLineRange } from './git.js';
+import { loadManifestAsync } from './indexer.js';
 
 export interface SliceHistoryMatch {
   sha: string;
@@ -22,24 +21,43 @@ export interface RetrievedSliceFreshness {
   reasons: string[];
 }
 
-export function getRetrievedSliceFreshness(
+export async function getRetrievedSliceFreshnessAsync(
   projectRoot: string,
   file: string,
   lineStart: number | null | undefined,
   lineEnd: number | null | undefined
-): RetrievedSliceFreshness {
+): Promise<RetrievedSliceFreshness> {
   const root = path.resolve(projectRoot);
   const dataDir = getDataDir(root);
   const manifestFile = path.join(dataDir, 'manifest.json');
-  const manifest = loadManifest(manifestFile);
+  const manifest = await loadManifestAsync(manifestFile);
   const absFile = path.join(root, file);
-  const currentFileMtimeMs = fs.existsSync(absFile) ? fs.statSync(absFile).mtimeMs : null;
+
+  let currentFileMtimeMs: number | null = null;
+  try {
+    if (await Bun.file(absFile).exists()) {
+      currentFileMtimeMs = Bun.file(absFile).lastModified;
+    }
+  } catch {
+    currentFileMtimeMs = null;
+  }
+
   const indexedFileMtimeMs = manifest.mtimes[file] ?? null;
-  const manifestIndexedAt = manifest.indexedAt
-    ?? (fs.existsSync(manifestFile) ? fs.statSync(manifestFile).mtime.toISOString() : null);
+
+  let manifestIndexedAt = manifest.indexedAt ?? null;
+  if (!manifestIndexedAt) {
+    try {
+      if (await Bun.file(manifestFile).exists()) {
+        manifestIndexedAt = new Date(Bun.file(manifestFile).lastModified).toISOString();
+      }
+    } catch {
+      manifestIndexedAt = null;
+    }
+  }
+
   const manifestIndexedAtMs = manifestIndexedAt ? Date.parse(manifestIndexedAt) : null;
   const latestChange = lineStart && lineEnd
-    ? findLatestSliceChange(root, file, lineStart, lineEnd)
+    ? await findLatestSliceChangeAsync(root, file, lineStart, lineEnd)
     : null;
 
   const reasons: string[] = [];
@@ -71,8 +89,8 @@ export function getRetrievedSliceFreshness(
   };
 }
 
-function findLatestSliceChange(projectRoot: string, file: string, lineStart: number, lineEnd: number): SliceHistoryMatch | null {
-  const match = getLineCommitHistory(projectRoot, file, lineStart, lineEnd)[0];
+async function findLatestSliceChangeAsync(projectRoot: string, file: string, lineStart: number, lineEnd: number): Promise<SliceHistoryMatch | null> {
+  const match = (await getLineCommitHistoryAsync(projectRoot, file, lineStart, lineEnd))[0];
   if (!match) return null;
   return {
     sha: match.sha,

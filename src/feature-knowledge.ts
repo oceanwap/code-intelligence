@@ -1,12 +1,12 @@
 import * as path from 'path';
 import { getAffectedSymbols } from './engineering-insights.js';
-import { loadGraph, type GraphData } from './graph.js';
+import { loadGraphAsync, type GraphData } from './graph.js';
 import { getDataDir } from './git.js';
 import { queryProject, type RetrievedChunk } from './indexer-run.js';
 import {
-  getFeatureMap,
-  getWhyChanged,
-  listRecentChanges,
+  getFeatureMapAsync,
+  getWhyChangedAsync,
+  listRecentChangesAsync,
   queryProjectMemory,
   renderEntrySource,
   type ChangeMemoryEntry,
@@ -31,9 +31,9 @@ export interface FeatureBrief {
   docs: Array<{ title: string; source: string; summary: string }>;
   codeAnchors: FeatureCodeAnchor[];
   recentChanges: ChangeMemoryEntry[];
-  whyChanged: ReturnType<typeof getWhyChanged>;
-  hotspots: ReturnType<typeof getRiskHotspots>;
-  impact: ReturnType<typeof getAffectedSymbols>;
+  whyChanged: Awaited<ReturnType<typeof getWhyChangedAsync>>;
+  hotspots: Awaited<ReturnType<typeof getRiskHotspots>>;
+  impact: Awaited<ReturnType<typeof getAffectedSymbols>>;
 }
 
 const STOP_WORDS = new Set([
@@ -87,7 +87,7 @@ function buildKnowledgeSupport(knowledgeHits: ProjectMemorySearchHit[]): Map<str
   return scores;
 }
 
-function buildHotspotSupport(hotspots: ReturnType<typeof getRiskHotspots>): Map<string, number> {
+function buildHotspotSupport(hotspots: Awaited<ReturnType<typeof getRiskHotspots>>): Map<string, number> {
   const scores = new Map<string, number>();
   for (const entry of hotspots?.symbols ?? []) {
     scores.set(entry.symbol, entry.fixCount * 2 + entry.changeCount + entry.score * 0.1);
@@ -163,7 +163,7 @@ export function rankFeatureAnchors(
   codeHits: RetrievedChunk[],
   opts?: {
     graph?: GraphData | null;
-    hotspots?: ReturnType<typeof getRiskHotspots>;
+    hotspots?: Awaited<ReturnType<typeof getRiskHotspots>>;
     limit?: number;
   }
 ): FeatureCodeAnchor[] {
@@ -225,7 +225,7 @@ function selectFeatureDocs(
   feature: string,
   topic: string | null,
   knowledgeHits: ProjectMemorySearchHit[],
-  featureMap: ReturnType<typeof getFeatureMap>
+  featureMap: Awaited<ReturnType<typeof getFeatureMapAsync>>
 ): Array<{ title: string; source: string; summary: string }> {
   const featureTokens = new Set(tokenize(feature));
   const docs = new Map<string, { title: string; source: string; summary: string; score: number }>();
@@ -281,8 +281,8 @@ export async function buildFeatureBrief(
   ]);
 
   const topic = chooseFeatureTopic(feature, knowledgeHits, codeHits);
-  const graph = loadGraph(path.join(getDataDir(root), 'graph.json'));
-  const hotspots = getRiskHotspots(root, {
+  const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+  const hotspots = await getRiskHotspots(root, {
     limit: 3,
     topic: topic ?? undefined,
   });
@@ -292,17 +292,17 @@ export async function buildFeatureBrief(
     limit: codeLimit,
   });
   const seedSymbols = chooseFeatureSeeds(knowledgeHits, codeAnchors, 4);
-  const featureMap = getFeatureMap(root);
+  const featureMap = await getFeatureMapAsync(root);
   const docs = selectFeatureDocs(feature, topic, knowledgeHits, featureMap);
-  const recentChanges = listRecentChanges(root, {
+  const recentChanges = await listRecentChangesAsync(root, {
     limit: 4,
     topic: topic ?? undefined,
   });
   const whyChanged = seedSymbols.length > 0
-    ? getWhyChanged(root, { target: seedSymbols[0], mode: 'symbol', topic: topic ?? undefined, limit: 3 })
+    ? await getWhyChangedAsync(root, { target: seedSymbols[0], mode: 'symbol', topic: topic ?? undefined, limit: 3 })
     : null;
   const impact = seedSymbols.length > 0
-    ? getAffectedSymbols(root, seedSymbols.slice(0, 2), { hops: 2, direction: 'both', limit: impactLimit })
+    ? await getAffectedSymbols(root, seedSymbols.slice(0, 2), { hops: 2, direction: 'both', limit: impactLimit })
     : null;
 
   return {

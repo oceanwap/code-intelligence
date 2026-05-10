@@ -1,5 +1,4 @@
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as path from 'path';
 import { walkFiles } from './indexer.js';
 
@@ -196,26 +195,27 @@ function compactSectionBody(body: string): string {
         .slice(0, MAX_STORED_DOC_BODY_CHARS);
 }
 
-export function buildDocumentEntries(projectRoot: string): DocumentMemoryEntry[] {
+export async function buildDocumentEntriesAsync(projectRoot: string): Promise<DocumentMemoryEntry[]> {
     const root = path.resolve(projectRoot);
-    const files = walkFiles(root, DOC_EXTS, DOC_NAMES);
+    const files = await walkFiles(root, DOC_EXTS, DOC_NAMES);
     const entries: DocumentMemoryEntry[] = [];
 
     for (const absPath of files) {
         if (entries.length >= MAX_TOTAL_DOC_ENTRIES) break;
 
-        let stat: fs.Stats;
+        const file = Bun.file(absPath);
         try {
-            stat = fs.statSync(absPath);
+            if (!(await file.exists())) continue;
         } catch {
             continue;
         }
 
-        if (stat.size > MAX_DOC_BYTES) continue;
+        const size = file.size;
+        if (size > MAX_DOC_BYTES) continue;
 
         let source = '';
         try {
-            source = fs.readFileSync(absPath, 'utf-8');
+            source = await file.text();
         } catch {
             continue;
         }
@@ -234,7 +234,7 @@ export function buildDocumentEntries(projectRoot: string): DocumentMemoryEntry[]
             entries.push({
                 id: `doc:${hashText(`${relPath}\n${section.title}\n${body}`)}`,
                 kind: 'document',
-                timestamp: new Date(stat.mtimeMs).toISOString(),
+                timestamp: new Date(file.lastModified).toISOString(),
                 title: section.title,
                 body: compactSectionBody(body),
                 summary: summarizeSection(section.title, body, docType),
@@ -246,7 +246,7 @@ export function buildDocumentEntries(projectRoot: string): DocumentMemoryEntry[]
                 path: relPath,
                 docType,
                 section: section.title,
-                sourceMtimeMs: stat.mtimeMs,
+                sourceMtimeMs: file.lastModified,
             });
         }
     }

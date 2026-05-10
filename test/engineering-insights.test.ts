@@ -131,11 +131,11 @@ function writeFixtures(dir: string): void {
   );
 }
 
-test('getAffectedSymbols ranks callers, dependencies, and implementations around a seed', t => {
+test('getAffectedSymbols ranks callers, dependencies, and implementations around a seed', async t => {
   const dir = makeTempDir(t);
   writeFixtures(dir);
 
-  const result = getAffectedSymbols(dir, ['Base.run'], { hops: 2, direction: 'both', limit: 10 });
+  const result = await getAffectedSymbols(dir, ['Base.run'], { hops: 2, direction: 'both', limit: 10 });
   assert.ok(result);
   assert.equal(result.missingSeeds.length, 0);
   assert.ok(result.totalDiscovered >= 3);
@@ -151,11 +151,11 @@ test('getAffectedSymbols ranks callers, dependencies, and implementations around
   assert.equal(bySymbol.get('Concrete.run')?.fixCount, 0);
 });
 
-test('getRiskHotspots ranks unstable, connected symbols and files', t => {
+test('getRiskHotspots ranks unstable, connected symbols and files', async t => {
   const dir = makeTempDir(t);
   writeFixtures(dir);
 
-  const result = getRiskHotspots(dir, 5);
+  const result = await getRiskHotspots(dir, 5);
   assert.ok(result);
 
   assert.equal(result.symbols[0]?.symbol, 'Base.run');
@@ -169,11 +169,11 @@ test('getRiskHotspots ranks unstable, connected symbols and files', t => {
   assert.ok(result.files.some(entry => entry.file === 'src/runner.ts'));
 });
 
-test('getRiskHotspots filters history by topic before ranking', t => {
+test('getRiskHotspots filters history by topic before ranking', async t => {
   const dir = makeTempDir(t);
   writeFixtures(dir);
 
-  const result = getRiskHotspots(dir, { limit: 5, topic: 'contract' });
+  const result = await getRiskHotspots(dir, { limit: 5, topic: 'contract' });
   assert.ok(result);
 
   assert.deepEqual(result.symbols.map(entry => entry.symbol), ['Base.run']);

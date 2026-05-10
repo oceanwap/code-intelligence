@@ -3,7 +3,6 @@
  * Extracts functions, classes, and methods as CodeChunk entries.
  */
 import * as path from 'path';
-import * as fs from 'fs';
 import { createRequire } from 'module';
 import type { CodeChunk } from './indexer.js';
 import { chunkId } from './indexer.js';
@@ -81,15 +80,19 @@ function collectImports(children: Node[]): string[] {
   return imports;
 }
 
-export function indexPhpFiles(rootDir: string): CodeChunk[] {
-  const files = walkFiles(rootDir, ['.php']);
+export async function indexPhpFilesAsync(rootDir: string, options?: { includeFiles?: Set<string> }): Promise<CodeChunk[]> {
+  const includeFiles = options?.includeFiles;
+  const files = await walkFiles(rootDir, ['.php']);
   const chunks: CodeChunk[] = [];
 
   for (const absPath of files) {
     const relPath = path.relative(rootDir, absPath);
+    if (includeFiles && !includeFiles.has(relPath)) continue;
     let src: string;
     try {
-      src = fs.readFileSync(absPath, 'utf-8');
+      const file = Bun.file(absPath);
+      if (!(await file.exists())) continue;
+      src = await file.text();
     } catch {
       continue;
     }
