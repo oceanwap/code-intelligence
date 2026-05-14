@@ -16,10 +16,12 @@ import { getDataDir } from './git.js';
 import { rerankByAttentionAsync } from './cognition/attention/engine.js';
 
 // ── Score thresholds ──────────────────────────────────────────────────────────
-// Calibrated so that genuinely similar code surfaces above 0.72 while
+// Calibrated so that genuinely similar code surfaces above 0.68 while
 // tangentially related utilities stay below it.
-const THRESHOLD_DUPLICATE = 0.82;
-const THRESHOLD_PARTIAL   = 0.68;
+// Exported so callers (e.g. agent-ops.ts) can reuse the same values without
+// duplicating the constants.
+export const THRESHOLD_DUPLICATE = 0.82;
+export const THRESHOLD_PARTIAL   = 0.68;
 
 export type ExistingMatchTier = 'LIKELY_DUPLICATE' | 'PARTIAL_MATCH';
 export type FindExistingVerdict = 'MATCH_FOUND' | 'PARTIAL_MATCH' | 'SAFE_TO_CREATE';

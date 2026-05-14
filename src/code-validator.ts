@@ -16,6 +16,8 @@ import { findExisting, type ExistingMatch } from './find-existing.js';
 import { loadArchitectureAsync } from './cognition/architecture/storage.js';
 import { listConstraintViolationsAsync } from './cognition/constraints/engine.js';
 import { moduleFromFile } from './utils/module-path.js';
+import { loadGraphAsync } from './graph.js';
+import { getDataDir } from './git.js';
 
 export type ValidationSeverity = 'PASS' | 'WARN' | 'BLOCK';
 
@@ -160,11 +162,12 @@ export async function validateGeneratedCode(
   const generatedImports = extractImports(code);
   const targetModule     = targetFile ? moduleFromFile(targetFile) : null;
 
-  // Run all three checks concurrently.
+  // Run all checks concurrently — graph loaded once, reused for constraint + naming.
   const [
     duplicateResults,
     architecture,
     violations,
+    graph,
   ] = await Promise.all([
     // Check each extracted symbol for duplicates.
     Promise.all(
@@ -174,6 +177,7 @@ export async function validateGeneratedCode(
     ),
     loadArchitectureAsync(root),
     listConstraintViolationsAsync(root, { limit: 50 }),
+    loadGraphAsync(path.join(getDataDir(root), 'graph.json')),
   ]);
 
   // 1. Duplicate flags.
@@ -210,14 +214,15 @@ export async function validateGeneratedCode(
     }
   }
 
-  // 3. Naming flags — compare generated names against module's existing symbols.
+  // 3. Naming flags — compare generated names against all existing symbols in the target module.
   const namingFlags: NamingFlag[] = [];
-  if (targetModule && architecture) {
-    // Collect existing symbol names in the target module from architecture data.
-    const moduleData = architecture.modules.find(m => m.name === targetModule);
-    if (moduleData) {
-      // We use the module name tokens as a proxy; real symbols would come from the graph.
-      const existingSymbols: string[] = []; // populated below if graph is available
+  if (targetModule && graph) {
+    // Collect every symbol that belongs to the target module from the call graph.
+    const existingSymbols = Object.entries(graph.symbolFile)
+      .filter(([, file]) => moduleFromFile(file) === targetModule)
+      .map(([symbol]) => symbol);
+
+    if (existingSymbols.length > 0) {
       namingFlags.push(...checkNaming(generatedSymbols, existingSymbols));
     }
   }

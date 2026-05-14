@@ -16,7 +16,6 @@ import { loadArchitectureAsync } from './cognition/architecture/storage.js';
 import { loadAttentionAsync, rerankByAttentionAsync } from './cognition/attention/engine.js';
 import { listConstraintViolationsAsync } from './cognition/constraints/engine.js';
 import { moduleFromFile } from './utils/module-path.js';
-import { getDataDir } from './git.js';
 
 export type PlacementRisk = 'LOW' | 'MEDIUM' | 'HIGH';
 
@@ -54,14 +53,15 @@ function placementScore(
   instability: number,
   coupling: number,
   violations: number,
+  attentionBonus: number,
 ): number {
-  // Weights as designed in the plan:
-  // semantic 40%, stability 30%, coupling 20%, constraint penalty 10%
-  const stabilityBonus = (1 - instability) * 0.30;
-  const couplingBonus  = (1 - Math.min(coupling, 1)) * 0.20;
-  const constraintPenalty = Math.min(violations * 0.10, 0.20);
+  // Weights: semantic 40%, stability 27%, coupling 18%, attention 10%, constraint penalty (cap 15%)
+  const stabilityBonus    = (1 - instability) * 0.27;
+  const couplingBonus     = (1 - Math.min(coupling, 1)) * 0.18;
+  const attentionContrib  = attentionBonus * 0.10;
+  const constraintPenalty = Math.min(violations * 0.10, 0.15);
   return Math.max(0, Math.min(1,
-    semanticWeight * 0.40 + stabilityBonus + couplingBonus - constraintPenalty,
+    semanticWeight * 0.40 + stabilityBonus + couplingBonus + attentionContrib - constraintPenalty,
   ));
 }
 
@@ -123,6 +123,13 @@ export async function whereShouldThisLive(
   const instabilityMap = new Map(architecture?.modules.map(m => [m.name, architecture.instability[m.name] ?? 0]) ?? []);
   const couplingMap    = new Map(architecture?.modules.map(m => [m.name, architecture.coupling[m.name]    ?? 0]) ?? []);
 
+  // Attention score map: CRITICAL = 1.0, HIGH = 0.75, MEDIUM = 0.5, DORMANT = 0.
+  // Modules with high attention are actively maintained — better homes for new code.
+  const attentionTierScore: Record<string, number> = { CRITICAL: 1.0, HIGH: 0.75, MEDIUM: 0.5, DORMANT: 0.0 };
+  const attentionMap = new Map(
+    (attention?.modules ?? []).map(m => [m.module, attentionTierScore[m.tier] ?? 0]),
+  );
+
   // Pre-build: which violation rules involve each module?
   const violationsByModule = new Map<string, string[]>();
   for (const v of violations) {
@@ -140,12 +147,13 @@ export async function whereShouldThisLive(
   // 4. Build candidates.
   const candidates: ModulePlacementCandidate[] = [];
   for (const [mod, weight] of moduleWeights.entries()) {
-    const semanticWeight = maxScore > 0 ? weight.scoreSum / maxScore : 0;
-    const instability    = instabilityMap.get(mod) ?? 0.5;
-    const coupling       = couplingMap.get(mod) ?? 0.5;
-    const warnings       = violationsByModule.get(mod.split('/')[0] ?? mod) ?? [];
+    const semanticWeight  = maxScore > 0 ? weight.scoreSum / maxScore : 0;
+    const instability     = instabilityMap.get(mod) ?? 0.5;
+    const coupling        = couplingMap.get(mod) ?? 0.5;
+    const attentionBonus  = attentionMap.get(mod) ?? 0;
+    const warnings        = violationsByModule.get(mod.split('/')[0] ?? mod) ?? [];
 
-    const score = placementScore(semanticWeight, instability, coupling, warnings.length);
+    const score = placementScore(semanticWeight, instability, coupling, warnings.length, attentionBonus);
     const risk  = placementRisk(instability, warnings);
     const candidate: ModulePlacementCandidate = {
       module: mod,

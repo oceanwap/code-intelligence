@@ -13,10 +13,11 @@
  */
 
 import * as path from 'path';
+import { QdrantClient } from '@qdrant/js-client-rest';
 import { loadGraphAsync } from './graph.js';
 import { getDataDir } from './git.js';
 import { moduleFromFile } from './utils/module-path.js';
-import { queryProject } from './indexer-run.js';
+import { collectionNameAsync } from './embedder.js';
 
 export interface ModuleConventions {
   module: string;
@@ -176,13 +177,33 @@ export async function getModuleConventions(
 
   if (moduleSymbols.length === 0) return null;
 
-  // 2. Fetch representative code snippets via semantic search.
-  //    Use the module name itself as the query to get its most representative chunks.
-  const searchResults = await queryProject(root, moduleName, qdrantUrl);
-  const moduleSnippets = searchResults
-    .filter(r => moduleFromFile(r.file) === moduleName)
-    .slice(0, 12)
-    .map(r => r.code ?? '');
+  // 2. Fetch code snippets by scrolling Qdrant directly, filtered by file path.
+  //    This is more accurate than queryProject because it covers ALL chunks in
+  //    the module, not just the semantically top-ranked ones — essential for
+  //    measuring structural patterns like naming and error handling uniformly.
+  let moduleSnippets: string[] = [];
+  try {
+    const qdrant = new QdrantClient({ url: qdrantUrl });
+    const collection = await collectionNameAsync(root);
+    const fileList = [...moduleFiles].slice(0, 20); // cap to avoid huge scrolls
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { points } = await qdrant.scroll(collection, {
+      filter: {
+        should: fileList.map(f => ({ key: 'file', match: { value: f } })),
+      } as any,
+      with_payload: true,
+      with_vector: false,
+      limit: 60,
+    });
+
+    moduleSnippets = points
+      .map(p => (p.payload?.['code'] as string | undefined) ?? '')
+      .filter(Boolean)
+      .slice(0, 40);
+  } catch {
+    // Qdrant unavailable — pattern analysis falls back to symbol names only.
+  }
 
   // 3. Analyse patterns.
   const prefixes      = topPrefixes(moduleSymbols);

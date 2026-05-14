@@ -24,8 +24,10 @@ async function readSnapshotHeader(filePath: string): Promise<MinimalSnapshot | n
     const file = Bun.file(filePath);
     if (!(await file.exists())) return null;
     const raw = await file.text();
-    // Only parse the first 512 chars — we only need the header fields.
-    const excerpt = raw.slice(0, 512);
+    // Only inspect the first 1024 chars — we only need the header fields.
+    // Using 1024 instead of 512 to handle snapshots where generatedAt is
+    // preceded by other top-level keys (e.g. large modules/dependencies arrays).
+    const excerpt = raw.slice(0, 1024);
     const generatedAtMatch = excerpt.match(/"generatedAt"\s*:\s*"([^"]+)"/);
     const headShaMatch = excerpt.match(/"indexedHeadSha"\s*:\s*"([^"]+)"/);
     return {
@@ -63,11 +65,16 @@ export async function shouldRefresh(
 
   // HEAD comparison — if no new commits, the snapshot is still valid even if
   // it is older than maxAgeMs (e.g. developer working without committing).
+  //
+  // Note: most cognition snapshots (architecture, attention, evolution, etc.)
+  // do not store indexedHeadSha in their JSON, so this branch is currently
+  // dormant for those files. It is active for project-intent snapshots and
+  // will become more useful as other snapshots adopt HEAD tracking.
   if (header.indexedHeadSha) {
     try {
       const currentHead = await getHeadCommitAsync(projectRoot);
-      if (currentHead && currentHead.startsWith(header.indexedHeadSha.slice(0, 8))) return false;
-      if (currentHead === header.indexedHeadSha) return false;
+      // Compare the first 8 chars of both SHAs — enough to confirm same commit.
+      if (currentHead && currentHead.slice(0, 8) === header.indexedHeadSha.slice(0, 8)) return false;
     } catch {
       // If git is unavailable, fall through to refresh.
     }

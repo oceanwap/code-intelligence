@@ -20,6 +20,7 @@ import { loadGraphAsync } from './graph.js';
 import { getDataDir } from './git.js';
 import { moduleFromFile } from './utils/module-path.js';
 import { shouldRefresh } from './cognition/freshness-gate.js';
+import { THRESHOLD_DUPLICATE, THRESHOLD_PARTIAL, ExistingMatch, ExistingMatchTier } from './find-existing.js';
 
 // Max ages for each cognition snapshot before a refresh is triggered.
 const FRESHNESS_MS = {
@@ -171,15 +172,6 @@ export async function buildPreflightChanges(projectRoot: string, qdrantUrl = 'ht
   };
 }
 
-export interface ExistingHandlerEntry {
-  symbol: string;
-  file: string;
-  similarityScore: number;
-  /** Caller count from the call graph — higher means more widely used. */
-  usageCount: number;
-  verdict: 'LIKELY_DUPLICATE' | 'PARTIAL_MATCH';
-}
-
 export interface AssembledTaskContext {
   task: string;
   generatedAt: string;
@@ -193,12 +185,12 @@ export interface AssembledTaskContext {
    * Code that may ALREADY handle what this task describes.
    * Agents must review these before writing new code to avoid duplication.
    */
-  existingHandlers: ExistingHandlerEntry[];
+  existingHandlers: ExistingMatch[];
 }
 
-// Score thresholds matching find-existing.ts
-const HANDLER_DUPLICATE_THRESHOLD = 0.82;
-const HANDLER_PARTIAL_THRESHOLD   = 0.68;
+// Reuse the canonical thresholds from find-existing.ts.
+const HANDLER_DUPLICATE_THRESHOLD = THRESHOLD_DUPLICATE;
+const HANDLER_PARTIAL_THRESHOLD   = THRESHOLD_PARTIAL;
 
 export async function assembleTaskContext(
   projectRoot: string,
@@ -236,18 +228,26 @@ export async function assembleTaskContext(
     .map(({ module, tier, score }) => ({ module, tier, score: Number(score.toFixed(3)) }));
 
   // Classify high-similarity semantic results as existing handlers.
-  const existingHandlers: ExistingHandlerEntry[] = [];
+  // Produces ExistingMatch objects (canonical type from find-existing.ts) so the
+  // caller can pass them directly to renderFindExisting or handle uniformly.
+  const existingHandlers: ExistingMatch[] = [];
   for (const item of semantic) {
     if (item.score < HANDLER_PARTIAL_THRESHOLD) continue;
-    const verdict: ExistingHandlerEntry['verdict'] =
+    const tier: ExistingMatchTier =
       item.score >= HANDLER_DUPLICATE_THRESHOLD ? 'LIKELY_DUPLICATE' : 'PARTIAL_MATCH';
     const usageCount = graph ? (graph.callers[item.symbol]?.length ?? 0) : 0;
+    const rec = tier === 'LIKELY_DUPLICATE'
+      ? usageCount > 3
+        ? `Extend or reuse \`${item.symbol}\` (${item.file}) — it is used in ${usageCount} places and covers this concern closely.`
+        : `Consider reusing \`${item.symbol}\` (${item.file}) before creating a new implementation.`
+      : `\`${item.symbol}\` (${item.file}) partially overlaps — review it first to avoid duplicating logic.`;
     existingHandlers.push({
       symbol: item.symbol,
       file: item.file,
       similarityScore: Number(item.score.toFixed(3)),
       usageCount,
-      verdict,
+      tier,
+      recommendation: rec,
     });
     if (existingHandlers.length >= limit) break;
   }
