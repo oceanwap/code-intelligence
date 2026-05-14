@@ -4,6 +4,7 @@ import { type BugMemoryEntry, type ChangeMemoryEntry, listRecentBugsAsync, listR
 import { loadArchitectureAsync, refreshArchitectureAsync } from '../architecture/storage.js';
 import { topUnstableModules } from '../architecture/analyzer.js';
 import { type ReflectionEntry, type RegressionRiskReport } from './types.js';
+import { moduleFromFile } from '../../utils/module-path.js';
 
 interface ReflectionStore {
   updatedAt: string;
@@ -29,15 +30,6 @@ async function loadStoreAsync(projectRoot: string): Promise<ReflectionStore> {
 
 async function saveStoreAsync(projectRoot: string, store: ReflectionStore): Promise<void> {
   await Bun.write(reflectionFile(projectRoot), JSON.stringify(store, null, 2));
-}
-
-function moduleFromFile(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, '/');
-  const parts = normalized.split('/').filter(Boolean);
-  if (parts.length === 0) return '<root>';
-  if (parts[0] === 'src') return parts.length >= 2 ? `src/${parts[1]}` : 'src';
-  if (parts[0] === 'test') return parts.length >= 2 ? `test/${parts[1]}` : 'test';
-  return parts[0];
 }
 
 function overlapScore(left: string[], right: string[]): number {

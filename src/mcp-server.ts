@@ -99,6 +99,11 @@ import {
 } from './agent-ops.js';
 import { buildGitSemanticChangeGraph } from './git-change-graph.js';
 import { buildProjectIntentSnapshot, renderProjectIntentSnapshot } from './project-intent.js';
+import { findExisting, renderFindExisting } from './find-existing.js';
+import { whereShouldThisLive, renderPlacementOracle } from './placement-oracle.js';
+import { validateIntent, renderIntentValidation } from './intent-validator.js';
+import { validateGeneratedCode, renderCodeValidation } from './code-validator.js';
+import { getModuleConventions, renderModuleConventions } from './module-conventions.js';
 
 const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositories, indexes and project memory are branch-scoped, so check status or re-index after switching branches.';
 const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
@@ -2423,6 +2428,96 @@ function createMcpServer(): McpServer {
       const output = await Promise.all(points.map(p => renderIndexedSymbol(root, graph, p.payload!['symbol'] as string, p)));
 
       return { content: [{ type: 'text', text: output.join('\n\n---\n\n') }] };
+    }
+  );
+
+  // --- find_existing ---
+  server.registerTool(
+    'find_existing',
+    {
+      description: 'CALL THIS BEFORE WRITING ANY NEW CODE. Searches the indexed codebase for symbols that already implement what you are about to create. Returns a MATCH_FOUND / PARTIAL_MATCH / SAFE_TO_CREATE verdict so you know whether to extend existing code or create something new. Prevents duplicate implementations. Required first step in any code-generation workflow.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        description: z.string().describe('Plain-language description of what you are about to implement, e.g. "a function that validates email addresses" or "an HTTP retry wrapper with exponential backoff".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+        limit: z.number().optional().describe('Maximum number of matches to return (default: 6).'),
+      },
+    },
+    async ({ projectRoot, description, qdrantUrl = 'http://localhost:6333', limit = 6 }) => {
+      const result = await findExisting(path.resolve(projectRoot), description, qdrantUrl, limit);
+      return { content: [{ type: 'text', text: renderFindExisting(result) }] };
+    }
+  );
+
+  // --- where_should_this_live ---
+  server.registerTool(
+    'where_should_this_live',
+    {
+      description: 'Recommends the best module(s) for placing new code. Call this after find_existing returns SAFE_TO_CREATE and before writing the new code. Scores candidate modules by semantic relatedness, architectural instability, coupling, and active constraint rules. Prevents architectural drift caused by placing code in the wrong layer or module.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        description: z.string().describe('Plain-language description of the new capability to add, e.g. "rate limiting middleware for API routes" or "a service that computes churn scores for modules".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+        topN: z.number().optional().describe('Number of module recommendations to return (default: 3).'),
+      },
+    },
+    async ({ projectRoot, description, qdrantUrl = 'http://localhost:6333', topN = 3 }) => {
+      const result = await whereShouldThisLive(path.resolve(projectRoot), description, qdrantUrl, topN);
+      return { content: [{ type: 'text', text: renderPlacementOracle(result) }] };
+    }
+  );
+
+  // --- validate_intent ---
+  server.registerTool(
+    'validate_intent',
+    {
+      description: 'Checks whether a proposed change aligns with the documented project intent, active git topics, and feature map. Returns a HIGH / MEDIUM / LOW alignment verdict and a plain-language explanation. Call before implementing any significant new capability to catch scope creep or drift from the project\'s core domain before it starts.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        description: z.string().describe('Plain-language description of the proposed change or feature, e.g. "add a newsletter subscription system" or "add rate limiting to the auth endpoints".'),
+      },
+    },
+    async ({ projectRoot, description }) => {
+      const result = await validateIntent(path.resolve(projectRoot), description);
+      return { content: [{ type: 'text', text: renderIntentValidation(result) }] };
+    }
+  );
+
+  // --- validate_generated_code ---
+  server.registerTool(
+    'validate_generated_code',
+    {
+      description: 'Post-generation gate: validates generated code before committing. Checks for (1) likely duplicate symbols vs the indexed codebase, (2) import statements that would trigger architectural constraint violations, and (3) naming inconsistencies against the target module\'s conventions. Returns PASS / WARN / BLOCK verdict. Call after generating code, before writing it to disk.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        code: z.string().describe('The generated code string to validate.'),
+        targetFile: z.string().optional().describe('Intended file path (relative to project root) where the code will be written. Used for module-aware constraint and naming checks.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, code, targetFile, qdrantUrl = 'http://localhost:6333' }) => {
+      const result = await validateGeneratedCode(path.resolve(projectRoot), code, targetFile, qdrantUrl);
+      return { content: [{ type: 'text', text: renderCodeValidation(result) }] };
+    }
+  );
+
+  // --- module_conventions ---
+  server.registerTool(
+    'module_conventions',
+    {
+      description: 'Returns a per-module style guide extracted from the indexed codebase: dominant function-name prefixes, async conventions, error-handling style, and export patterns. Call before writing new code for an existing module so the new code follows established conventions rather than introducing inconsistent patterns.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        module: z.string().describe('Module name as it appears in the architecture (e.g. "src/auth", "src/cognition", "packages/admin"). Use get_overview or project_status to find module names.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, module: moduleName, qdrantUrl = 'http://localhost:6333' }) => {
+      const conventions = await getModuleConventions(path.resolve(projectRoot), moduleName, qdrantUrl);
+      if (!conventions) {
+        return { content: [{ type: 'text', text: `No indexed symbols found for module "${moduleName}". Check the module name with get_overview or project_status.` }] };
+      }
+      return { content: [{ type: 'text', text: renderModuleConventions(conventions) }] };
     }
   );
 

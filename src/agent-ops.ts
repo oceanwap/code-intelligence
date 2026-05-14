@@ -18,20 +18,23 @@ import { validateArchitectureAsync, listConstraintViolationsAsync } from './cogn
 import { regressionRiskAsync } from './cognition/reflection/engine.js';
 import { loadGraphAsync } from './graph.js';
 import { getDataDir } from './git.js';
+import { moduleFromFile } from './utils/module-path.js';
+import { shouldRefresh } from './cognition/freshness-gate.js';
+
+// Max ages for each cognition snapshot before a refresh is triggered.
+const FRESHNESS_MS = {
+  structure:    5 * 60 * 1_000,   //  5 min
+  architecture: 5 * 60 * 1_000,   //  5 min
+  attention:   10 * 60 * 1_000,   // 10 min
+  failures:    15 * 60 * 1_000,   // 15 min
+  evolution:   10 * 60 * 1_000,   // 10 min
+  governance:  10 * 60 * 1_000,   // 10 min
+};
 
 const TASK_STOP_WORDS = new Set([
   'the', 'and', 'with', 'from', 'that', 'this', 'what', 'when', 'where', 'why',
   'how', 'for', 'into', 'about', 'over', 'under', 'your', 'their', 'please', 'fix',
 ]);
-
-function moduleFromFile(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, '/');
-  const parts = normalized.split('/').filter(Boolean);
-  if (parts.length === 0) return '<root>';
-  if (parts[0] === 'src') return parts.length >= 2 ? `src/${parts[1]}` : 'src';
-  if (parts[0] === 'test' || parts[0] === 'tests') return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : parts[0];
-  return parts[0];
-}
 
 function tokenizeTask(task: string): string[] {
   return task
@@ -55,14 +58,34 @@ function topTaskTopic(task: string): string | undefined {
 }
 
 export async function ensureCognitionBaseline(projectRoot: string, qdrantUrl = 'http://localhost:6333'): Promise<void> {
-  await syncProjectMemory(projectRoot, qdrantUrl);
-  await refreshStructureAsync(projectRoot);
-  await refreshArchitectureAsync(projectRoot);
-  await refreshAttentionAsync(projectRoot);
-  await refreshFailureIntelligenceAsync(projectRoot);
-  await validateArchitectureAsync(projectRoot);
-  await refreshEvolutionAsync(projectRoot);
-  await refreshMemoryGovernanceAsync(projectRoot);
+  const root = path.resolve(projectRoot);
+  const dataDir = getDataDir(root);
+
+  // Always sync memory — it is fast and HEAD-aware internally.
+  await syncProjectMemory(root, qdrantUrl);
+
+  // Refresh each cognition layer only when its snapshot is stale.
+  const [needsStructure, needsArch, needsAttention, needsFailures, needsEvolution, needsGovernance] =
+    await Promise.all([
+      shouldRefresh(`${dataDir}/structure.json`,             FRESHNESS_MS.structure,    root),
+      shouldRefresh(`${dataDir}/architecture.json`,          FRESHNESS_MS.architecture, root),
+      shouldRefresh(`${dataDir}/attention.json`,             FRESHNESS_MS.attention,    root),
+      shouldRefresh(`${dataDir}/failure-intelligence.json`,  FRESHNESS_MS.failures,     root),
+      shouldRefresh(`${dataDir}/evolution.json`,             FRESHNESS_MS.evolution,    root),
+      shouldRefresh(`${dataDir}/memory-governance.json`,     FRESHNESS_MS.governance,   root),
+    ]);
+
+  await Promise.all([
+    needsStructure    ? refreshStructureAsync(root)              : Promise.resolve(),
+    needsArch         ? refreshArchitectureAsync(root)           : Promise.resolve(),
+    needsAttention    ? refreshAttentionAsync(root)              : Promise.resolve(),
+    needsFailures     ? refreshFailureIntelligenceAsync(root)    : Promise.resolve(),
+    needsEvolution    ? refreshEvolutionAsync(root)              : Promise.resolve(),
+    needsGovernance   ? refreshMemoryGovernanceAsync(root)       : Promise.resolve(),
+  ]);
+
+  // Constraint validation is cheap and always runs after architecture refresh.
+  await validateArchitectureAsync(root);
 }
 
 export interface PreflightChangeEntry {
@@ -148,6 +171,15 @@ export async function buildPreflightChanges(projectRoot: string, qdrantUrl = 'ht
   };
 }
 
+export interface ExistingHandlerEntry {
+  symbol: string;
+  file: string;
+  similarityScore: number;
+  /** Caller count from the call graph — higher means more widely used. */
+  usageCount: number;
+  verdict: 'LIKELY_DUPLICATE' | 'PARTIAL_MATCH';
+}
+
 export interface AssembledTaskContext {
   task: string;
   generatedAt: string;
@@ -157,7 +189,16 @@ export interface AssembledTaskContext {
   recentChanges: Array<{ title: string; timestamp: string; topics: string[]; files: string[] }>;
   relatedBugs: Array<{ title: string; timestamp: string; evidenceScore: number; files: string[] }>;
   memoryHits: Array<{ id: string; score: number; summary: string }>;
+  /**
+   * Code that may ALREADY handle what this task describes.
+   * Agents must review these before writing new code to avoid duplication.
+   */
+  existingHandlers: ExistingHandlerEntry[];
 }
+
+// Score thresholds matching find-existing.ts
+const HANDLER_DUPLICATE_THRESHOLD = 0.82;
+const HANDLER_PARTIAL_THRESHOLD   = 0.68;
 
 export async function assembleTaskContext(
   projectRoot: string,
@@ -165,18 +206,20 @@ export async function assembleTaskContext(
   qdrantUrl = 'http://localhost:6333',
   limit = 8
 ): Promise<AssembledTaskContext> {
-  await ensureCognitionBaseline(projectRoot, qdrantUrl);
+  const root = path.resolve(projectRoot);
+  await ensureCognitionBaseline(root, qdrantUrl);
 
   const topic = topTaskTopic(task);
-  let semantic = await queryProject(projectRoot, task, qdrantUrl);
-  semantic = await rerankByAttentionAsync(projectRoot, semantic);
+  let semantic = await queryProject(root, task, qdrantUrl);
+  semantic = await rerankByAttentionAsync(root, semantic);
 
-  const [attention, violations, changes, bugs, memoryHits] = await Promise.all([
-    loadAttentionAsync(projectRoot),
-    listConstraintViolationsAsync(projectRoot, { limit: 25 }),
-    listRecentChangesAsync(projectRoot, { limit: 30, topic }),
-    listRecentBugsAsync(projectRoot, { limit: 20, topic }),
-    queryProjectMemory(projectRoot, task, qdrantUrl, 8),
+  const [attention, violations, changes, bugs, memoryHits, graph] = await Promise.all([
+    loadAttentionAsync(root),
+    listConstraintViolationsAsync(root, { limit: 25 }),
+    listRecentChangesAsync(root, { limit: 30, topic }),
+    listRecentBugsAsync(root, { limit: 20, topic }),
+    queryProjectMemory(root, task, qdrantUrl, 8),
+    loadGraphAsync(path.join(getDataDir(root), 'graph.json')),
   ]);
 
   const taskTokens = new Set(tokenizeTask(task));
@@ -191,6 +234,23 @@ export async function assembleTaskContext(
     .sort((left, right) => (right.taskScore - left.taskScore) || (right.score - left.score))
     .slice(0, limit)
     .map(({ module, tier, score }) => ({ module, tier, score: Number(score.toFixed(3)) }));
+
+  // Classify high-similarity semantic results as existing handlers.
+  const existingHandlers: ExistingHandlerEntry[] = [];
+  for (const item of semantic) {
+    if (item.score < HANDLER_PARTIAL_THRESHOLD) continue;
+    const verdict: ExistingHandlerEntry['verdict'] =
+      item.score >= HANDLER_DUPLICATE_THRESHOLD ? 'LIKELY_DUPLICATE' : 'PARTIAL_MATCH';
+    const usageCount = graph ? (graph.callers[item.symbol]?.length ?? 0) : 0;
+    existingHandlers.push({
+      symbol: item.symbol,
+      file: item.file,
+      similarityScore: Number(item.score.toFixed(3)),
+      usageCount,
+      verdict,
+    });
+    if (existingHandlers.length >= limit) break;
+  }
 
   return {
     task,
@@ -226,6 +286,7 @@ export async function assembleTaskContext(
       score: Number(hit.score.toFixed(3)),
       summary: hit.entry.summary,
     })),
+    existingHandlers,
   };
 }
 

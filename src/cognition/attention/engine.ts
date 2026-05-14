@@ -6,6 +6,7 @@ import { loadMemoryGovernanceAsync, refreshMemoryGovernanceAsync } from '../gove
 import { loadEvolutionAsync, refreshEvolutionAsync } from '../evolution/engine.js';
 import { loadStructureAsync, refreshStructureAsync } from '../structure/engine.js';
 import { type AttentionScore, type AttentionSnapshot, type AttentionTier, type AttentionUsage, type ModuleAttention, type SymbolAttention } from './types.js';
+import { moduleFromFile } from '../../utils/module-path.js';
 
 function attentionFile(projectRoot: string): string {
   return path.join(getDataDir(projectRoot), 'attention.json');
@@ -252,18 +253,9 @@ export async function rerankByAttentionAsync(projectRoot: string, results: Retri
   const symbolScore = new Map(snapshot.symbols.map(item => [item.symbol, item.composite]));
   const moduleScore = new Map(snapshot.modules.map(item => [item.module, item.score.composite]));
 
-  function moduleFromFilePath(filePath: string): string {
-    const normalized = filePath.replace(/\\/g, '/');
-    const parts = normalized.split('/').filter(Boolean);
-    if (parts.length === 0) return '<root>';
-    if (parts[0] === 'src') return parts.length >= 2 ? `src/${parts[1]}` : 'src';
-    if (parts[0] === 'test') return parts.length >= 2 ? `test/${parts[1]}` : 'test';
-    return parts[0];
-  }
-
   return [...results]
     .map(result => {
-      const moduleName = moduleFromFilePath(result.file);
+      const moduleName = moduleFromFile(result.file);
       const attention = symbolScore.get(result.symbol) ?? moduleScore.get(moduleName) ?? 0;
       return {
         ...result,

@@ -4,18 +4,10 @@ import { type BugMemoryEntry, listRecentBugsAsync } from '../../project-memory.j
 import { loadArchitectureAsync, refreshArchitectureAsync } from '../architecture/storage.js';
 import { loadCognitionConfigAsync } from '../config.js';
 import { type FailureCluster, type FailureClusterKey, type FailureIntelligenceSnapshot, type FailureRecord } from './types.js';
+import { moduleFromFile } from '../../utils/module-path.js';
 
 function failureFile(projectRoot: string): string {
   return path.join(getDataDir(projectRoot), 'failure-intelligence.json');
-}
-
-function moduleFromFile(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, '/');
-  const parts = normalized.split('/').filter(Boolean);
-  if (parts.length === 0) return '<root>';
-  if (parts[0] === 'src') return parts.length >= 2 ? `src/${parts[1]}` : 'src';
-  if (parts[0] === 'test') return parts.length >= 2 ? `test/${parts[1]}` : 'test';
-  return parts[0];
 }
 
 function dedupe(values: string[]): string[] {

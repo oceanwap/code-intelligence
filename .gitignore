@@ -3,3 +3,4 @@ dist/
 .code-intelligence/
 *.env
 local_cache
+.repowise

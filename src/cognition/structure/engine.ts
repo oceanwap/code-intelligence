@@ -3,20 +3,10 @@ import { getDataDir } from '../../git.js';
 import { loadGraphAsync, type GraphData } from '../../graph.js';
 import { loadArchitectureAsync, refreshArchitectureAsync } from '../architecture/storage.js';
 import { type StructureCycle, type StructureDependency, type StructureModule, type StructureSnapshot } from './types.js';
+import { moduleFromFile } from '../../utils/module-path.js';
 
 function structureFile(projectRoot: string): string {
   return path.join(getDataDir(projectRoot), 'structure.json');
-}
-
-function moduleFromFile(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, '/');
-  const parts = normalized.split('/').filter(Boolean);
-  if (parts.length === 0) return '<root>';
-  if (parts[0] === 'src') return parts.length >= 2 ? `src/${parts[1]}` : 'src';
-  if (parts[0] === 'test') return parts.length >= 2 ? `test/${parts[1]}` : 'test';
-  if (parts[0] === 'docs') return 'docs';
-  if (parts[0] === 'bin') return 'bin';
-  return parts[0];
 }
 
 function inferZone(moduleName: string): string {

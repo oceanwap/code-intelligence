@@ -5,18 +5,10 @@ import { loadArchitectureAsync, refreshArchitectureAsync } from '../architecture
 import { loadCognitionConfigAsync } from '../config.js';
 import { type ArchitectureSnapshot } from '../architecture/types.js';
 import { type ArchitectureDriftRecord, type EvolutionHotspot, type EvolutionPoint, type EvolutionSnapshot, type ModuleEvolution } from './types.js';
+import { moduleFromFile } from '../../utils/module-path.js';
 
 function evolutionFile(projectRoot: string): string {
   return path.join(getDataDir(projectRoot), 'evolution.json');
-}
-
-function moduleFromFile(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, '/');
-  const parts = normalized.split('/').filter(Boolean);
-  if (parts.length === 0) return '<root>';
-  if (parts[0] === 'src') return parts.length >= 2 ? `src/${parts[1]}` : 'src';
-  if (parts[0] === 'test') return parts.length >= 2 ? `test/${parts[1]}` : 'test';
-  return parts[0];
 }
 
 function appendTrend(previous: EvolutionPoint[] | undefined, next: EvolutionPoint, maxTrendPoints: number): EvolutionPoint[] {
