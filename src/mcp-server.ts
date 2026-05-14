@@ -14,7 +14,7 @@ import {
   renderAffectedSymbols as renderAffectedSymbolsInsight,
   renderRiskHotspots as renderRiskHotspotsInsight,
 } from './engineering-insights.js';
-import { indexProject, queryProject } from './indexer-run.js';
+import { indexProject, queryProject, type IndexMode, type ProgressCallback } from './indexer-run.js';
 import { loadGraphAsync, type GraphData } from './graph.js';
 import {
   getFeatureMapAsync,
@@ -104,6 +104,225 @@ const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositori
 const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
 
 type IndexedPoint = IndexedSymbolPoint;
+
+type McpLogLevel = 'debug' | 'info' | 'warn' | 'error';
+type ProcessLogDestination = 'stdout' | 'stderr' | 'split';
+
+const PORT = process.env['PORT'] ? parseInt(process.env['PORT']) : null;
+const useHttp = PORT !== null || process.argv.includes('--http');
+const httpPort = PORT ?? 3737;
+
+function parseLogDestination(value: string | undefined): ProcessLogDestination | null {
+  switch ((value ?? '').trim().toLowerCase()) {
+    case 'stdout':
+      return 'stdout';
+    case 'stderr':
+      return 'stderr';
+    case 'split':
+      return 'split';
+    default:
+      return null;
+  }
+}
+
+const MCP_LOG_DESTINATION: ProcessLogDestination = parseLogDestination(process.env['CODE_INTEL_LOG_DESTINATION'])
+  ?? (useHttp ? 'split' : 'stderr');
+
+process.env['CODE_INTEL_LOG_DESTINATION'] = MCP_LOG_DESTINATION;
+
+const LOG_LEVEL_PRIORITY: Record<McpLogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+};
+
+const INDEX_STAGE_LABELS: Record<Parameters<ProgressCallback>[0], string> = {
+  'pre-scanning': 'Pre-scanning files',
+  parsing: 'Parsing files',
+  'building-graph': 'Building call graph',
+  'building-manifest': 'Building manifest',
+  cleaning: 'Cleaning stale data',
+  'loading-model': 'Loading embedding model',
+  embedding: 'Embedding code',
+  storing: 'Storing embeddings',
+  'syncing-memory': 'Syncing project memory',
+  'computing-cognition': 'Computing cognition layers',
+};
+
+function isTruthyEnvValue(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test(value ?? '');
+}
+
+function parseLogLevel(value: string | undefined): McpLogLevel {
+  switch ((value ?? '').trim().toLowerCase()) {
+    case 'debug':
+      return 'debug';
+    case 'warn':
+      return 'warn';
+    case 'error':
+      return 'error';
+    case 'info':
+    default:
+      return 'info';
+  }
+}
+
+const MCP_LOG_LEVEL: McpLogLevel = isTruthyEnvValue(process.env['CODE_INTEL_MCP_DEBUG'])
+  ? 'debug'
+  : parseLogLevel(process.env['CODE_INTEL_MCP_LOG_LEVEL']);
+
+function shouldLog(level: McpLogLevel): boolean {
+  return LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[MCP_LOG_LEVEL];
+}
+
+function truncateForLog(value: string, max = 180): string {
+  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function summarizeForLog(value: unknown, depth = 0): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return truncateForLog(value);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return value.toString();
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      ...(MCP_LOG_LEVEL === 'debug' && value.stack
+        ? { stack: truncateForLog(value.stack, 1200) }
+        : {}),
+    };
+  }
+  if (Array.isArray(value)) {
+    if (depth >= 2) return `[array(${value.length})]`;
+    const sample = value.slice(0, 5).map(item => summarizeForLog(item, depth + 1));
+    return value.length > 5 ? [...sample, `… +${value.length - 5} more`] : sample;
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (depth >= 2) {
+      return `{keys:${entries.slice(0, 8).map(([key]) => key).join(',')}}`;
+    }
+
+    const summary: Record<string, unknown> = {};
+    for (const [key, entryValue] of entries.slice(0, 12)) {
+      summary[key] = /token|secret|password|api[-_]?key|authorization/i.test(key)
+        ? '[redacted]'
+        : summarizeForLog(entryValue, depth + 1);
+    }
+    if (entries.length > 12) {
+      summary['__truncatedKeys'] = entries.length - 12;
+    }
+    return summary;
+  }
+  return String(value);
+}
+
+function formatLogMeta(meta: unknown): string {
+  if (meta === undefined) return '';
+  const safeMeta = summarizeForLog(meta);
+  if (typeof safeMeta === 'string') return safeMeta;
+  try {
+    return JSON.stringify(safeMeta);
+  } catch {
+    return String(safeMeta);
+  }
+}
+
+function logStreamForLevel(level: McpLogLevel): NodeJS.WriteStream {
+  if (MCP_LOG_DESTINATION === 'stdout') return process.stdout;
+  if (MCP_LOG_DESTINATION === 'stderr') return process.stderr;
+  return level === 'error' ? process.stderr : process.stdout;
+}
+
+function mcpLog(level: McpLogLevel, message: string, meta?: unknown): void {
+  if (!shouldLog(level)) return;
+  const suffix = meta === undefined ? '' : ` ${formatLogMeta(meta)}`;
+  logStreamForLevel(level).write(`[code-intel:mcp][${level}] ${new Date().toISOString()} ${message}${suffix}\n`);
+}
+
+function drawLogProgressBar(done: number, total: number): string {
+  const width = 25;
+  const pct = total === 0 ? 100 : Math.round((done / total) * 100);
+  const filled = Math.round((width * pct) / 100);
+  return `[${'█'.repeat(filled)}${'░'.repeat(width - filled)}] ${String(pct).padStart(3)}% ${done}/${total}`;
+}
+
+function summarizeToolResult(result: unknown): unknown {
+  if (!result || typeof result !== 'object') return summarizeForLog(result);
+
+  const typed = result as {
+    content?: Array<{ type?: string; text?: string }>;
+    structuredContent?: unknown;
+    isError?: boolean;
+  };
+
+  if (Array.isArray(typed.content)) {
+    const firstItem = typed.content[0];
+    return {
+      contentItems: typed.content.length,
+      firstType: firstItem?.type,
+      firstTextPreview: typeof firstItem?.text === 'string' ? truncateForLog(firstItem.text, 220) : undefined,
+      hasStructuredContent: typed.structuredContent !== undefined,
+      isError: typed.isError === true,
+    };
+  }
+
+  return summarizeForLog(result);
+}
+
+function createIndexProgressLogger(projectRoot: string, indexMode: IndexMode, fromScratch: boolean): ProgressCallback {
+  mcpLog('info', `Scanning ${projectRoot}...`);
+  if (fromScratch) {
+    mcpLog('warn', 'Full reindex mode enabled; deleting all previous index data before rebuild');
+  }
+  mcpLog('info', `Index mode: ${indexMode}`);
+
+  let lastMessage = '';
+  return (stage, done, total) => {
+    const label = INDEX_STAGE_LABELS[stage] ?? stage;
+    const message = total <= 1
+      ? `  ${label}${done === 0 ? '...' : ' complete'}`
+      : `  ${label} ${drawLogProgressBar(done, total)}`;
+
+    if (message === lastMessage) return;
+    lastMessage = message;
+    mcpLog('info', message);
+  };
+}
+
+function attachToolLogging(server: McpServer): void {
+  const originalRegisterTool = server.registerTool.bind(server);
+
+  server.registerTool = ((name: string, config: unknown, handler: (...args: unknown[]) => Promise<unknown>) => {
+    return (originalRegisterTool as (...args: unknown[]) => unknown)(
+      name,
+      config,
+      async (...handlerArgs: unknown[]) => {
+        const startedAt = performance.now();
+        mcpLog('info', `Tool started: ${name}`);
+        if (MCP_LOG_LEVEL === 'debug') {
+          mcpLog('debug', `Tool input: ${name}`, handlerArgs[0]);
+        }
+
+        try {
+          const result = await handler(...handlerArgs);
+          const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+          if (MCP_LOG_LEVEL === 'debug') {
+            mcpLog('debug', `Tool result: ${name}`, summarizeToolResult(result));
+          }
+          mcpLog('info', `Tool completed: ${name}`, { durationMs });
+          return result;
+        } catch (error) {
+          const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
+          mcpLog('error', `Tool failed: ${name}`, { durationMs, error });
+          throw error;
+        }
+      }
+    );
+  }) as typeof server.registerTool;
+}
 
 function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
   return ranges
@@ -206,6 +425,7 @@ async function enforceCognitionPipeline(projectRoot: string, qdrantUrl = 'http:/
 
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
+  attachToolLogging(server);
 
   const registerSnapshotResource = (name: string, fileName: string, description: string): void => {
     server.registerResource(
@@ -214,8 +434,10 @@ function createMcpServer(): McpServer {
       { mimeType: 'application/json', description },
       async () => {
         const root = process.cwd();
+        mcpLog('debug', `Resource requested: ${name}`, { root, fileName });
         const file = Bun.file(path.join(getDataDir(root), fileName));
         if (!(await file.exists())) {
+          mcpLog('warn', `Resource unavailable: ${name}`, { root, fileName });
           return {
             contents: [{
               uri: `code-intel://snapshot/${fileName}`,
@@ -252,7 +474,17 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, qdrantUrl = 'http://localhost:6333', fromScratch = false, indexMode = 'fast' }) => {
       const root = path.resolve(projectRoot);
-      const result = await indexProject(root, qdrantUrl, undefined, fromScratch, indexMode);
+      const result = await indexProject(root, qdrantUrl, createIndexProgressLogger(root, indexMode, fromScratch), fromScratch, indexMode);
+      mcpLog('info', 'Index project summary', {
+        root,
+        mode: result.mode,
+        discoveredChunks: result.discoveredChunks,
+        indexedChunks: result.indexedChunks,
+        filteredOutChunks: result.filteredOutChunks,
+        symbols: result.symbols,
+        files: result.files,
+        totalDurationMs: result.totalDurationMs,
+      });
       const lines = [];
       if (fromScratch) {
         lines.push('🔄 Full reindex from scratch (deleted all previous data)');
@@ -2193,14 +2425,19 @@ function createMcpServer(): McpServer {
   return server;
 }
 
-const PORT = process.env['PORT'] ? parseInt(process.env['PORT']) : null;
-const useHttp = PORT !== null || process.argv.includes('--http');
-const httpPort = PORT ?? 3737;
+mcpLog('info', 'Starting code-intelligence MCP server', {
+  mode: useHttp ? 'http' : 'stdio',
+  httpPort: useHttp ? httpPort : undefined,
+  logLevel: MCP_LOG_LEVEL,
+  logDestination: MCP_LOG_DESTINATION,
+  pid: process.pid,
+});
 
 if (useHttp) {
   // HTTP Streamable mode — persistent server VS Code connects to via URL.
   // A fresh McpServer is created per request (stateless: no session tracking).
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    mcpLog('info', 'HTTP request received', { method: req.method, url: req.url });
     if (req.url === '/mcp') {
       const body = await new Promise<Buffer>((resolve, reject) => {
         const chunks: Buffer[] = [];
@@ -2209,21 +2446,27 @@ if (useHttp) {
         req.on('error', reject);
       });
       const parsedBody = body.length > 0 ? JSON.parse(body.toString()) : undefined;
+      if (MCP_LOG_LEVEL === 'debug') {
+        mcpLog('debug', 'HTTP request body', parsedBody);
+      }
 
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       const server = createMcpServer();
       await server.connect(transport);
       await transport.handleRequest(req, res, parsedBody);
+      mcpLog('info', 'HTTP request handled', { method: req.method, url: req.url, statusCode: res.statusCode });
     } else {
+      mcpLog('warn', 'HTTP request rejected', { method: req.method, url: req.url, statusCode: 404 });
       res.writeHead(404).end();
     }
   });
 
   httpServer.listen(httpPort, () => {
-    console.log(`code-intelligence MCP server listening on http://localhost:${httpPort}/mcp`);
+    mcpLog('info', `code-intelligence MCP server listening on http://localhost:${httpPort}/mcp`);
   });
 } else {
   // Stdio mode — spawned per-session by VS Code
   const transport = new StdioServerTransport();
   await createMcpServer().connect(transport);
+  mcpLog('info', 'code-intelligence MCP server connected over stdio');
 }

@@ -25,6 +25,33 @@ const EMBED_BATCH_SIZE = (() => {
 const MAX_EMBED_TEXT_CHARS = 6000;
 const EMBED_DEBUG = process.env.CODE_INTEL_EMBED_DEBUG === '1';
 
+type ProcessLogDestination = 'stdout' | 'stderr' | 'split';
+
+function parseLogDestination(value: string | undefined): ProcessLogDestination | null {
+  switch ((value ?? '').trim().toLowerCase()) {
+    case 'stdout':
+      return 'stdout';
+    case 'stderr':
+      return 'stderr';
+    case 'split':
+      return 'split';
+    default:
+      return null;
+  }
+}
+
+function runtimeLog(message: string, level: 'info' | 'error' = 'info'): void {
+  const destination = parseLogDestination(process.env['CODE_INTEL_LOG_DESTINATION']) ?? 'stdout';
+  const stream = destination === 'stdout'
+    ? process.stdout
+    : destination === 'stderr'
+      ? process.stderr
+      : level === 'error'
+        ? process.stderr
+        : process.stdout;
+  stream.write(`${message}\n`);
+}
+
 function nowMs(): number {
   return performance.now();
 }
@@ -200,7 +227,7 @@ export async function embedAndStore(
     const info = await qdrant.getCollection(collection);
     const dim = (info.config?.params?.vectors as { size?: number } | undefined)?.size;
     if (dim !== undefined && dim !== VECTOR_SIZE) {
-      console.log(`Collection dim mismatch (${dim} → ${VECTOR_SIZE}), recreating...`);
+      runtimeLog(`Collection dim mismatch (${dim} → ${VECTOR_SIZE}), recreating...`);
       await qdrant.deleteCollection(collection);
       await clearCache(cache, cacheFile);
       await qdrant.createCollection(collection, {
@@ -267,14 +294,14 @@ export async function embedAndStore(
   mark('upsert-done');
 
   if (points.length > 0) {
-    console.log(`Upserted ${points.length} chunk(s) into "${collection}"`);
+    runtimeLog(`Upserted ${points.length} chunk(s) into "${collection}"`);
   } else {
-    console.log(`No changes — collection "${collection}" is up to date`);
+    runtimeLog(`No changes — collection "${collection}" is up to date`);
   }
 
   if (EMBED_DEBUG) {
-    console.log(`[embed-debug] runtime=bun uncached=${uncached.length}/${chunks.length} points=${points.length} batch=${EMBED_BATCH_SIZE}`);
-    console.log(`[embed-debug] timings(ms) ${Object.entries(marks).map(([k, v]) => `${k}=${v}`).join(', ')}`);
+    runtimeLog(`[embed-debug] runtime=bun uncached=${uncached.length}/${chunks.length} points=${points.length} batch=${EMBED_BATCH_SIZE}`);
+    runtimeLog(`[embed-debug] timings(ms) ${Object.entries(marks).map(([k, v]) => `${k}=${v}`).join(', ')}`);
   }
 }
 
