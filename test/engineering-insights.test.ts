@@ -161,11 +161,18 @@ test('getRiskHotspots ranks unstable, connected symbols and files', async t => {
   assert.equal(result.symbols[0]?.symbol, 'Base.run');
   assert.equal(result.symbols[0]?.changeCount, 2);
   assert.equal(result.symbols[0]?.fixCount, 1);
+  assert.equal(result.symbols[0]?.dependentsCount, 1);
+  assert.equal(result.symbols[0]?.testGap, true);
+  assert.ok(result.symbols[0]?.impactSurface.some(entry => entry.symbol === 'entry'));
+  assert.match(result.symbols[0]?.riskSummary ?? '', /Base\.run/);
   assert.ok(result.symbols.some(entry => entry.symbol === 'Concrete.run'));
 
   assert.equal(result.files[0]?.file, 'src/base.ts');
   assert.equal(result.files[0]?.changeCount, 2);
   assert.equal(result.files[0]?.fixCount, 1);
+  assert.equal(result.files[0]?.testGap, true);
+  assert.ok(result.files[0]?.impactSurface.some(entry => entry.file === 'src/runner.ts'));
+  assert.match(result.files[0]?.riskSummary ?? '', /src\/base\.ts/);
   assert.ok(result.files.some(entry => entry.file === 'src/runner.ts'));
 });
 

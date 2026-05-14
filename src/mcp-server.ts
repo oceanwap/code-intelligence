@@ -1985,15 +1985,19 @@ function createMcpServer(): McpServer {
         projectRoot: z.string().describe(PROJECT_ROOT_DESC),
         limit: z.number().int().min(1).max(25).optional().describe('Maximum number of symbol and file hotspots to return per section (default: 10).'),
         topic: z.string().optional().describe('Optional topic filter, for example "auth", "cache", or "graph".'),
+        format: z.enum(['text', 'json']).optional().describe('Output format. Use json for structured dependents, test-gap, and impact-surface metadata (default: text).'),
         qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
-    async ({ projectRoot, limit = 10, topic, qdrantUrl = 'http://localhost:6333' }) => {
+    async ({ projectRoot, limit = 10, topic, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       await syncProjectMemory(root, qdrantUrl);
       const hotspots = await getRiskHotspotsInsight(root, { limit, topic });
       if (!hotspots) {
         return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      }
+      if (format === 'json') {
+        return { content: [{ type: 'text', text: JSON.stringify(hotspots, null, 2) }] };
       }
       return { content: [{ type: 'text', text: renderRiskHotspotsInsight(hotspots) }] };
     }

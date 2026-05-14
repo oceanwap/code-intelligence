@@ -44,6 +44,24 @@ export interface GitLineCommitHistory {
   lineRanges: GitLineRange[];
 }
 
+export interface GitOwnershipContributor {
+  authorName: string;
+  authorEmail: string;
+  lineCount: number;
+  percentage: number;
+  latestAuthoredAt: string | null;
+}
+
+export interface GitFileOwnershipSummary {
+  filePath: string;
+  totalLines: number;
+  primaryOwner: GitOwnershipContributor | null;
+  recentOwner: GitOwnershipContributor | null;
+  contributorCount: number;
+  busFactor: number;
+  contributors: GitOwnershipContributor[];
+}
+
 export interface GitSymbolReferenceStats {
   count: number;
   files: string[];
@@ -601,6 +619,103 @@ export async function getLineCommitHistoryAsync(
       lineRanges: compactLineRanges(entry.lines),
     }))
     .sort((left, right) => Date.parse(right.authoredAt || '1970-01-01T00:00:00.000Z') - Date.parse(left.authoredAt || '1970-01-01T00:00:00.000Z'));
+}
+
+function lineRangeCount(ranges: GitLineRange[]): number {
+  return ranges.reduce((sum, range) => sum + (range.endLine - range.startLine + 1), 0);
+}
+
+function contributorKey(authorName: string, authorEmail: string): string {
+  return `${authorEmail.trim().toLowerCase()}::${authorName.trim().toLowerCase()}`;
+}
+
+function computeBusFactor(contributors: GitOwnershipContributor[], threshold = 0.75): number {
+  if (contributors.length === 0) return 0;
+  let covered = 0;
+  for (let index = 0; index < contributors.length; index += 1) {
+    covered += contributors[index]?.percentage ?? 0;
+    if (covered >= threshold) return index + 1;
+  }
+  return contributors.length;
+}
+
+export async function getFileOwnershipSummaryAsync(projectRoot: string, filePath: string): Promise<GitFileOwnershipSummary | null> {
+  const gitRoot = await findGitRootAsync(projectRoot);
+  if (!gitRoot) return null;
+
+  const absPath = path.join(gitRoot, filePath);
+  let totalLines = 0;
+  try {
+    const source = await Bun.file(absPath).text();
+    totalLines = source.length === 0 ? 0 : source.split(/\r?\n/).length;
+  } catch {
+    return null;
+  }
+
+  if (totalLines === 0) {
+    return {
+      filePath,
+      totalLines: 0,
+      primaryOwner: null,
+      recentOwner: null,
+      contributorCount: 0,
+      busFactor: 0,
+      contributors: [],
+    };
+  }
+
+  const history = await getLineCommitHistoryAsync(projectRoot, filePath, 1, totalLines);
+  if (history.length === 0) {
+    return {
+      filePath,
+      totalLines,
+      primaryOwner: null,
+      recentOwner: null,
+      contributorCount: 0,
+      busFactor: 0,
+      contributors: [],
+    };
+  }
+
+  const contributors = new Map<string, { authorName: string; authorEmail: string; lineCount: number; latestAuthoredAt: string | null }>();
+  for (const commit of history) {
+    const key = contributorKey(commit.authorName || 'Unknown', commit.authorEmail || 'unknown@example.invalid');
+    const existing = contributors.get(key) ?? {
+      authorName: commit.authorName || 'Unknown',
+      authorEmail: commit.authorEmail || 'unknown@example.invalid',
+      lineCount: 0,
+      latestAuthoredAt: null as string | null,
+    };
+    existing.lineCount += lineRangeCount(commit.lineRanges);
+    if (!existing.latestAuthoredAt || Date.parse(commit.authoredAt || '1970-01-01T00:00:00.000Z') > Date.parse(existing.latestAuthoredAt || '1970-01-01T00:00:00.000Z')) {
+      existing.latestAuthoredAt = commit.authoredAt || existing.latestAuthoredAt;
+    }
+    contributors.set(key, existing);
+  }
+
+  const effectiveTotalLines = [...contributors.values()].reduce((sum, contributor) => sum + contributor.lineCount, 0) || totalLines;
+  const ranked = [...contributors.values()]
+    .map(contributor => ({
+      authorName: contributor.authorName,
+      authorEmail: contributor.authorEmail,
+      lineCount: contributor.lineCount,
+      percentage: effectiveTotalLines > 0 ? contributor.lineCount / effectiveTotalLines : 0,
+      latestAuthoredAt: contributor.latestAuthoredAt,
+    }))
+    .sort((left, right) => right.lineCount - left.lineCount || Date.parse(right.latestAuthoredAt || '1970-01-01T00:00:00.000Z') - Date.parse(left.latestAuthoredAt || '1970-01-01T00:00:00.000Z'));
+
+  const recentOwner = [...ranked]
+    .sort((left, right) => Date.parse(right.latestAuthoredAt || '1970-01-01T00:00:00.000Z') - Date.parse(left.latestAuthoredAt || '1970-01-01T00:00:00.000Z') || right.lineCount - left.lineCount)[0] ?? null;
+
+  return {
+    filePath,
+    totalLines: effectiveTotalLines,
+    primaryOwner: ranked[0] ?? null,
+    recentOwner,
+    contributorCount: ranked.length,
+    busFactor: computeBusFactor(ranked),
+    contributors: ranked,
+  };
 }
 
 async function isGitRepoAsync(projectRoot: string): Promise<boolean> {

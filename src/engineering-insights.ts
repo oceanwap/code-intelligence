@@ -2,6 +2,7 @@ import * as path from 'path';
 import { loadGraphAsync, type GraphData } from './graph.js';
 import { getDataDir } from './git.js';
 import { getProjectMemoryEntriesAsync, type ChangeMemoryEntry, type ProjectMemoryEntry } from './project-memory.js';
+import { summarizeOwnershipForFilesAsync } from './ownership-insights.js';
 
 type ImpactDirection = 'out' | 'in' | 'both';
 type RelationKind = 'calls' | 'calledBy' | 'implements' | 'implementedFrom';
@@ -48,6 +49,16 @@ export interface SymbolHotspot {
   lastChanged: string | null;
   lastChangeTitle: string | null;
   connectivity: number;
+  dependentsCount: number;
+  likelyTestCallers: string[];
+  impactSurface: HotspotImpactSurface[];
+  primaryOwner: string | null;
+  ownerPct: number;
+  recentOwner: string | null;
+  contributorCount: number;
+  busFactor: number;
+  testGap: boolean;
+  riskSummary: string;
   topics: string[];
   score: number;
 }
@@ -60,8 +71,33 @@ export interface FileHotspot {
   lastChangeTitle: string | null;
   symbolCount: number;
   connectivity: number;
+  dependentsCount: number;
+  nearbyTests: string[];
+  impactSurface: FileHotspotImpact[];
+  primaryOwner: string | null;
+  ownerPct: number;
+  recentOwner: string | null;
+  contributorCount: number;
+  busFactor: number;
+  testGap: boolean;
+  riskSummary: string;
   topics: string[];
   score: number;
+}
+
+export interface HotspotImpactSurface {
+  symbol: string;
+  file: string | null;
+  relation: RelationKind;
+  score: number;
+  isTest: boolean;
+}
+
+export interface FileHotspotImpact {
+  file: string;
+  relation: 'calls' | 'calledBy';
+  score: number;
+  isTest: boolean;
 }
 
 export interface RiskHotspotsResult {
@@ -193,6 +229,133 @@ function impactedSymbolScore(entry: AffectedSymbolEntry): number {
 
 function hotspotScore(changeCount: number, fixCount: number, connectivity: number): number {
   return changeCount * 4 + fixCount * 3 + connectivity;
+}
+
+function isTestPath(filePath: string | null | undefined): boolean {
+  if (!filePath) return false;
+  const normalized = filePath.replace(/\\/g, '/').toLowerCase();
+  return /(^|\/)(test|tests)\//.test(normalized) || /\.(test|spec)\.[a-z0-9]+$/.test(normalized);
+}
+
+function relationScore(kind: RelationKind): number {
+  return relationWeight(kind);
+}
+
+function buildSymbolImpactSurface(graph: GraphData, symbol: string, limit = 3): HotspotImpactSurface[] {
+  const entries: HotspotImpactSurface[] = [];
+  const push = (targetSymbol: string, relation: RelationKind): void => {
+    entries.push({
+      symbol: targetSymbol,
+      file: graph.symbolFile[targetSymbol] ?? null,
+      relation,
+      score: relationScore(relation) + graphConnectivity(graph, targetSymbol),
+      isTest: isTestPath(graph.symbolFile[targetSymbol] ?? null),
+    });
+  };
+
+  for (const caller of graph.callers[symbol] ?? []) push(caller, 'calledBy');
+  for (const callee of graph.symbols[symbol] ?? []) push(callee, 'calls');
+  for (const implementation of graph.implementations[symbol] ?? []) push(implementation, 'implements');
+  for (const base of graph.implementedFrom[symbol] ?? []) push(base, 'implementedFrom');
+
+  const deduped = new Map<string, HotspotImpactSurface>();
+  for (const entry of entries) {
+    const key = `${entry.relation}:${entry.symbol}`;
+    const existing = deduped.get(key);
+    if (!existing || existing.score < entry.score) deduped.set(key, entry);
+  }
+
+  return [...deduped.values()]
+    .sort((left, right) => right.score - left.score || left.symbol.localeCompare(right.symbol))
+    .slice(0, limit);
+}
+
+function likelyTestCallers(graph: GraphData, symbol: string): string[] {
+  return (graph.callers[symbol] ?? []).filter(caller => isTestPath(graph.symbolFile[caller] ?? null));
+}
+
+function fileDependents(graph: GraphData, symbols: string[], currentFile: string): string[] {
+  const dependents = new Set<string>();
+  for (const symbol of symbols) {
+    for (const caller of graph.callers[symbol] ?? []) {
+      const callerFile = graph.symbolFile[caller];
+      if (!callerFile || callerFile === currentFile) continue;
+      dependents.add(callerFile);
+    }
+  }
+  return [...dependents];
+}
+
+function candidateGraphFiles(graph: GraphData): string[] {
+  return [...new Set([...Object.keys(graph.files), ...Object.values(graph.symbolFile)])];
+}
+
+function nearbyTestFiles(file: string, graph: GraphData): string[] {
+  const normalized = file.replace(/\\/g, '/');
+  const dir = path.posix.dirname(normalized);
+  const ext = path.posix.extname(normalized);
+  const base = path.posix.basename(normalized, ext).toLowerCase();
+
+  return candidateGraphFiles(graph)
+    .filter(candidate => candidate !== file)
+    .filter(candidate => isTestPath(candidate))
+    .filter(candidate => {
+      const candidateNormalized = candidate.replace(/\\/g, '/').toLowerCase();
+      const candidateDir = path.posix.dirname(candidateNormalized);
+      return candidateDir === dir.toLowerCase()
+        || candidateDir.startsWith(`${dir.toLowerCase()}/`)
+        || dir.toLowerCase().startsWith(`${candidateDir}/`)
+        || candidateNormalized.includes(base);
+    })
+    .slice(0, 5);
+}
+
+function buildFileImpactSurface(graph: GraphData, file: string, symbols: string[], limit = 3): FileHotspotImpact[] {
+  const scores = new Map<string, { file: string; relation: 'calls' | 'calledBy'; score: number; isTest: boolean }>();
+  const register = (targetFile: string | undefined, relation: 'calls' | 'calledBy', weight: number): void => {
+    if (!targetFile || targetFile === file) return;
+    const existing = scores.get(`${relation}:${targetFile}`);
+    const next = {
+      file: targetFile,
+      relation,
+      score: (existing?.score ?? 0) + weight,
+      isTest: isTestPath(targetFile),
+    };
+    scores.set(`${relation}:${targetFile}`, next);
+  };
+
+  for (const symbol of symbols) {
+    for (const callee of graph.symbols[symbol] ?? []) {
+      register(graph.symbolFile[callee], 'calls', 4 + graphConnectivity(graph, callee));
+    }
+    for (const caller of graph.callers[symbol] ?? []) {
+      register(graph.symbolFile[caller], 'calledBy', 6 + graphConnectivity(graph, caller));
+    }
+  }
+
+  return [...scores.values()]
+    .sort((left, right) => right.score - left.score || left.file.localeCompare(right.file))
+    .slice(0, limit);
+}
+
+function symbolRiskSummary(entry: SymbolHotspot): string {
+  const ownership = entry.primaryOwner
+    ? `, owned ${(entry.ownerPct * 100).toFixed(0)}% by ${entry.primaryOwner}`
+    : '';
+  const busFactorRisk = entry.busFactor === 1 && entry.primaryOwner
+    ? `, bus factor risk (sole maintainer: ${entry.primaryOwner})`
+    : '';
+  return `${entry.symbol} — score ${entry.score.toFixed(1)}, ${entry.dependentsCount} dependents, ${entry.changeCount} changes, ${entry.fixCount} fixes${ownership}${busFactorRisk}${entry.testGap ? ', no nearby tests seen' : ''}`;
+}
+
+function fileRiskSummary(entry: FileHotspot): string {
+  const ownership = entry.primaryOwner
+    ? `, owned ${(entry.ownerPct * 100).toFixed(0)}% by ${entry.primaryOwner}`
+    : '';
+  const busFactorRisk = entry.busFactor === 1 && entry.primaryOwner
+    ? `, bus factor risk (sole maintainer: ${entry.primaryOwner})`
+    : '';
+  return `${entry.file} — score ${entry.score.toFixed(1)}, ${entry.dependentsCount} dependent files, ${entry.changeCount} changes, ${entry.fixCount} fixes${ownership}${busFactorRisk}${entry.testGap ? ', no nearby tests seen' : ''}`;
 }
 
 function formatReason(reason: RelationReason): string {
@@ -328,18 +491,25 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
   const entries = (await getProjectMemoryEntriesAsync(root))
     .filter(entry => !topic || (isChangeEntry(entry) && entry.topics.some(item => item.includes(topic))));
   const { changeEntries, symbolStats, fileStats } = buildChangeStats(entries);
-  const symbolHotspots = [...symbolStats.entries()]
-    .map(([symbol, stat]) => ({
-      symbol,
-      file: graph.symbolFile[symbol] ?? null,
-      changeCount: stat.changeCount,
-      fixCount: stat.fixCount,
-      lastChanged: stat.lastChanged,
-      lastChangeTitle: stat.lastChangeTitle,
-      connectivity: graphConnectivity(graph, symbol),
-      topics: toTopTopics(stat.topics),
-      score: hotspotScore(stat.changeCount, stat.fixCount, graphConnectivity(graph, symbol)),
-    }))
+  const rankedSymbolHotspots = [...symbolStats.entries()]
+    .map(([symbol, stat]) => {
+      const dependentsCount = (graph.callers[symbol] ?? []).length;
+      const tests = likelyTestCallers(graph, symbol);
+      return {
+        symbol,
+        file: graph.symbolFile[symbol] ?? null,
+        changeCount: stat.changeCount,
+        fixCount: stat.fixCount,
+        lastChanged: stat.lastChanged,
+        lastChangeTitle: stat.lastChangeTitle,
+        connectivity: graphConnectivity(graph, symbol),
+        dependentsCount,
+        likelyTestCallers: tests,
+        impactSurface: buildSymbolImpactSurface(graph, symbol),
+        topics: toTopTopics(stat.topics),
+        score: hotspotScore(stat.changeCount, stat.fixCount, graphConnectivity(graph, symbol)),
+      };
+    })
     .sort((left, right) => right.score - left.score || left.symbol.localeCompare(right.symbol))
     .slice(0, maxResults);
 
@@ -349,10 +519,11 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
     symbolsByFile.get(file)!.add(symbol);
   }
 
-  const fileHotspots = [...fileStats.entries()]
+  const rankedFileHotspots = [...fileStats.entries()]
     .map(([file, stat]) => {
       const symbols = [...(symbolsByFile.get(file) ?? new Set<string>())];
       const connectivity = symbols.reduce((total, symbol) => total + graphConnectivity(graph, symbol), 0);
+      const dependents = fileDependents(graph, symbols, file);
       return {
         file,
         changeCount: stat.changeCount,
@@ -361,12 +532,49 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
         lastChangeTitle: stat.lastChangeTitle,
         symbolCount: symbols.length,
         connectivity,
+        dependentsCount: dependents.length,
+        nearbyTests: nearbyTestFiles(file, graph),
+        impactSurface: buildFileImpactSurface(graph, file, symbols),
         topics: toTopTopics(stat.topics),
         score: hotspotScore(stat.changeCount, stat.fixCount, connectivity),
       };
     })
     .sort((left, right) => right.score - left.score || left.file.localeCompare(right.file))
     .slice(0, maxResults);
+
+  const symbolHotspots: SymbolHotspot[] = await Promise.all(rankedSymbolHotspots.map(async entry => {
+    const ownership = entry.file
+      ? await summarizeOwnershipForFilesAsync(root, [entry.file], { maxFiles: 1 })
+      : await summarizeOwnershipForFilesAsync(root, [], { maxFiles: 1 });
+    const enriched: SymbolHotspot = {
+      ...entry,
+      primaryOwner: ownership.primaryOwner,
+      ownerPct: ownership.ownerPct,
+      recentOwner: ownership.recentOwner,
+      contributorCount: ownership.contributorCount,
+      busFactor: ownership.busFactor,
+      testGap: entry.likelyTestCallers.length === 0,
+      riskSummary: '',
+    };
+    enriched.riskSummary = symbolRiskSummary(enriched);
+    return enriched;
+  }));
+
+  const fileHotspots: FileHotspot[] = await Promise.all(rankedFileHotspots.map(async entry => {
+    const ownership = await summarizeOwnershipForFilesAsync(root, [entry.file], { maxFiles: 1 });
+    const enriched: FileHotspot = {
+      ...entry,
+      primaryOwner: ownership.primaryOwner,
+      ownerPct: ownership.ownerPct,
+      recentOwner: ownership.recentOwner,
+      contributorCount: ownership.contributorCount,
+      busFactor: ownership.busFactor,
+      testGap: entry.nearbyTests.length === 0,
+      riskSummary: '',
+    };
+    enriched.riskSummary = fileRiskSummary(enriched);
+    return enriched;
+  }));
 
   return {
     analyzedChanges: changeEntries.length,
@@ -386,9 +594,17 @@ export function renderRiskHotspots(result: RiskHotspotsResult): string {
         entry.file ? `File: ${entry.file}` : '',
         `Change history: ${entry.changeCount} change(s), ${entry.fixCount} fix(es)`,
         entry.lastChanged ? `Last changed: ${entry.lastChanged}${entry.lastChangeTitle ? ` — ${entry.lastChangeTitle}` : ''}` : '',
+        `Dependents: ${entry.dependentsCount}`,
+        `Ownership: primary=${entry.primaryOwner ?? 'unknown'} (${(entry.ownerPct * 100).toFixed(0)}%), recent=${entry.recentOwner ?? 'unknown'}, contributors=${entry.contributorCount}, busFactor=${entry.busFactor}`,
+        `Likely test callers: ${entry.likelyTestCallers.join(', ') || 'none'}`,
+        `Test gap: ${entry.testGap ? 'yes' : 'no'}`,
+        entry.impactSurface.length > 0
+          ? `Impact surface: ${entry.impactSurface.map(item => `${item.symbol}${item.file ? `@${item.file}` : ''} [${item.relation}]`).join('; ')}`
+          : 'Impact surface: none',
         entry.topics.length > 0 ? `Topics: ${entry.topics.join(', ')}` : '',
         `Connectivity: ${entry.connectivity}`,
         `Score: ${entry.score.toFixed(1)}`,
+        `Summary: ${entry.riskSummary}`,
       ].filter(Boolean).join('\n')).join('\n\n---\n\n'),
     ].join('\n\n'));
   } else {
@@ -404,8 +620,16 @@ export function renderRiskHotspots(result: RiskHotspotsResult): string {
         entry.lastChanged ? `Last changed: ${entry.lastChanged}${entry.lastChangeTitle ? ` — ${entry.lastChangeTitle}` : ''}` : '',
         entry.topics.length > 0 ? `Topics: ${entry.topics.join(', ')}` : '',
         `Indexed symbols: ${entry.symbolCount}`,
+        `Dependent files: ${entry.dependentsCount}`,
+        `Ownership: primary=${entry.primaryOwner ?? 'unknown'} (${(entry.ownerPct * 100).toFixed(0)}%), recent=${entry.recentOwner ?? 'unknown'}, contributors=${entry.contributorCount}, busFactor=${entry.busFactor}`,
+        `Nearby tests: ${entry.nearbyTests.join(', ') || 'none'}`,
+        `Test gap: ${entry.testGap ? 'yes' : 'no'}`,
+        entry.impactSurface.length > 0
+          ? `Impact surface: ${entry.impactSurface.map(item => `${item.file} [${item.relation}]`).join('; ')}`
+          : 'Impact surface: none',
         `Connectivity: ${entry.connectivity}`,
         `Score: ${entry.score.toFixed(1)}`,
+        `Summary: ${entry.riskSummary}`,
       ].filter(Boolean).join('\n')).join('\n\n---\n\n'),
     ].join('\n\n'));
   } else {
