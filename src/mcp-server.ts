@@ -112,6 +112,7 @@ import { whereShouldThisLive, renderPlacementOracle } from './placement-oracle.j
 import { validateIntent, renderIntentValidation } from './intent-validator.js';
 import { validateGeneratedCode, renderCodeValidation } from './code-validator.js';
 import { getModuleConventions, renderModuleConventions } from './module-conventions.js';
+import { buildRepoMap, renderRepoMap } from './repo-map.js';
 
 const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositories, indexes and project memory are branch-scoped, so check status or re-index after switching branches.';
 const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
@@ -2477,6 +2478,28 @@ function createMcpServer(): McpServer {
         return { content: [{ type: 'text', text: `No indexed symbols found for module "${moduleName}". Check the module name with get_overview or project_status.` }] };
       }
       return { content: [{ type: 'text', text: renderModuleConventions(conventions) }] };
+    }
+  );
+
+  // --- repo_map ---
+  server.registerTool(
+    'repo_map',
+    {
+      description: 'Generate an aider-style repo map: a compact file→symbol→signature overview of the codebase ranked by call-graph PageRank. Optionally focus the map on seed symbols or file paths. Use this to get a high-level orientation of a project before diving into code.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        seeds: z.array(z.string()).optional().describe('Optional seed symbols or file paths to focus ranking on. Symbols near seeds will score higher.'),
+        maxLines: z.number().optional().describe('Maximum output lines (default: 1000). Lower for a tighter map.'),
+        includeMethods: z.boolean().optional().describe('Whether to include class methods (default: true).'),
+      },
+    },
+    async ({ projectRoot, seeds, maxLines, includeMethods }) => {
+      const result = await buildRepoMap(path.resolve(projectRoot), {
+        seeds: seeds ?? [],
+        maxLines: maxLines ?? 1000,
+        includeMethods: includeMethods !== false,
+      });
+      return { content: [{ type: 'text', text: renderRepoMap(result) }] };
     }
   );
 

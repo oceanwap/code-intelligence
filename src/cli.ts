@@ -95,6 +95,7 @@ import { buildGitSemanticChangeGraph } from './git-change-graph.js';
 import { loadGraphAsync } from './graph.js';
 import { getDataDir, getCurrentBranchAsync } from './git.js';
 import { getProjectMemoryCountAsync } from './project-memory.js';
+import { buildRepoMap, renderRepoMap } from './repo-map.js';
 import { loadStructureAsync, refreshStructureAsync } from './cognition/structure/engine.js';
 
 function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
@@ -1456,6 +1457,26 @@ program
       const refs = `callers=${s.callers.length}, callees=${s.callees.length}`;
       console.log(`  ${s.symbol} (${s.kind}) @ ${s.file} | ${refs}`);
     });
+  });
+
+// ─── Repo map ─────────────────────────────────────────────────────────────────
+
+program
+  .command('repo-map')
+  .description('Generate an aider-style repo map: file→symbol→signature ranked by call-graph PageRank')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--seeds <symbols>', 'Comma-separated seed symbols or file paths to focus the map on')
+  .option('--max-lines <n>', 'Maximum output lines (default: 1000)', '1000')
+  .option('--no-methods', 'Exclude class methods from the map')
+  .action(async (opts: { dir: string; seeds?: string; maxLines: string; methods: boolean }) => {
+    const root = path.resolve(opts.dir);
+    const seeds = opts.seeds ? opts.seeds.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const result = await buildRepoMap(root, {
+      seeds,
+      maxLines: Number(opts.maxLines) || 1000,
+      includeMethods: opts.methods !== false,
+    });
+    console.log(renderRepoMap(result));
   });
 
 program.parse();
