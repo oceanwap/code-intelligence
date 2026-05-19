@@ -14,7 +14,7 @@ import {
   renderAffectedSymbols as renderAffectedSymbolsInsight,
   renderRiskHotspots as renderRiskHotspotsInsight,
 } from './engineering-insights.js';
-import { indexProject, queryProject, type IndexMode, type ProgressCallback } from './indexer-run.js';
+import { indexProject, queryProjectPage, type IndexMode, type ProgressCallback } from './indexer-run.js';
 import { loadGraphAsync, type GraphData } from './graph.js';
 import {
   getFeatureMapAsync,
@@ -42,6 +42,7 @@ import {
   serializeFeatureBriefResponse,
   serializeQueryProjectResponse,
 } from './output-format.js';
+import { renderCompactCallGraphLines } from './call-graph-preview.js';
 import { buildEnrichedSymbolContextAsync, type IndexedSymbolPoint } from './symbol-context.js';
 import { findDependencyPath, topUnstableModules } from './cognition/architecture/analyzer.js';
 import { loadArchitectureAsync, refreshArchitectureAsync } from './cognition/architecture/storage.js';
@@ -528,11 +529,14 @@ function createMcpServer(): McpServer {
         projectRoot: z.string().describe(PROJECT_ROOT_DESC),
         question: z.string().describe('Natural language implementation question about the codebase, for example "how does authentication work" or "where is rate limiting applied".'),
         mode: z.enum(['default', 'architecture']).optional().describe('Retrieval mode. Use architecture for package/module/topology-first results (default: default).'),
+        semanticThreshold: z.number().min(0).max(1).optional().describe('Semantic threshold for expanding caller/callee neighborhood from strong matches (default: 0.5).'),
+        page: z.number().int().min(1).optional().describe('Result page number (default: 1).'),
+        pageSize: z.number().int().min(1).max(20).optional().describe('Results per page (default: 6).'),
         format: z.enum(['text', 'json']).optional().describe('Output format. Use json when the client wants structured scores, signals, and code fields (default: text).'),
         qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
-    async ({ projectRoot, question, mode = 'default', format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
+    async ({ projectRoot, question, mode = 'default', semanticThreshold = 0.5, page = 1, pageSize = 6, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       const pipeline = await enforceCognitionPipeline(root, qdrantUrl);
       
@@ -550,7 +554,13 @@ function createMcpServer(): McpServer {
         }
       }
       
-      let results = await queryProject(root, question, qdrantUrl, mode);
+      const response = await queryProjectPage(root, question, qdrantUrl, {
+        mode,
+        semanticThreshold,
+        page,
+        pageSize,
+      });
+      let results = response.results;
       results = await rerankByAttentionAsync(root, results);
       const memoryFreshness = await getProjectMemoryFreshnessAsync(root);
       const structure = await loadStructureAsync(root);
@@ -567,13 +577,22 @@ function createMcpServer(): McpServer {
         return { content: [{ type: 'text', text: 'No results found.' }] };
       }
       if (format === 'json') {
-        return { content: [{ type: 'text', text: JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness), null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness, response.pagination), null, 2) }] };
       }
       const sections = [];
       if (violationWarning) {
         sections.push(violationWarning);
       }
       sections.push(`Pipeline enforced: structure modules ${pipeline.structureModules}, critical attention ${pipeline.attentionCritical}, constraint violations ${pipeline.constraintViolations}`);
+      sections.push(`Results page ${response.pagination.page}/${response.pagination.totalPages} (page size ${response.pagination.pageSize}, total ${response.pagination.totalResults})`);
+      if (response.pagination.hasMore && response.pagination.nextPage) {
+        sections.push(`More context available: call query_project again with page=${response.pagination.nextPage} and pageSize=${response.pagination.pageSize}`);
+      }
+      if (response.pagination.symbolIndexByPage.length > 0) {
+        sections.push('Symbols by page:');
+        sections.push(...response.pagination.symbolIndexByPage.map(entry => `- page ${entry.page}: ${entry.symbols.join(', ') || '(none)'}`));
+      }
+      sections.push(...renderCompactCallGraphLines(results));
       sections.push(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
       if (memoryFreshness.reasons.length > 0) {
         sections.push(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);

@@ -4,7 +4,7 @@ import type { CodeChunk } from './indexer.js';
 import { embedAndStore, deletePoints, deleteOrphanPoints } from './embedder.js';
 import { buildGraphAsync, saveGraph } from './graph.js';
 import { syncProjectMemory } from './project-memory.js';
-import { retrieve, type RetrievedChunk, type RetrievalMode } from './retriever.js';
+import { retrieve, retrievePage, type RetrievedChunk, type RetrievalMode, type RetrievalResponse } from './retriever.js';
 import { getDataDir } from './git.js';
 import { refreshArchitectureAsync } from './cognition/architecture/storage.js';
 import { refreshStructureAsync } from './cognition/structure/engine.js';
@@ -374,13 +374,41 @@ export async function indexProject(
 
 export { type RetrievedChunk };
 
+export interface QueryProjectPageOptions {
+  mode?: RetrievalMode;
+  semanticThreshold?: number;
+  page?: number;
+  pageSize?: number;
+}
+
 export async function queryProject(
   projectRoot: string,
   question: string,
   qdrantUrl = 'http://localhost:6333',
-  mode: RetrievalMode = 'default'
+  mode: RetrievalMode = 'default',
+  semanticThreshold?: number
 ): Promise<RetrievedChunk[]> {
   const root = path.resolve(projectRoot);
   const graphPath = path.join(getDataDir(root), 'graph.json');
-  return retrieve(question, root, graphPath, qdrantUrl, mode);
+  return retrieve(question, root, graphPath, qdrantUrl, mode, semanticThreshold);
+}
+
+export async function queryProjectPage(
+  projectRoot: string,
+  question: string,
+  qdrantUrl = 'http://localhost:6333',
+  options: QueryProjectPageOptions = {}
+): Promise<RetrievalResponse> {
+  const root = path.resolve(projectRoot);
+  const graphPath = path.join(getDataDir(root), 'graph.json');
+  return retrievePage(
+    question,
+    root,
+    graphPath,
+    qdrantUrl,
+    options.mode ?? 'default',
+    options.semanticThreshold,
+    options.page,
+    options.pageSize,
+  );
 }

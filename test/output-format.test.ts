@@ -93,6 +93,42 @@ test('serializeQueryProjectResponse exposes an explicit ranking contract', () =>
   assert.equal('scoreBreakdown' in (response.results[0] ?? {}), false);
 });
 
+  test('serializeQueryProjectResponse includes pagination guidance when provided', () => {
+    const result: RetrievedChunk = {
+      file: 'src/billing.ts',
+      symbol: 'BillingService.createPositions',
+      type: 'method',
+      code: 'createPositions() { return []; }',
+      score: 4.2,
+      semanticScore: 0.61,
+    };
+    const response = serializeQueryProjectResponse(
+      'billing query',
+      [result],
+      undefined,
+      {
+        page: 1,
+        pageSize: 6,
+        totalResults: 18,
+        totalPages: 3,
+        hasMore: true,
+        nextPage: 2,
+        symbolIndexByPage: [
+          { page: 1, symbols: ['BillingService.createPositions', 'BillingService.hasDiscount'] },
+          { page: 2, symbols: ['BillingService.createDiscountPositions'] },
+          { page: 3, symbols: ['BillPosition.whereIn'] },
+        ],
+      }
+    );
+
+    assert.equal(response.pagination?.page, 1);
+    assert.equal(response.pagination?.nextPage, 2);
+    assert.equal(response.pagination?.hasMore, true);
+    assert.equal(response.pagination?.symbolIndexByPage.length, 3);
+    assert.equal(response.pagination?.symbolIndexByPage[1]?.symbols[0], 'BillingService.createDiscountPositions');
+    assert.ok(response.pagination?.guidance.includes('page=2'));
+  });
+
 test('serializeFeatureBriefResponse flattens knowledge and guidance into stable fields', () => {
   const brief: FeatureBrief = {
     feature: 'auth login flow',

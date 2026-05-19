@@ -5,6 +5,7 @@ import { getProjectMemoryEntriesAsync, type ProjectMemoryEntry } from './project
 import { getRetrievedSliceFreshnessAsync, type RetrievedSliceFreshness } from './query-freshness.js';
 
 const MAX_CHARS = 3000 * 4; // ~3000 tokens (1 token ≈ 4 chars)
+const STRONG_SEMANTIC_SCORE = 0.5;
 const STOP_WORDS = new Set([
   'the', 'how', 'what', 'where', 'does', 'get', 'set', 'use', 'for', 'with',
   'from', 'and', 'that', 'this', 'are', 'was', 'not', 'but', 'file', 'code',
@@ -50,6 +51,24 @@ export interface RetrievedChunk {
   };
 }
 
+export interface RetrievalPagination {
+  page: number;
+  pageSize: number;
+  totalResults: number;
+  totalPages: number;
+  hasMore: boolean;
+  nextPage: number | null;
+  symbolIndexByPage: Array<{
+    page: number;
+    symbols: string[];
+  }>;
+}
+
+export interface RetrievalResponse {
+  results: RetrievedChunk[];
+  pagination: RetrievalPagination;
+}
+
 export type RetrievalMode = 'default' | 'architecture';
 
 export class MissingCodeIndexError extends Error {
@@ -77,6 +96,21 @@ function isQdrantCollectionNotFound(error: unknown): boolean {
       || detail.includes('not found'));
 }
 
+function normalizeSemanticThreshold(value: number | undefined): number {
+  if (!Number.isFinite(value)) return STRONG_SEMANTIC_SCORE;
+  return Math.max(0, Math.min(1, value as number));
+}
+
+function normalizePage(value: number | undefined): number {
+  if (!Number.isFinite(value)) return 1;
+  return Math.max(1, Math.floor(value as number));
+}
+
+function normalizePageSize(value: number | undefined): number {
+  if (!Number.isFinite(value)) return 6;
+  return Math.max(1, Math.min(20, Math.floor(value as number)));
+}
+
 function tokenize(text: string | null | undefined): string[] {
   if (!text) return [];
   return text
@@ -100,6 +134,99 @@ function graphNeighbors(graph: GraphData | null, symbol: string): string[] {
     ...(graph.supertypes?.[symbol] ?? []),
     ...(graph.subtypes?.[symbol] ?? []),
   ])];
+}
+
+function symbolSuffix(symbol: string): string {
+  if (symbol.includes('::')) return symbol.split('::').pop() ?? symbol;
+  if (symbol.includes('.')) return symbol.split('.').pop() ?? symbol;
+  if (symbol.includes('\\')) return symbol.split('\\').pop() ?? symbol;
+  return symbol;
+}
+
+function callerSymbolPrefix(callerSymbol: string): { prefix: string; separator: '::' | '.' } | null {
+  if (callerSymbol.includes('::')) {
+    const idx = callerSymbol.lastIndexOf('::');
+    return { prefix: callerSymbol.slice(0, idx), separator: '::' };
+  }
+  if (callerSymbol.includes('.')) {
+    const idx = callerSymbol.lastIndexOf('.');
+    return { prefix: callerSymbol.slice(0, idx), separator: '.' };
+  }
+  return null;
+}
+
+function resolveCalleeCandidates(
+  callerSymbol: string,
+  callerFile: string,
+  calleeSymbol: string,
+  graph: GraphData
+): string[] {
+  const candidates = new Set<string>();
+  if (!calleeSymbol) return [];
+
+  // Exact symbol from call graph.
+  candidates.add(calleeSymbol);
+
+  const needsQualification = !calleeSymbol.includes('::') && !calleeSymbol.includes('.') && !calleeSymbol.includes('\\');
+  const calleeName = symbolSuffix(calleeSymbol);
+
+  // Class-qualified candidate based on caller's symbol style.
+  if (needsQualification) {
+    const callerPrefix = callerSymbolPrefix(callerSymbol);
+    if (callerPrefix) candidates.add(`${callerPrefix.prefix}${callerPrefix.separator}${calleeName}`);
+  }
+
+  // Same-file suffix matches help bridge partially-resolved call sites.
+  for (const [symbol, file] of Object.entries(graph.symbolFile)) {
+    if (file !== callerFile) continue;
+    if (symbol === calleeSymbol) {
+      candidates.add(symbol);
+      continue;
+    }
+    if (symbolSuffix(symbol) === calleeName) {
+      candidates.add(symbol);
+    }
+  }
+
+  return [...candidates];
+}
+
+export function collectDirectCallExpansionSymbols(
+  seedResults: Array<Pick<RetrievedChunk, 'symbol' | 'file'>>,
+  graph: GraphData,
+  maxCallsPerSeed = 10
+): Set<string> {
+  const expanded = new Set<string>();
+
+  for (const seed of seedResults) {
+    const directCalls = graph.callSites?.[seed.symbol]?.map(site => site.symbol)
+      ?? graph.symbols[seed.symbol]
+      ?? [];
+
+    for (const callee of directCalls.slice(0, maxCallsPerSeed)) {
+      for (const candidate of resolveCalleeCandidates(seed.symbol, seed.file, callee, graph)) {
+        expanded.add(candidate);
+      }
+    }
+  }
+
+  return expanded;
+}
+
+export function prioritizeDirectCallResults(ranked: RetrievedChunk[], directSymbols: Set<string>): RetrievedChunk[] {
+  if (directSymbols.size === 0) return ranked;
+  const direct: RetrievedChunk[] = [];
+  const rest: RetrievedChunk[] = [];
+
+  for (const result of ranked) {
+    if (directSymbols.has(result.symbol)) {
+      direct.push(result);
+    } else {
+      rest.push(result);
+    }
+  }
+
+  return [...direct, ...rest];
 }
 
 function summarizeRelation(values: string[], limit = 5): { total: number; symbols: string[] } {
@@ -213,25 +340,38 @@ export function rankRetrievedChunks(
   results: RetrievedChunk[],
   graph: GraphData | null,
   memoryEntries: ProjectMemoryEntry[] = [],
-  mode: RetrievalMode = 'default'
+  mode: RetrievalMode = 'default',
+  strongSemanticSeedSymbols: Set<string> = new Set<string>()
 ): RetrievedChunk[] {
   const queryTokens = new Set(tokenize(query));
   if (queryTokens.size === 0) return results;
 
   const { symbolSupport, fileSupport } = buildMemorySupport(queryTokens, memoryEntries);
+  const strongSemanticSeeds = [...strongSemanticSeedSymbols];
 
   const architectureIntent = mode === 'architecture';
 
   return [...results]
     .map(result => {
       const semanticScore = result.semanticScore ?? result.score;
+      const isStrongSemanticSeed = strongSemanticSeedSymbols.has(result.symbol);
+      const isChildOfStrongSemantic = !isStrongSemanticSeed && strongSemanticSeeds
+        .some(seed => (graph?.symbols[seed] ?? []).includes(result.symbol));
+      const isParentOfStrongSemantic = !isStrongSemanticSeed && strongSemanticSeeds
+        .some(seed => (graph?.callers?.[seed] ?? []).includes(result.symbol));
+      const semanticRelationBoost = isStrongSemanticSeed
+        ? 0
+        : (isChildOfStrongSemantic || isParentOfStrongSemantic)
+          ? 0.2
+          : 0;
+      const promotedSemanticScore = Math.min(1, semanticScore + semanticRelationBoost);
       const symbolOverlap = countOverlap(queryTokens, result.symbol);
       const fileOverlap = countOverlap(queryTokens, result.file);
       const directMemory = (symbolSupport.get(result.symbol) ?? 0) + (fileSupport.get(result.file) ?? 0);
       const neighbors = graphNeighbors(graph, result.symbol);
       const neighborSupport = neighbors.reduce((total, symbol) => total + (symbolSupport.get(symbol) ?? 0), 0);
       const connectivity = neighbors.length;
-      const semanticContribution = architectureIntent ? semanticScore * 8 : semanticScore * 10;
+      const semanticContribution = architectureIntent ? promotedSemanticScore * 8 : promotedSemanticScore * 10;
       const symbolOverlapContribution = architectureIntent ? symbolOverlap * 4 : symbolOverlap * 3;
       const fileOverlapContribution = architectureIntent ? fileOverlap * 4 : fileOverlap * 2;
       const directMemoryContribution = architectureIntent ? Math.min(8, directMemory * 0.15) : directMemory;
@@ -246,6 +386,8 @@ export function rankRetrievedChunks(
 
       const rankingSignals: string[] = [];
       if (semanticScore >= 0.5) rankingSignals.push('strong semantic match');
+      if (semanticRelationBoost > 0 && isChildOfStrongSemantic) rankingSignals.push('child of strong semantic match');
+      if (semanticRelationBoost > 0 && isParentOfStrongSemantic) rankingSignals.push('parent of strong semantic match');
       if (symbolOverlapContribution > 0) rankingSignals.push('symbol token overlap');
       if (fileOverlapContribution > 0) rankingSignals.push('file token overlap');
       if (directMemoryContribution > 0) rankingSignals.push('supported by project memory');
@@ -276,8 +418,26 @@ export async function retrieve(
   projectRoot: string,
   graphPath: string,
   qdrantUrl = 'http://localhost:6333',
-  mode: RetrievalMode = 'default'
+  mode: RetrievalMode = 'default',
+  semanticThreshold?: number
 ): Promise<RetrievedChunk[]> {
+  const response = await retrievePage(query, projectRoot, graphPath, qdrantUrl, mode, semanticThreshold, 1, 6);
+  return response.results;
+}
+
+export async function retrievePage(
+  query: string,
+  projectRoot: string,
+  graphPath: string,
+  qdrantUrl = 'http://localhost:6333',
+  mode: RetrievalMode = 'default',
+  semanticThreshold?: number,
+  page?: number,
+  pageSize?: number
+): Promise<RetrievalResponse> {
+  const strongSemanticThreshold = normalizeSemanticThreshold(semanticThreshold);
+  const currentPage = normalizePage(page);
+  const currentPageSize = normalizePageSize(pageSize);
   const qdrant = new QdrantClient({ url: qdrantUrl });
   const collection = await collectionNameAsync(projectRoot);
 
@@ -309,20 +469,44 @@ export async function retrieve(
     score: h.score,
     semanticScore: h.score,
   }));
+  const strongSemanticSeedSymbols = new Set(
+    results
+      .filter(result => (result.semanticScore ?? 0) >= strongSemanticThreshold)
+      .map(result => result.symbol)
+  );
 
   // 3. Expand via dependency graph: 2-hop outbound + 1-hop inbound (callers)
   const graph = await loadGraphAsync(graphPath);
+  const priorityExpandedSymbols = new Set<string>();
   if (graph) {
     const seen = new Set(results.map(r => r.symbol));
     const relatedSymbols = new Set<string>();
+    const strongSemanticSeeds = results
+      .filter(result => (result.semanticScore ?? 0) >= strongSemanticThreshold)
+      .sort((left, right) => (right.semanticScore ?? 0) - (left.semanticScore ?? 0))
+      .slice(0, 4);
+    const expansionSeeds = strongSemanticSeeds.length > 0
+      ? strongSemanticSeeds
+      : results.filter(result => (result.semanticScore ?? 0) > 0).slice(0, 2);
+
+    // Direct helper expansion (both PHP and TS/Node): include functions/methods used by strong semantic seeds.
+    for (const symbol of collectDirectCallExpansionSymbols(expansionSeeds, graph, 12)) {
+      if (!seen.has(symbol)) relatedSymbols.add(symbol);
+      priorityExpandedSymbols.add(symbol);
+      seen.add(symbol);
+    }
 
     // Outbound: 2 hops
-    const frontier = new Set(results.map(r => r.symbol));
+    const frontier = new Set(expansionSeeds.map(r => r.symbol));
     for (let hop = 0; hop < 2; hop++) {
       const next = new Set<string>();
       for (const sym of frontier) {
         for (const callee of (graph.symbols[sym] ?? [])) {
-          if (!seen.has(callee)) { relatedSymbols.add(callee); next.add(callee); }
+          if (!seen.has(callee)) {
+            relatedSymbols.add(callee);
+            if (hop === 0) priorityExpandedSymbols.add(callee);
+            next.add(callee);
+          }
         }
       }
       next.forEach(s => { seen.add(s); frontier.delete(s); });
@@ -330,10 +514,14 @@ export async function retrieve(
       next.forEach(s => frontier.add(s));
     }
 
-    // Inbound: 1 hop — grab symbols that call any of our top results
-    for (const r of results) {
+    // Inbound: 1 hop — grab parent symbols that call any strong semantic seed
+    for (const r of expansionSeeds) {
       for (const caller of (graph.callers?.[r.symbol] ?? [])) {
-        if (!seen.has(caller)) { relatedSymbols.add(caller); seen.add(caller); }
+        if (!seen.has(caller)) {
+          relatedSymbols.add(caller);
+          priorityExpandedSymbols.add(caller);
+          seen.add(caller);
+        }
       }
     }
 
@@ -412,7 +600,7 @@ export async function retrieve(
 
   const memoryEntries = await getProjectMemoryEntriesAsync(projectRoot);
   const ranked = await Promise.all(
-    rankRetrievedChunks(query, results, graph, memoryEntries, mode)
+    rankRetrievedChunks(query, results, graph, memoryEntries, mode, strongSemanticSeedSymbols)
       .map(async result => ({
         ...result,
         graphSummary: buildGraphSummary(graph, result.symbol),
@@ -420,12 +608,43 @@ export async function retrieve(
       }))
   );
 
-  // 5. Truncate to ~3000 tokens
-  let total = 0;
-  const truncated = ranked.filter(r => {
-    if (total + r.code.length > MAX_CHARS) return false;
-    total += r.code.length;
+  const prioritized = prioritizeDirectCallResults(ranked, priorityExpandedSymbols);
+
+  const connected = connectRetrievedChunksWithinResults(prioritized, graph);
+  const totalResults = connected.length;
+  const totalPages = Math.max(1, Math.ceil(totalResults / currentPageSize));
+  const safePage = Math.min(currentPage, totalPages);
+
+  const symbolIndexByPage = Array.from({ length: totalPages }, (_, index) => {
+    const pageNumber = index + 1;
+    const pageStart = index * currentPageSize;
+    const pageEnd = pageStart + currentPageSize;
+    const symbols = connected.slice(pageStart, pageEnd).map(result => result.symbol);
+    return { page: pageNumber, symbols };
+  });
+
+  const start = (safePage - 1) * currentPageSize;
+  const end = start + currentPageSize;
+  const pageSlice = connected.slice(start, end);
+
+  // Per-page truncation to keep each page usable by an LLM context window.
+  let totalChars = 0;
+  const truncatedPage = pageSlice.filter(r => {
+    if (totalChars + r.code.length > MAX_CHARS) return false;
+    totalChars += r.code.length;
     return true;
   });
-  return connectRetrievedChunksWithinResults(truncated, graph);
+
+  return {
+    results: truncatedPage,
+    pagination: {
+      page: safePage,
+      pageSize: currentPageSize,
+      totalResults,
+      totalPages,
+      hasMore: safePage < totalPages,
+      nextPage: safePage < totalPages ? safePage + 1 : null,
+      symbolIndexByPage,
+    },
+  };
 }

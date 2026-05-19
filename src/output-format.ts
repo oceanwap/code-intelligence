@@ -82,6 +82,19 @@ export interface QueryProjectResponseJson {
     needsReindex: boolean;
     reasons: string[];
   };
+  pagination?: {
+    page: number;
+    pageSize: number;
+    totalResults: number;
+    totalPages: number;
+    hasMore: boolean;
+    nextPage: number | null;
+    symbolIndexByPage: Array<{
+      page: number;
+      symbols: string[];
+    }>;
+    guidance: string;
+  };
   resultCount: number;
   results: QueryResultJson[];
 }
@@ -256,7 +269,19 @@ function serializeWhyChanged(result: WhyChangedResult | null): FeatureBriefRespo
 export function serializeQueryProjectResponse(
   question: string,
   results: RetrievedChunk[],
-  freshness?: ProjectMemoryFreshness
+  freshness?: ProjectMemoryFreshness,
+  pagination?: {
+    page: number;
+    pageSize: number;
+    totalResults: number;
+    totalPages: number;
+    hasMore: boolean;
+    nextPage: number | null;
+    symbolIndexByPage: Array<{
+      page: number;
+      symbols: string[];
+    }>;
+  }
 ): QueryProjectResponseJson {
   return {
     question,
@@ -269,6 +294,14 @@ export function serializeQueryProjectResponse(
       needsReindex: freshness?.needsReindex ?? false,
       reasons: freshness?.reasons ?? [],
     },
+    pagination: pagination
+      ? {
+        ...pagination,
+        guidance: pagination.hasMore
+          ? `More context available. Request page=${pagination.nextPage} to continue.`
+          : 'No additional pages.',
+      }
+      : undefined,
     resultCount: results.length,
     results: results.map(serializeQueryResult),
   };

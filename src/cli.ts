@@ -8,7 +8,7 @@ import {
   renderAffectedSymbols,
   renderRiskHotspots,
 } from './engineering-insights.js';
-import { indexProject, queryProject } from './indexer-run.js';
+import { indexProject, queryProjectPage } from './indexer-run.js';
 import {
   getFeatureMapAsync,
   getBugBriefAsync,
@@ -30,6 +30,7 @@ import {
 import { serializeQueryProjectResponse } from './output-format.js';
 import { buildProjectIntentSnapshot, renderProjectIntentSnapshot } from './project-intent.js';
 import { MissingCodeIndexError } from './retriever.js';
+import { renderCompactCallGraphLines } from './call-graph-preview.js';
 
 function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
   return ranges
@@ -210,13 +211,38 @@ program
   .option('--dir <path>', 'Project root directory', '.')
   .option('--format <format>', 'Output format: text|json', 'text')
   .option('--mode <mode>', 'Retrieval mode: default|architecture', 'default')
+  .option('--semantic-threshold <value>', 'Semantic score threshold (0..1) to expand caller/callee context from strong matches', '0.5')
+  .option('--page <n>', 'Result page number (starts at 1)', '1')
+  .option('--page-size <n>', 'Results per page (1..20)', '6')
   .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
-  .action(async (question: string, opts: { dir: string; format: 'text' | 'json'; mode: 'default' | 'architecture'; qdrant: string }) => {
+  .action(async (question: string, opts: { dir: string; format: 'text' | 'json'; mode: 'default' | 'architecture'; semanticThreshold: string; page: string; pageSize: string; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     const mode = opts.mode === 'architecture' ? 'architecture' : 'default';
+    const parsedThreshold = Number(opts.semanticThreshold);
+    const semanticThreshold = Number.isFinite(parsedThreshold) ? Math.max(0, Math.min(1, parsedThreshold)) : 0.5;
+    const parsedPage = Number(opts.page);
+    const page = Number.isFinite(parsedPage) ? Math.max(1, Math.floor(parsedPage)) : 1;
+    const parsedPageSize = Number(opts.pageSize);
+    const pageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(20, Math.floor(parsedPageSize))) : 6;
     let results: RetrievedChunk[];
+    let pagination: {
+      page: number;
+      pageSize: number;
+      totalResults: number;
+      totalPages: number;
+      hasMore: boolean;
+      nextPage: number | null;
+      symbolIndexByPage: Array<{ page: number; symbols: string[] }>;
+    } | null = null;
     try {
-      results = await queryProject(root, question, opts.qdrant, mode);
+      const response = await queryProjectPage(root, question, opts.qdrant, {
+        mode,
+        semanticThreshold,
+        page,
+        pageSize,
+      });
+      results = response.results;
+      pagination = response.pagination;
     } catch (error) {
       if (error instanceof MissingCodeIndexError) {
         console.log('No code index found for this project/branch yet.');
@@ -232,13 +258,28 @@ program
     }
 
     if (opts.format === 'json') {
-      console.log(JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness), null, 2));
+      console.log(JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness, pagination ?? undefined), null, 2));
       return;
     }
 
     console.log(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
     if (memoryFreshness.reasons.length > 0) {
       console.log(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);
+    }
+    if (pagination) {
+      console.log(`Results page ${pagination.page}/${pagination.totalPages} (page size ${pagination.pageSize}, total ${pagination.totalResults})`);
+      if (pagination.hasMore && pagination.nextPage) {
+        console.log(`More context available: rerun with --page ${pagination.nextPage} --page-size ${pagination.pageSize}`);
+      }
+      if (pagination.symbolIndexByPage.length > 0) {
+        console.log('Symbols by page:');
+        for (const entry of pagination.symbolIndexByPage) {
+          console.log(`  Page ${entry.page}: ${entry.symbols.join(', ') || '(none)'}`);
+        }
+      }
+      for (const line of renderCompactCallGraphLines(results, { linePrefix: '  ' })) {
+        console.log(line);
+      }
     }
     if (mode === 'architecture') {
       const snapshot = await buildProjectIntentSnapshot(root);

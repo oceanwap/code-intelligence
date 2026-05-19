@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { connectRetrievedChunksWithinResults, rankRetrievedChunks, type RetrievedChunk } from '../src/retriever.js';
+import {
+  collectDirectCallExpansionSymbols,
+  connectRetrievedChunksWithinResults,
+  prioritizeDirectCallResults,
+  rankRetrievedChunks,
+  type RetrievedChunk,
+} from '../src/retriever.js';
 import type { GraphData } from '../src/graph.js';
 import type { ProjectMemoryEntry } from '../src/project-memory.js';
 
@@ -122,4 +128,116 @@ test('connectRetrievedChunksWithinResults marks links between returned slices', 
 
   const session = connected.find(chunk => chunk.symbol === 'SessionStore.issue');
   assert.deepEqual(session?.connectionsWithinResults?.usedBy, ['AuthService.login']);
+});
+
+test('collectDirectCallExpansionSymbols resolves same-file PHP and TS helper methods', () => {
+  const graph: GraphData = {
+    symbols: {
+      'BillingService::createPositions': ['hasDiscount', 'createDiscountPositions'],
+      'BillingService.hasInvoice': ['validateInvoice'],
+    },
+    callSites: {
+      'BillingService::createPositions': [
+        { symbol: 'hasDiscount', file: 'src/BillingService.php', line: 1 },
+        { symbol: 'createDiscountPositions', file: 'src/BillingService.php', line: 2 },
+      ],
+      'BillingService.hasInvoice': [
+        { symbol: 'validateInvoice', file: 'src/billing.ts', line: 10 },
+      ],
+    },
+    callers: {},
+    files: {
+      'src/BillingService.php': [],
+      'src/billing.ts': [],
+    },
+    symbolFile: {
+      'BillingService::createPositions': 'src/BillingService.php',
+      'BillingService::hasDiscount': 'src/BillingService.php',
+      'BillingService::createDiscountPositions': 'src/BillingService.php',
+      'BillingService.hasInvoice': 'src/billing.ts',
+      'BillingService.validateInvoice': 'src/billing.ts',
+    },
+    supertypes: {},
+    subtypes: {},
+    implementations: {},
+    implementedFrom: {},
+  };
+
+  const expanded = collectDirectCallExpansionSymbols([
+    { symbol: 'BillingService::createPositions', file: 'src/BillingService.php' },
+    { symbol: 'BillingService.hasInvoice', file: 'src/billing.ts' },
+  ], graph);
+
+  assert.ok(expanded.has('BillingService::hasDiscount'));
+  assert.ok(expanded.has('BillingService::createDiscountPositions'));
+  assert.ok(expanded.has('BillingService.validateInvoice'));
+});
+
+test('prioritizeDirectCallResults moves direct helper symbols ahead of unrelated results', () => {
+  const ranked: RetrievedChunk[] = [
+    makeChunk({ symbol: 'Utility.formatMoney', score: 11 }),
+    makeChunk({ symbol: 'BillingService::createDiscountPositions', score: 7 }),
+    makeChunk({ symbol: 'BillingService::hasDiscount', score: 6 }),
+  ];
+
+  const prioritized = prioritizeDirectCallResults(
+    ranked,
+    new Set(['BillingService::hasDiscount', 'BillingService::createDiscountPositions'])
+  );
+
+  assert.equal(prioritized[0]?.symbol, 'BillingService::createDiscountPositions');
+  assert.equal(prioritized[1]?.symbol, 'BillingService::hasDiscount');
+  assert.equal(prioritized[2]?.symbol, 'Utility.formatMoney');
+});
+
+test('rankRetrievedChunks promotes parent/child of strong semantic seed', () => {
+  const graph: GraphData = {
+    symbols: {
+      'BillingService::createPositions': ['BillingService::createDiscountPositions'],
+      'BillingService::createDiscountPositions': [],
+      'Utility::formatMoney': [],
+    },
+    callers: {
+      'BillingService::createPositions': ['BillingController::generateBill'],
+      'BillingService::createDiscountPositions': ['BillingService::createPositions'],
+    },
+    files: {
+      'src/BillingService.php': [],
+      'src/BillingController.php': [],
+      'src/Utility.php': [],
+    },
+    symbolFile: {
+      'BillingService::createPositions': 'src/BillingService.php',
+      'BillingService::createDiscountPositions': 'src/BillingService.php',
+      'BillingController::generateBill': 'src/BillingController.php',
+      'Utility::formatMoney': 'src/Utility.php',
+    },
+    supertypes: {},
+    subtypes: {},
+    implementations: {},
+    implementedFrom: {},
+  };
+
+  const ranked = rankRetrievedChunks(
+    'billing create positions',
+    [
+      makeChunk({ symbol: 'BillingService::createPositions', file: 'src/BillingService.php', score: 0.82, semanticScore: 0.82 }),
+      makeChunk({ symbol: 'BillingService::createDiscountPositions', file: 'src/BillingService.php', score: 0.15, semanticScore: 0.15 }),
+      makeChunk({ symbol: 'BillingController::generateBill', file: 'src/BillingController.php', score: 0.16, semanticScore: 0.16 }),
+      makeChunk({ symbol: 'Utility::formatMoney', file: 'src/Utility.php', score: 0.22, semanticScore: 0.22 }),
+    ],
+    graph,
+    [],
+    'default',
+    new Set(['BillingService::createPositions'])
+  );
+
+  const boostedChild = ranked.find(item => item.symbol === 'BillingService::createDiscountPositions');
+  const boostedParent = ranked.find(item => item.symbol === 'BillingController::generateBill');
+  const unrelated = ranked.find(item => item.symbol === 'Utility::formatMoney');
+
+  assert.ok((boostedChild?.score ?? 0) > (unrelated?.score ?? 0));
+  assert.ok((boostedParent?.score ?? 0) > (unrelated?.score ?? 0));
+  assert.ok(boostedChild?.rankingSignals?.includes('child of strong semantic match'));
+  assert.ok(boostedParent?.rankingSignals?.includes('parent of strong semantic match'));
 });
