@@ -3,6 +3,7 @@ import { loadGraphAsync, type GraphCallSite, type GraphData } from './graph.js';
 import { collectionNameAsync, embedQuery } from './embedder.js';
 import { getProjectMemoryEntriesAsync, type ProjectMemoryEntry } from './project-memory.js';
 import { getRetrievedSliceFreshnessAsync, type RetrievedSliceFreshness } from './query-freshness.js';
+import { renderCompactCallGraphLines } from './call-graph-preview.js';
 
 const MAX_CHARS = 3000 * 4; // ~3000 tokens (1 token ≈ 4 chars)
 const STRONG_SEMANTIC_SCORE = 0.5;
@@ -62,6 +63,7 @@ export interface RetrievalPagination {
     page: number;
     symbols: string[];
   }>;
+  callGraphPreviewLines: string[];
 }
 
 export interface RetrievalResponse {
@@ -623,6 +625,8 @@ export async function retrievePage(
     return { page: pageNumber, symbols };
   });
 
+  const callGraphPreviewLines = renderCompactCallGraphLines(connected, { linePrefix: '  ' });
+
   const start = (safePage - 1) * currentPageSize;
   const end = start + currentPageSize;
   const pageSlice = connected.slice(start, end);
@@ -645,6 +649,7 @@ export async function retrievePage(
       hasMore: safePage < totalPages,
       nextPage: safePage < totalPages ? safePage + 1 : null,
       symbolIndexByPage,
+      callGraphPreviewLines,
     },
   };
 }

@@ -1,3 +1,6 @@
+import treeify from 'treeify';
+import type { TreeObject, TreeValue } from 'treeify';
+
 export interface CompactCallGraphNode {
   symbol: string;
   connectionsWithinResults?: {
@@ -37,16 +40,15 @@ export interface CompactCallGraphRenderOptions {
   emptyMessage?: string;
 }
 
-export function renderCompactCallGraphLines(
-  results: CompactCallGraphNode[],
-  options: CompactCallGraphRenderOptions = {}
-): string[] {
-  const maxEdges = options.maxEdges ?? 12;
-  const linePrefix = options.linePrefix ?? '- ';
-  const emptyMessage = options.emptyMessage ?? '(no in-page call edges found)';
+interface Edge {
+  from: string;
+  to: string;
+}
 
+function buildEdges(results: CompactCallGraphNode[]): Edge[] {
   const symbols = new Set(results.map(result => result.symbol));
-  const edges = new Set<string>();
+  const edgeKeys = new Set<string>();
+  const edges: Edge[] = [];
 
   for (const result of results) {
     const outboundCandidates = [
@@ -56,7 +58,10 @@ export function renderCompactCallGraphLines(
     for (const callee of outboundCandidates) {
       const resolvedCallee = resolveInPageSymbol(callee, symbols);
       if (!resolvedCallee || resolvedCallee === result.symbol) continue;
-      edges.add(`${result.symbol} -> ${resolvedCallee}`);
+      const key = `${result.symbol} -> ${resolvedCallee}`;
+      if (edgeKeys.has(key)) continue;
+      edgeKeys.add(key);
+      edges.push({ from: result.symbol, to: resolvedCallee });
     }
 
     const inboundCandidates = [
@@ -66,11 +71,80 @@ export function renderCompactCallGraphLines(
     for (const caller of inboundCandidates) {
       const resolvedCaller = resolveInPageSymbol(caller, symbols);
       if (!resolvedCaller || resolvedCaller === result.symbol) continue;
-      edges.add(`${resolvedCaller} -> ${result.symbol}`);
+      const key = `${resolvedCaller} -> ${result.symbol}`;
+      if (edgeKeys.has(key)) continue;
+      edgeKeys.add(key);
+      edges.push({ from: resolvedCaller, to: result.symbol });
     }
   }
 
-  const topEdges = [...edges].slice(0, maxEdges);
-  if (topEdges.length === 0) return ['Small call graph:', `${linePrefix}${emptyMessage}`];
-  return ['Small call graph:', ...topEdges.map(edge => `${linePrefix}${edge}`)];
+  return edges;
+}
+
+function buildForest(edges: Edge[]): TreeObject {
+  const adjacency = new Map<string, string[]>();
+  const indegree = new Map<string, number>();
+  const nodes = new Set<string>();
+
+  for (const edge of edges) {
+    nodes.add(edge.from);
+    nodes.add(edge.to);
+    const list = adjacency.get(edge.from) ?? [];
+    if (!list.includes(edge.to)) list.push(edge.to);
+    adjacency.set(edge.from, list);
+    indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1);
+    if (!indegree.has(edge.from)) indegree.set(edge.from, indegree.get(edge.from) ?? 0);
+  }
+
+  for (const [node, list] of adjacency) {
+    adjacency.set(node, [...list].sort((a, b) => a.localeCompare(b)));
+  }
+
+  const roots = [...nodes]
+    .filter(node => (adjacency.get(node)?.length ?? 0) > 0 && (indegree.get(node) ?? 0) === 0)
+    .sort((a, b) => a.localeCompare(b));
+  const startNodes = roots.length > 0
+    ? roots
+    : [...adjacency.keys()].sort((a, b) => a.localeCompare(b));
+
+  const toBranch = (node: string, path: Set<string>): TreeObject => {
+    const children = adjacency.get(node) ?? [];
+    const branch: TreeObject = {};
+
+    for (const child of children) {
+      if (path.has(child)) {
+        branch[`${child} (cycle)`] = {};
+        continue;
+      }
+      const nextPath = new Set(path);
+      nextPath.add(child);
+      branch[child] = toBranch(child, nextPath);
+    }
+
+    return branch;
+  };
+
+  const forest: TreeObject = {};
+  for (const root of startNodes) {
+    forest[root] = toBranch(root, new Set([root])) as TreeValue;
+  }
+  return forest;
+}
+
+export function renderCompactCallGraphLines(
+  results: CompactCallGraphNode[],
+  options: CompactCallGraphRenderOptions = {}
+): string[] {
+  const maxEdges = options.maxEdges ?? 12;
+  const linePrefix = options.linePrefix ?? '- ';
+  const emptyMessage = options.emptyMessage ?? '(no in-page call edges found)';
+
+  const edges = buildEdges(results).slice(0, maxEdges);
+  if (edges.length === 0) return ['Small call graph:', `${linePrefix}${emptyMessage}`];
+  const forest = buildForest(edges);
+  const rendered = treeify.asTree(forest, false, true).trimEnd();
+  const graphLines = rendered.length > 0
+    ? rendered.split('\n').map(line => `${linePrefix}${line}`)
+    : [`${linePrefix}${emptyMessage}`];
+  return ['Small call graph:', ...graphLines];
 }

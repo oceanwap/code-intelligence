@@ -118,6 +118,11 @@ test('serializeQueryProjectResponse exposes an explicit ranking contract', () =>
           { page: 2, symbols: ['BillingService.createDiscountPositions'] },
           { page: 3, symbols: ['BillPosition.whereIn'] },
         ],
+        callGraphPreviewLines: [
+          'Small call graph:',
+          '  BillingService.createPositions',
+          '  └─ BillingService.createDiscountPositions',
+        ],
       }
     );
 
@@ -125,6 +130,7 @@ test('serializeQueryProjectResponse exposes an explicit ranking contract', () =>
     assert.equal(response.pagination?.nextPage, 2);
     assert.equal(response.pagination?.hasMore, true);
     assert.equal(response.pagination?.symbolIndexByPage.length, 3);
+    assert.equal(response.pagination?.callGraphPreviewLines[0], 'Small call graph:');
     assert.equal(response.pagination?.symbolIndexByPage[1]?.symbols[0], 'BillingService.createDiscountPositions');
     assert.ok(response.pagination?.guidance.includes('page=2'));
   });

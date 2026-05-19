@@ -42,8 +42,15 @@ import {
   serializeFeatureBriefResponse,
   serializeQueryProjectResponse,
 } from './output-format.js';
-import { renderCompactCallGraphLines } from './call-graph-preview.js';
-import { buildEnrichedSymbolContextAsync, type IndexedSymbolPoint } from './symbol-context.js';
+import {
+  scrollSymbolPoints,
+  groupPointsBySymbol,
+  expandGraphBfs,
+  makeProjectQdrantClient,
+  loadProjectGraph,
+  renderSymbolText,
+  type IndexedSymbolPoint,
+} from './symbol-lookup.js';
 import { findDependencyPath, topUnstableModules } from './cognition/architecture/analyzer.js';
 import { loadArchitectureAsync, refreshArchitectureAsync } from './cognition/architecture/storage.js';
 import {
@@ -352,59 +359,11 @@ function formatSymbolRelation(label: string, values: string[] | undefined): stri
   return `**${label}:** ${values.join(', ')}`;
 }
 
-async function scrollSymbolPoints(qdrant: QdrantClient, collection: string, symbols: string[]): Promise<IndexedPoint[]> {
-  if (symbols.length === 0) return [];
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { points } = await qdrant.scroll(collection, {
-    filter: {
-      should: symbols.map(symbol => ({ key: 'symbol', match: { value: symbol } })),
-    } as any,
-    with_payload: true,
-    with_vector: false,
-    limit: Math.max(symbols.length * 3, 10),
-  });
-
-  return points as IndexedPoint[];
-}
-
-function groupPointsBySymbol(points: IndexedPoint[]): Map<string, IndexedPoint[]> {
-  const grouped = new Map<string, IndexedPoint[]>();
-  for (const point of points) {
-    const symbol = point.payload?.['symbol'];
-    if (typeof symbol !== 'string') continue;
-    if (!grouped.has(symbol)) grouped.set(symbol, []);
-    grouped.get(symbol)!.push(point);
-  }
-  return grouped;
-}
+// scrollSymbolPoints, groupPointsBySymbol, expandGraphBfs, renderSymbolText
+// are imported from ./symbol-lookup.js
 
 async function renderIndexedSymbol(projectRoot: string, graph: GraphData | null, symbol: string, point?: IndexedPoint): Promise<string> {
-  const context = await buildEnrichedSymbolContextAsync(projectRoot, graph, symbol, point);
-  return [
-    `**${context.symbol}** (${context.type}) — ${context.file}`,
-    context.lineStart && context.lineEnd ? `**Lines:** ${context.lineStart}-${context.lineEnd}` : '',
-    context.freshness.indexRefreshedAt ? `**Slice index refreshed:** ${context.freshness.indexRefreshedAt}` : '',
-    context.freshness.latestChange
-      ? `**Latest slice change:** ${context.freshness.latestChange.timestamp || 'unknown'} ${context.freshness.latestChange.sha.slice(0, 12)} ${context.freshness.latestChange.title}`
-      : '',
-    context.freshness.latestChange?.changedLines.length
-      ? `**Changed lines in slice:** ${formatLineRanges(context.freshness.latestChange.changedLines)}`
-      : '',
-    context.freshness.reasons.length > 0
-      ? `**Freshness:** re-index recommended (${context.freshness.reasons.join('; ')})`
-      : '',
-    formatGraphRelation('Calls', context.graph.calls),
-    formatCallSiteRelation('Call', context.graph.calls),
-    formatGraphRelation('Used by', context.graph.usedBy),
-    formatCallSiteRelation('Used by', context.graph.usedBy),
-    formatGraphRelation('Supertypes', context.graph.supertypes),
-    formatGraphRelation('Subtypes', context.graph.subtypes),
-    formatGraphRelation('Implements', context.graph.implements),
-    formatGraphRelation('Implemented by', context.graph.implementedBy),
-    `**Recommended next MCP calls:** ${context.nextCalls.map(call => `${call.tool} (${call.reason})`).join('; ')}`,
-    context.code ? `\`\`\`\n${context.code}\n\`\`\`` : '*(code not in index)*',
-  ].filter(Boolean).join('\n');
+  return renderSymbolText(projectRoot, graph, symbol, point);
 }
 
 async function enforceCognitionPipeline(projectRoot: string, qdrantUrl = 'http://localhost:6333'): Promise<{
@@ -592,7 +551,7 @@ function createMcpServer(): McpServer {
         sections.push('Symbols by page:');
         sections.push(...response.pagination.symbolIndexByPage.map(entry => `- page ${entry.page}: ${entry.symbols.join(', ') || '(none)'}`));
       }
-      sections.push(...renderCompactCallGraphLines(results));
+      sections.push(...response.pagination.callGraphPreviewLines);
       sections.push(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
       if (memoryFreshness.reasons.length > 0) {
         sections.push(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);
@@ -659,6 +618,10 @@ function createMcpServer(): McpServer {
         })
         .join('\n\n---\n\n');
       sections.push(output);
+      sections.push(`Results page ${response.pagination.page}/${response.pagination.totalPages} (page size ${response.pagination.pageSize}, total ${response.pagination.totalResults})`);
+      if (response.pagination.hasMore && response.pagination.nextPage) {
+        sections.push(`More context available: call query_project again with page=${response.pagination.nextPage} and pageSize=${response.pagination.pageSize}`);
+      }
       return { content: [{ type: 'text', text: sections.join('\n\n') }] };
     }
   );
@@ -2309,32 +2272,9 @@ function createMcpServer(): McpServer {
         return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
       }
 
-      // BFS expansion
-      const discovered = new Set<string>(seeds);
-      const frontier = new Set<string>(seeds);
-
-      for (let hop = 0; hop < hops; hop++) {
-        const next = new Set<string>();
-        for (const sym of frontier) {
-          if (direction === 'out' || direction === 'both') {
-            for (const callee of (graph.symbols[sym] ?? [])) {
-              if (!discovered.has(callee)) { discovered.add(callee); next.add(callee); }
-            }
-          }
-          if (direction === 'in' || direction === 'both') {
-            for (const caller of (graph.callers?.[sym] ?? [])) {
-              if (!discovered.has(caller)) { discovered.add(caller); next.add(caller); }
-            }
-          }
-        }
-        frontier.clear();
-        next.forEach(s => frontier.add(s));
-        if (frontier.size === 0) break;
-      }
-
-      // Cap at 60 symbols to keep response manageable
+      // BFS expansion (shared utility)
+      const { discovered, capped } = expandGraphBfs(graph, seeds, hops, direction);
       const symbolList = [...discovered].slice(0, 60);
-      const capped = discovered.size > 60;
 
       const qdrant = new QdrantClient({ url: qdrantUrl });
       const collection = await collectionNameAsync(root);

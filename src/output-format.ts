@@ -93,6 +93,7 @@ export interface QueryProjectResponseJson {
       page: number;
       symbols: string[];
     }>;
+    callGraphPreviewLines: string[];
     guidance: string;
   };
   resultCount: number;
@@ -281,6 +282,7 @@ export function serializeQueryProjectResponse(
       page: number;
       symbols: string[];
     }>;
+    callGraphPreviewLines: string[];
   }
 ): QueryProjectResponseJson {
   return {
