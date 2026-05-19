@@ -29,6 +29,7 @@ import {
 } from './project-memory.js';
 import { serializeQueryProjectResponse } from './output-format.js';
 import { buildProjectIntentSnapshot, renderProjectIntentSnapshot } from './project-intent.js';
+import { MissingCodeIndexError } from './retriever.js';
 
 function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
   return ranges
@@ -213,7 +214,17 @@ program
   .action(async (question: string, opts: { dir: string; format: 'text' | 'json'; mode: 'default' | 'architecture'; qdrant: string }) => {
     const root = path.resolve(opts.dir);
     const mode = opts.mode === 'architecture' ? 'architecture' : 'default';
-    const results = await queryProject(root, question, opts.qdrant, mode);
+    let results: RetrievedChunk[];
+    try {
+      results = await queryProject(root, question, opts.qdrant, mode);
+    } catch (error) {
+      if (error instanceof MissingCodeIndexError) {
+        console.log('No code index found for this project/branch yet.');
+        console.log(`Run this first: code-intel index "${root}" --qdrant "${opts.qdrant}"`);
+        return;
+      }
+      throw error;
+    }
     const memoryFreshness = await getProjectMemoryFreshnessAsync(root);
     if (!results.length) {
       console.log('No results found.');

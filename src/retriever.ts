@@ -52,6 +52,31 @@ export interface RetrievedChunk {
 
 export type RetrievalMode = 'default' | 'architecture';
 
+export class MissingCodeIndexError extends Error {
+  collection: string;
+  qdrantUrl: string;
+
+  constructor(collection: string, qdrantUrl: string) {
+    super(`Code index collection "${collection}" does not exist on ${qdrantUrl}`);
+    this.name = 'MissingCodeIndexError';
+    this.collection = collection;
+    this.qdrantUrl = qdrantUrl;
+  }
+}
+
+function isQdrantCollectionNotFound(error: unknown): boolean {
+  const candidate = error as {
+    status?: number;
+    message?: string;
+    data?: { status?: { error?: string } };
+  };
+  const detail = `${candidate.message ?? ''}\n${candidate.data?.status?.error ?? ''}`.toLowerCase();
+  return candidate.status === 404
+    && (detail.includes('collection')
+      || detail.includes('/collections/')
+      || detail.includes('not found'));
+}
+
 function tokenize(text: string | null | undefined): string[] {
   if (!text) return [];
   return text
@@ -260,11 +285,19 @@ export async function retrieve(
   const queryVec = await embedQuery(query);
 
   // 2. Search Qdrant for top 5 semantic matches
-  const hits = await qdrant.search(collection, {
-    vector: queryVec,
-    limit: 5,
-    with_payload: true,
-  });
+  let hits;
+  try {
+    hits = await qdrant.search(collection, {
+      vector: queryVec,
+      limit: 5,
+      with_payload: true,
+    });
+  } catch (error) {
+    if (isQdrantCollectionNotFound(error)) {
+      throw new MissingCodeIndexError(collection, qdrantUrl);
+    }
+    throw error;
+  }
 
   const results: RetrievedChunk[] = hits.map(h => ({
     file: h.payload!['file'] as string,
