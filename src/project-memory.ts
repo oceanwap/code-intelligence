@@ -1,6 +1,7 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import * as crypto from 'crypto';
 import * as path from 'path';
+import { mkdir } from 'node:fs/promises';
 import { buildDocumentEntriesAsync, type DocumentMemoryEntry } from './document-memory.js';
 import { extractSemanticTouch, prefersOldRevision } from './change-semantic.js';
 import { VECTOR_SIZE, embedQuery, embedTexts, scopedCollectionNameAsync } from './embedder.js';
@@ -209,6 +210,65 @@ function projectMemoryCacheFile(projectRoot: string): string {
     return path.join(getDataDir(projectRoot), PROJECT_MEMORY_CACHE_FILE);
 }
 
+function isFiniteVectorComponent(value: unknown): value is number {
+    return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isValidMemoryVector(vector: unknown): vector is number[] {
+    return Array.isArray(vector)
+        && vector.length === VECTOR_SIZE
+        && vector.every(isFiniteVectorComponent);
+}
+
+function hasPlainObjectShape(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function normalizeMemoryCacheEntries(rawCache: Record<string, unknown>): Record<string, MemoryCacheEntry> {
+    const normalized: Record<string, MemoryCacheEntry> = {};
+
+    for (const [id, value] of Object.entries(rawCache)) {
+        if (isValidMemoryVector(value)) {
+            normalized[id] = { fingerprint: '', vector: value };
+            continue;
+        }
+
+        if (!hasPlainObjectShape(value) || !isValidMemoryVector(value.vector)) {
+            continue;
+        }
+
+        normalized[id] = {
+            fingerprint: typeof value.fingerprint === 'string' ? value.fingerprint : '',
+            vector: value.vector,
+        };
+    }
+
+    return normalized;
+}
+
+function shouldRewriteMemoryCache(rawCache: Record<string, unknown>, normalizedCache: Record<string, MemoryCacheEntry>): boolean {
+    const rawEntries = Object.entries(rawCache);
+    if (rawEntries.length !== Object.keys(normalizedCache).length) return true;
+
+    for (const [id, value] of rawEntries) {
+        const normalized = normalizedCache[id];
+        if (!normalized) return true;
+        if (isValidMemoryVector(value)) return true;
+        if (!hasPlainObjectShape(value)) return true;
+        if (typeof value.fingerprint !== 'string') return true;
+        if (!isValidMemoryVector(value.vector)) return true;
+    }
+
+    return false;
+}
+
+export function readAnonymousVectorSize(vectors: unknown): number | null {
+    if (!hasPlainObjectShape(vectors)) return null;
+    return typeof vectors.size === 'number' && Number.isFinite(vectors.size)
+        ? vectors.size
+        : null;
+}
+
 async function memoryCollectionNameAsync(projectRoot: string): Promise<string> {
     return await scopedCollectionNameAsync(projectRoot, 'memory');
 }
@@ -238,32 +298,28 @@ async function saveMemorySnapshot(projectRoot: string, snapshot: ProjectMemorySn
 }
 
 async function loadMemoryCacheAsync(cacheFile: string): Promise<Record<string, MemoryCacheEntry>> {
-    let raw: Record<string, number[] | MemoryCacheEntry>;
+    let raw: unknown;
     try {
-        raw = JSON.parse(await Bun.file(cacheFile).text()) as Record<string, number[] | MemoryCacheEntry>;
+        raw = JSON.parse(await Bun.file(cacheFile).text()) as unknown;
     } catch {
         return {};
     }
 
-    const normalized: Record<string, MemoryCacheEntry> = {};
-    for (const [id, value] of Object.entries(raw)) {
-        if (Array.isArray(value)) {
-            normalized[id] = { fingerprint: '', vector: value };
-            continue;
-        }
+    if (!hasPlainObjectShape(raw)) {
+        await saveMemoryCache(cacheFile, {});
+        return {};
+    }
 
-        if (value && Array.isArray(value.vector)) {
-            normalized[id] = {
-                fingerprint: typeof value.fingerprint === 'string' ? value.fingerprint : '',
-                vector: value.vector,
-            };
-        }
+    const normalized = normalizeMemoryCacheEntries(raw);
+    if (shouldRewriteMemoryCache(raw, normalized)) {
+        await saveMemoryCache(cacheFile, normalized);
     }
 
     return normalized;
 }
 
 async function saveMemoryCache(cacheFile: string, cache: Record<string, MemoryCacheEntry>): Promise<void> {
+    await mkdir(path.dirname(cacheFile), { recursive: true });
     await Bun.write(cacheFile, JSON.stringify(cache));
 }
 
@@ -671,8 +727,8 @@ async function ensureMemoryCollection(projectRoot: string, qdrantUrl: string): P
 
     if (existing.collections.find(item => item.name === collection)) {
         const info = await qdrant.getCollection(collection);
-        const dim = (info.config?.params?.vectors as { size?: number } | undefined)?.size;
-        if (dim !== undefined && dim !== VECTOR_SIZE) {
+        const dim = readAnonymousVectorSize(info.config?.params?.vectors);
+        if (dim !== VECTOR_SIZE) {
             await qdrant.deleteCollection(collection);
             await qdrant.createCollection(collection, {
                 vectors: { size: VECTOR_SIZE, distance: 'Cosine' },
@@ -743,7 +799,7 @@ async function upsertMemoryEntries(
     const entriesToStore = needsFullSync ? entries : uncached;
     const points = entriesToStore.map(entry => ({
         id: memoryPointId(entry.id),
-        vector: cache[entry.id].vector,
+        vector: cache[entry.id]?.vector,
         payload: {
             entryId: entry.id,
             sha: entry.kind === 'change' ? entry.sha : entry.kind === 'bug' ? entry.fixedBySha : undefined,
@@ -765,6 +821,12 @@ async function upsertMemoryEntries(
             docType: entry.kind === 'document' ? entry.docType : undefined,
         },
     }));
+
+    for (const point of points) {
+        if (!isValidMemoryVector(point.vector)) {
+            throw new Error(`Missing or invalid memory embedding vector for entry ${point.payload.entryId as string}`);
+        }
+    }
 
     for (let index = 0; index < points.length; index += UPSERT_BATCH_SIZE) {
         await upsertWithRetry(qdrant, collection, points.slice(index, index + UPSERT_BATCH_SIZE));

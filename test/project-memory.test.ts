@@ -12,10 +12,13 @@ import {
     getProjectStatusAsync,
     getWhyChangedAsync,
     listRecentBugsAsync,
+    normalizeMemoryCacheEntries,
+    readAnonymousVectorSize,
     type BugMemoryEntry,
     type ChangeMemoryEntry,
     type ProjectMemoryEntry,
 } from '../src/project-memory.js';
+import { VECTOR_SIZE } from '../src/embedder.js';
 
 function makeTempDir(t: TestContext): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'code-intel-memory-test-'));
@@ -374,4 +377,26 @@ test('buildProjectMemoryEntries rebuilds stale noisy change entries instead of r
     assert.ok(rebuilt);
     assert.ok(!rebuilt.body.includes('Co-authored-by'));
     assert.ok(rebuilt.summary.includes('Detail: Handle TypeError when session state is missing'));
+});
+
+test('normalizeMemoryCacheEntries drops invalid vectors and preserves valid fingerprints', () => {
+    const validVector = Array.from({ length: VECTOR_SIZE }, (_, index) => index / 1000);
+    const normalized = normalizeMemoryCacheEntries({
+        valid: { fingerprint: 'keep-me', vector: validVector },
+        legacy: validVector,
+        wrongLength: { fingerprint: 'bad-length', vector: [1, 2, 3] },
+        nonFinite: { fingerprint: 'nan', vector: [...validVector.slice(0, VECTOR_SIZE - 1), Number.NaN] },
+        notAnObject: 'oops',
+    });
+
+    assert.deepEqual(Object.keys(normalized).sort(), ['legacy', 'valid']);
+    assert.equal(normalized.valid?.fingerprint, 'keep-me');
+    assert.equal(normalized.legacy?.fingerprint, '');
+    assert.equal(normalized.legacy?.vector.length, VECTOR_SIZE);
+});
+
+test('readAnonymousVectorSize accepts anonymous vectors and rejects named-vector configs', () => {
+    assert.equal(readAnonymousVectorSize({ size: VECTOR_SIZE, distance: 'Cosine' }), VECTOR_SIZE);
+    assert.equal(readAnonymousVectorSize({ default: { size: VECTOR_SIZE, distance: 'Cosine' } }), null);
+    assert.equal(readAnonymousVectorSize(null), null);
 });
