@@ -2,36 +2,20 @@ import { Project, SyntaxKind, Node, FunctionDeclaration, ArrowFunction, Function
 import * as path from 'path';
 import { createRequire } from 'module';
 import type { GitFilePatch } from './git.js';
+import { PhpNode, PhpParserEngine } from "./php-parser.js";
 
 type TsFnLike = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
 type SymbolKind = 'function' | 'class' | 'method';
 
 interface LineRange {
-    startLine: number;
-    endLine: number;
+  startLine: number;
+  endLine: number;
 }
-
 interface SymbolRange {
-    symbol: string;
-    type: SymbolKind;
-    startLine: number;
-    endLine: number;
-}
-
-interface PhpLoc {
-    start: { line: number };
-    end: { line: number };
-}
-
-interface PhpNode {
-    kind: string;
-    loc?: PhpLoc;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    [key: string]: any;
-}
-
-interface PhpEngine {
-    parseCode(code: string, filename: string): PhpNode;
+  symbol: string;
+  type: SymbolKind;
+  startLine: number;
+  endLine: number;
 }
 
 export interface SemanticTouch {
@@ -40,10 +24,6 @@ export interface SemanticTouch {
 }
 
 const require = createRequire(import.meta.url);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const phpParserPkg = require('php-parser') as any;
-const PhpParserEngine: new (opts: unknown) => PhpEngine =
-    phpParserPkg.Engine ?? phpParserPkg.default?.Engine ?? phpParserPkg;
 
 const TS_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx']);
 const PHP_EXTS = new Set(['.php']);
@@ -53,18 +33,18 @@ const tsProject = new Project({
     compilerOptions: { allowJs: true },
 });
 
-function makePhpParser(): PhpEngine {
-    return new PhpParserEngine({
-        parser: { extractDoc: false, suppressErrors: true },
-        ast: { withPositions: true },
-        lexer: { all_tokens: false },
-    });
+function makePhpParser() {
+  return new PhpParserEngine({
+    parser: { extractDoc: false, suppressErrors: true },
+    ast: { withPositions: true },
+    lexer: { all_tokens: false },
+  });
 }
 
 function phpNodeName(node: PhpNode | string | null | undefined): string | null {
     if (!node) return null;
     if (typeof node === 'string') return node;
-    if (node.kind === 'identifier' || node.kind === 'name') return node.name as string;
+    if (node.kind === "identifier" || node.kind === "name") return node.name;
     return null;
 }
 
@@ -194,7 +174,7 @@ function collectPhpSymbolRanges(filePath: string, source: string): SymbolRange[]
 
     for (const node of topLevel) {
         if (node.kind === 'namespace') {
-            const nsName = phpNodeName(node.name) ?? '';
+            const nsName = phpNodeName(node) ?? "";
             containers.push({ children: node.children ?? [], nsPrefix: nsName ? `${nsName}\\` : '' });
         } else {
             if (containers.length === 0 || containers[0].nsPrefix !== '') {

@@ -2,30 +2,10 @@
  * PHP call graph builder.
  * Extracts outbound calls and inbound callers for PHP functions/methods.
  */
-import * as path from 'path';
-import { createRequire } from 'module';
+import * as path from "path";
 import { walkFiles } from './indexer.js';
 import type { GraphCallSite, GraphData } from './graph.js';
-
-const require = createRequire(import.meta.url);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const phpParserPkg = require('php-parser') as any;
-const Engine: new (opts: unknown) => PhpEngine =
-  phpParserPkg.Engine ?? phpParserPkg.default?.Engine ?? phpParserPkg;
-
-interface Node {
-  kind: string;
-  loc?: {
-    start?: { line: number };
-    end?: { line: number };
-  };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: any;
-}
-
-interface PhpEngine {
-  parseCode(code: string, filename: string): Node;
-}
+import { PhpNode, PhpParserEngine } from "./php-parser.js";
 
 type TypeMembers = Record<string, Set<string>>;
 
@@ -54,10 +34,13 @@ function normalizePhpTypes(values: Array<string | null | undefined>, nsPrefix: s
   return [...refs];
 }
 
-function asPhpNodeList(value: unknown): Array<Node | string | null | undefined> {
-  if (Array.isArray(value)) return value as Array<Node | string | null | undefined>;
+function asPhpNodeList(
+  value: unknown,
+): Array<PhpNode | string | null | undefined> {
+  if (Array.isArray(value))
+    return value as Array<PhpNode | string | null | undefined>;
   if (value === null || value === undefined) return [];
-  return [value as Node | string | null | undefined];
+  return [value as PhpNode | string | null | undefined];
 }
 
 function registerSupertypes(graph: GraphData, typeName: string, supertypes: string[]): void {
@@ -83,52 +66,62 @@ function registerImplementation(graph: GraphData, baseSymbol: string, implementa
   addUnique(graph.implementedFrom, implementationSymbol, baseSymbol);
 }
 
-function makeParser(): PhpEngine {
-  return new Engine({
+function makeParser() {
+  return new PhpParserEngine({
     parser: { extractDoc: false, suppressErrors: true },
     ast: { withPositions: true },
     lexer: { all_tokens: false },
   });
 }
 
-function nodeName(n: Node | string | null | undefined): string | null {
+function nodeName(n: PhpNode | string | null | undefined): string | null {
   if (!n) return null;
-  if (typeof n === 'string') return n;
-  if (n.kind === 'identifier' || n.kind === 'name') return n.name as string;
+  if (typeof n === "string") return n;
+  if (n.kind === "identifier" || n.kind === "name") return n.name as string;
   return null;
 }
 
-function walk(node: Node, visitor: (n: Node) => void): void {
-  if (!node || typeof node !== 'object') return;
+function walk(node: PhpNode, visitor: (n: PhpNode) => void): void {
+  if (!node || typeof node !== "object") return;
   visitor(node);
   for (const val of Object.values(node)) {
-    if (Array.isArray(val)) val.forEach(v => walk(v as Node, visitor));
-    else if (val && typeof val === 'object' && 'kind' in (val as object)) walk(val as Node, visitor);
+    if (Array.isArray(val)) val.forEach((v) => walk(v as PhpNode, visitor));
+    else if (val && typeof val === "object" && "kind" in (val as object))
+      walk(val as PhpNode, visitor);
   }
 }
 
 /** Collect all call expressions within a subtree, returning callee callsite entries */
-function extractPhpCalls(node: Node, relPath: string): GraphCallSite[] {
+function extractPhpCalls(node: PhpNode, relPath: string): GraphCallSite[] {
   const calls: GraphCallSite[] = [];
-  walk(node, n => {
-    if (n.kind !== 'call') return;
-    const what = n.what as Node | undefined;
+  walk(node, (n) => {
+    if (n.kind !== "call") return;
+    const what = n.what as PhpNode | undefined;
     if (!what) return;
     const line = n.loc?.start?.line ?? what.loc?.start?.line ?? 1;
 
     // Plain function call: foo()
-    if (what.kind === 'identifier' || what.kind === 'name') {
+    if (what.kind === "identifier" || what.kind === "name") {
       const name = nodeName(what);
       if (name) calls.push({ symbol: name, file: relPath, line });
     }
 
     // Static call: ClassName::method()  or  self::method()
-    if (what.kind === 'staticlookup') {
+    if (what.kind === "staticlookup") {
       const className = nodeName(what.what);
       const methodName = nodeName(what.offset);
       if (methodName) {
-        if (className && className !== 'self' && className !== 'static' && className !== 'parent') {
-          calls.push({ symbol: `${className}::${methodName}`, file: relPath, line });
+        if (
+          className &&
+          className !== "self" &&
+          className !== "static" &&
+          className !== "parent"
+        ) {
+          calls.push({
+            symbol: `${className}::${methodName}`,
+            file: relPath,
+            line,
+          });
         } else {
           calls.push({ symbol: methodName, file: relPath, line });
         }
@@ -136,11 +129,14 @@ function extractPhpCalls(node: Node, relPath: string): GraphCallSite[] {
     }
 
     // Instance call: $this->method() or $obj->method()
-    if (what.kind === 'propertylookup') {
+    if (what.kind === "propertylookup") {
       const methodName = nodeName(what.offset);
-      const obj = what.what as Node | undefined;
+      const obj = what.what as PhpNode | undefined;
       if (methodName) {
-        if (obj?.kind === 'variable' && (obj.name === 'this' || obj.name === 'self')) {
+        if (
+          obj?.kind === "variable" &&
+          (obj.name === "this" || obj.name === "self")
+        ) {
           calls.push({ symbol: methodName, file: relPath, line }); // resolved further if we know the class name at call site
         } else {
           calls.push({ symbol: methodName, file: relPath, line });
@@ -171,7 +167,7 @@ export async function buildPhpGraphAsync(rootDir: string, graph: GraphData, opti
     }
 
     const parser = makeParser();
-    let ast: Node;
+    let ast: PhpNode;
     try {
       ast = parser.parseCode(src, relPath);
     } catch {
@@ -181,7 +177,7 @@ export async function buildPhpGraphAsync(rootDir: string, graph: GraphData, opti
     const fileImports: string[] = [];
     walk(ast, n => {
       if (n.kind === 'usegroup') {
-        const items: Node[] = n.items ?? [];
+        const items: PhpNode[] = n.items ?? [];
         for (const item of items) {
           if (item.name) fileImports.push(item.name as string);
         }
@@ -189,8 +185,9 @@ export async function buildPhpGraphAsync(rootDir: string, graph: GraphData, opti
     });
     graph.files[relPath] = fileImports;
 
-    const topLevel: Node[] = ast.kind === 'program' ? (ast.children ?? []) : [];
-    const containers: Array<{ children: Node[]; nsPrefix: string }> = [];
+    const topLevel: PhpNode[] =
+      ast.kind === "program" ? (ast.children ?? []) : [];
+    const containers: Array<{ children: PhpNode[]; nsPrefix: string }> = [];
 
     for (const n of topLevel) {
       if (n.kind === 'namespace') {
@@ -242,7 +239,7 @@ export async function buildPhpGraphAsync(rootDir: string, graph: GraphData, opti
           ], nsPrefix, fileImports);
           registerSupertypes(graph, fullClassName, directSupertypes);
 
-          const body: Node[] = n.body ?? [];
+          const body: PhpNode[] = n.body ?? [];
           typeMembers[fullClassName] = new Set(
             body
               .filter(member => member.kind === 'method')

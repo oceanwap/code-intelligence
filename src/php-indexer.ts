@@ -2,41 +2,14 @@
  * PHP AST indexer using php-parser (glayzzle).
  * Extracts functions, classes, and methods as CodeChunk entries.
  */
-import * as path from 'path';
-import { createRequire } from 'module';
+import * as path from "path";
 import type { CodeChunk } from './indexer.js';
 import { chunkId } from './indexer.js';
 import { walkFiles } from './indexer.js';
+import { PhpParserEngine, PhpNode } from "./php-parser.js";
 
-// php-parser is CJS; use createRequire so we stay ESM-compatible
-const require = createRequire(import.meta.url);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const phpParserPkg = require('php-parser') as any;
-const Engine: new (opts: unknown) => PhpEngine =
-  phpParserPkg.Engine ?? phpParserPkg.default?.Engine ?? phpParserPkg;
-
-// ---- Minimal type surface for php-parser AST nodes ----------------
-
-interface Loc {
-  start: { line: number; offset: number };
-  end: { line: number; offset: number };
-}
-
-interface Node {
-  kind: string;
-  loc?: Loc;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: any;
-}
-
-interface PhpEngine {
-  parseCode(code: string, filename: string): Node;
-}
-
-// -------------------------------------------------------------------
-
-function makeParser(): PhpEngine {
-  return new Engine({
+function makeParser() {
+  return new PhpParserEngine({
     parser: { extractDoc: true, suppressErrors: true },
     ast: { withPositions: true },
     lexer: { all_tokens: false },
@@ -44,10 +17,10 @@ function makeParser(): PhpEngine {
 }
 
 /** Extract the string name from an identifier or string AST node */
-function nodeName(n: Node | string | null | undefined): string | null {
+function nodeName(n: PhpNode | string | null | undefined): string | null {
   if (!n) return null;
-  if (typeof n === 'string') return n;
-  if (n.kind === 'identifier' || n.kind === 'name') return n.name as string;
+  if (typeof n === "string") return n;
+  if (n.kind === "identifier" || n.kind === "name") return n.name as string;
   return null;
 }
 
@@ -67,11 +40,11 @@ function walk(node: Node, visitor: (n: Node) => void): void {
 }
 
 /** Collect `use` imports from a program/namespace children list */
-function collectImports(children: Node[]): string[] {
+function collectImports(children: PhpNode[]): string[] {
   const imports: string[] = [];
   for (const n of children) {
-    if (n.kind === 'usegroup') {
-      const items: Node[] = n.items ?? [];
+    if (n.kind === "usegroup") {
+      const items: PhpNode[] = n.items ?? [];
       for (const item of items) {
         if (item.name) imports.push(item.name as string);
       }
@@ -100,7 +73,7 @@ export async function indexPhpFilesAsync(rootDir: string, options?: { includeFil
     const lines = src.split('\n');
     const parser = makeParser();
 
-    let ast: Node;
+    let ast: PhpNode;
     try {
       ast = parser.parseCode(src, relPath);
     } catch {
@@ -119,8 +92,9 @@ export async function indexPhpFilesAsync(rootDir: string, options?: { includeFil
     }
 
     // Flatten namespace wrappers so we handle namespaced and global code uniformly
-    const topLevel: Node[] = ast.kind === 'program' ? (ast.children ?? []) : [];
-    const containers: Array<{ children: Node[]; nsPrefix: string }> = [];
+    const topLevel: PhpNode[] =
+      ast.kind === "program" ? (ast.children ?? []) : [];
+    const containers: Array<{ children: PhpNode[]; nsPrefix: string }> = [];
 
     for (const n of topLevel) {
       if (n.kind === 'namespace') {
@@ -176,7 +150,7 @@ export async function indexPhpFilesAsync(rootDir: string, options?: { includeFil
           });
 
           // Methods
-          const body: Node[] = n.body ?? [];
+          const body: PhpNode[] = n.body ?? [];
           for (const member of body) {
             if (member.kind !== 'method') continue;
             const methodName = nodeName(member.name);
