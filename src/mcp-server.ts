@@ -627,6 +627,86 @@ function createMcpServer(): McpServer {
     }
   );
 
+  server.registerTool(
+    'smart_query',
+    {
+      description: 'Answer natural language questions about the codebase by retrieving relevant code context and synthesizing an answer via a local LLM (Ollama). Use this when you want a concise, synthesized explanation rather than raw search results. Requires Ollama to be running.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        question: z.string().describe('Natural language question about the codebase.'),
+        model: z.string().optional().describe('Ollama model name (default: qwen2.5:3b).'),
+        ollamaUrl: z.string().optional().describe('Ollama server URL (default: http://localhost:11434).'),
+        pageSize: z.number().int().min(1).max(8).optional().describe('Number of code chunks to retrieve (default: 4, max: 8).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, question, model = 'qwen2.5:3b', ollamaUrl = 'http://localhost:11434', pageSize = 4, qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      
+      // 1. Fetch code context via queryProjectPage (small pageSize to stay within token budget)
+      const response = await queryProjectPage(root, question, qdrantUrl, {
+        mode: 'default',
+        semanticThreshold: 0.5,
+        page: 1,
+        pageSize,
+      });
+      
+      const results = response.results;
+      
+      if (!results.length) {
+        return { content: [{ type: 'text', text: 'No relevant code found for this question.' }] };
+      }
+      
+      // 2. Build prompt
+      const contextParts = results.map(r => {
+        const lines = r.lineStart && r.lineEnd ? ` (lines ${r.lineStart}-${r.lineEnd})` : '';
+        return `File: ${r.file}${lines}\nSymbol: ${r.symbol} (${r.type})\n\n\`\`\`\n${r.code}\n\`\`\`\n`;
+      });
+      
+      const prompt = `You are a code intelligence assistant. Answer the user's question about the codebase using ONLY the provided code context. Be concise and accurate.\n\nQuestion: ${question}\n\nCode Context:\n\n${contextParts.join('\n---\n\n')}\n\nAnswer:`;
+      
+      // 3. Call Ollama
+      try {
+        const res = await fetch(`${ollamaUrl}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model,
+            prompt,
+            stream: false,
+          }),
+        });
+        
+        if (!res.ok) {
+          const errorText = await res.text().catch(() => 'Unknown error');
+          return {
+            content: [{ type: 'text', text: `Ollama request failed (${res.status}): ${errorText}\n\nHint: Make sure Ollama is running at ${ollamaUrl} and the model '${model}' is pulled.` }],
+            isError: true,
+          };
+        }
+        
+        const data = await res.json() as { response?: string; error?: string };
+        
+        if (data.error) {
+          return {
+            content: [{ type: 'text', text: `Ollama error: ${data.error}\n\nHint: Make sure the model '${model}' is available (run: ollama pull ${model})` }],
+            isError: true,
+          };
+        }
+        
+        const answer = data.response ?? 'No response from model.';
+        
+        return { content: [{ type: 'text', text: answer }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: 'text', text: `Failed to connect to Ollama at ${ollamaUrl}: ${message}\n\nHint: Make sure Ollama is running (ollama serve).` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // --- index_status ---
   server.registerTool(
     'index_status',
