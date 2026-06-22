@@ -44,7 +44,7 @@ import { whereShouldThisLive, renderPlacementOracle } from './placement-oracle.j
 import { validateIntent, renderIntentValidation } from './intent-validator.js';
 import { validateGeneratedCode, renderCodeValidation } from './code-validator.js';
 import { getModuleConventions, renderModuleConventions } from './module-conventions.js';
-import { smartQueryAsync } from './smart-query.js';
+import { smartQueryAsync, smartQueryStream, NoRelevantCodeError } from './smart-query.js';
 import { loadArchitectureAsync, refreshArchitectureAsync } from './cognition/architecture/storage.js';
 import { findDependencyPath, topUnstableModules } from './cognition/architecture/analyzer.js';
 import {
@@ -388,17 +388,23 @@ program
     const parsedPageSize = Number(opts.pageSize);
     const pageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(8, Math.floor(parsedPageSize))) : 4;
     try {
-      const { answer } = await smartQueryAsync(root, question, {
+      for await (const token of smartQueryStream(root, question, {
         model: opts.model,
         ollamaUrl: opts.ollamaUrl,
         pageSize,
         qdrantUrl: opts.qdrant,
-      });
-      console.log(answer);
+      })) {
+        process.stdout.write(token);
+      }
+      process.stdout.write('\n');
     } catch (error) {
       if (error instanceof MissingCodeIndexError) {
         console.log('No code index found for this project/branch yet.');
         console.log(`Run this first: code-intel index "${root}" --qdrant "${opts.qdrant}"`);
+        return;
+      }
+      if (error instanceof NoRelevantCodeError) {
+        console.log(error.message);
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
