@@ -367,13 +367,10 @@ export async function indexProject(
   // Ingest external scan data (CVEs, outdated packages, dead code, lint) into project memory
   let externalScanEntries = 0;
   await measure('ingesting-external-scans', async () => {
-    const { entries, warnings } = await ingestExternalScanDataAsync(root);
+    const { entries } = await ingestExternalScanDataAsync(root);
     if (entries.length > 0) {
       const result = await appendDocumentEntriesAsync(root, entries, qdrantUrl);
       externalScanEntries = result.appendedCount;
-    }
-    if (warnings.length > 0) {
-      console.warn('[index_project] External scan ingestion warnings:', warnings);
     }
   });
 

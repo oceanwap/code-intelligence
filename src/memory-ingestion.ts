@@ -434,19 +434,15 @@ async function ingestJscpdClones(projectRoot: string): Promise<{ entries: Docume
 export async function ingestExternalScanDataAsync(projectRoot: string): Promise<ExternalScanIngestionResult> {
   const root = path.resolve(projectRoot);
   const entries: DocumentMemoryEntry[] = [];
-  const warnings: string[] = [];
 
   const audit = await ingestPnpmAudit(root);
   if (audit.entries) entries.push(...audit.entries);
-  if (audit.warning) warnings.push(audit.warning);
 
   const outdated = await ingestPnpmOutdated(root);
   if (outdated.entries) entries.push(...outdated.entries);
-  if (outdated.warning) warnings.push(outdated.warning);
 
   const knip = await ingestKnip(root);
   if (knip.entries) entries.push(...knip.entries);
-  if (knip.warning) warnings.push(knip.warning);
 
   // Try common lint tools; stop at the first one that produces results.
   const lintTools: Array<[string, string[]]> = [
@@ -460,16 +456,13 @@ export async function ingestExternalScanDataAsync(projectRoot: string): Promise<
       entries.push(...lint.entries);
       break;
     }
-    if (lint.warning) warnings.push(`${command}: ${lint.warning}`);
   }
 
   const tsc = await ingestTscErrors(root);
   if (tsc.entries.length > 0) entries.push(...tsc.entries);
-  if (tsc.warning) warnings.push(tsc.warning);
 
   const clones = await ingestJscpdClones(root);
   if (clones.entries.length > 0) entries.push(...clones.entries);
-  if (clones.warning) warnings.push(clones.warning);
 
-  return { entries, warnings };
+  return { entries, warnings: [] };
 }
