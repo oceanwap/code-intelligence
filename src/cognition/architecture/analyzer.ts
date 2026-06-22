@@ -33,8 +33,14 @@ function inferModuleName(filePath: string): string {
 }
 
 function inferZone(moduleName: string): string {
+  const parts = moduleName.split('/').filter(Boolean);
+
+  // Monorepo packages each get their own zone (e.g. packages/admin, apps/web).
+  if (parts[0] === 'packages' || parts[0] === 'apps' || parts[0] === 'libs') {
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : parts[0];
+  }
+
   if (moduleName.startsWith('src/')) return 'application';
-  if (moduleName.includes('/src/')) return 'application';
   if (moduleName.startsWith('test/')) return 'quality';
   if (moduleName.endsWith('/test')) return 'quality';
   if (moduleName === 'docs') return 'knowledge';
@@ -140,6 +146,17 @@ export function analyzeArchitecture(graph: GraphData): ArchitectureSnapshot {
     for (const specifier of imports) {
       const to = buildImportDependency(file, specifier);
       if (!to) continue;
+      const key = `${from}=>${to}`;
+      const existing = dependencyMap.get(key) ?? { from, to, calls: 0, imports: 0, weight: 0 };
+      existing.imports += 1;
+      existing.weight += 0.5;
+      dependencyMap.set(key, existing);
+    }
+
+    // Use resolved workspace / tsconfig-path imports so cross-package edges are captured.
+    for (const resolvedFile of graph.resolvedImports?.[file] ?? []) {
+      const to = inferModuleName(resolvedFile);
+      if (to === from) continue;
       const key = `${from}=>${to}`;
       const existing = dependencyMap.get(key) ?? { from, to, calls: 0, imports: 0, weight: 0 };
       existing.imports += 1;
