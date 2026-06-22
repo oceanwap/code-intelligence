@@ -210,3 +210,18 @@ test('getRiskHotspots returns null for malformed graph instead of throwing', asy
   const result = await getRiskHotspots(dir, 5);
   assert.equal(result, null);
 });
+
+test('getRiskHotspots can sort by churn separately from connectivity', async t => {
+  const dir = makeTempDir(t);
+  writeFixtures(dir);
+
+  const churnResult = await getRiskHotspots(dir, { limit: 5, sortBy: 'churn' });
+  assert.ok(churnResult);
+  assert.equal(churnResult.symbols[0]?.symbol, 'Base.run');
+  assert.ok((churnResult.symbols[0]?.churnScore ?? 0) > (churnResult.symbols[0]?.connectivityScore ?? 0));
+
+  const connectivityResult = await getRiskHotspots(dir, { limit: 5, sortBy: 'connectivity' });
+  assert.ok(connectivityResult);
+  assert.equal(connectivityResult.symbols[0]?.symbol, 'Base.run');
+  assert.ok(connectivityResult.symbols.every(entry => entry.dependentsCount > 0));
+});

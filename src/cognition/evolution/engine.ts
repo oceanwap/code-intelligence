@@ -1,6 +1,6 @@
 import * as path from 'path';
-import { getDataDir } from '../../git.js';
-import { listRecentBugsAsync, listRecentChangesAsync } from '../../project-memory.js';
+import { getDataDir, getFileChurnAsync } from '../../git.js';
+import { listRecentBugsAsync } from '../../project-memory.js';
 import { loadArchitectureAsync, refreshArchitectureAsync } from '../architecture/storage.js';
 import { loadCognitionConfigAsync } from '../config.js';
 import { type ArchitectureSnapshot } from '../architecture/types.js';
@@ -61,13 +61,12 @@ function buildModuleMetrics(architecture: ArchitectureSnapshot): Map<string, { i
 }
 
 async function buildChurnMapAsync(projectRoot: string): Promise<Map<string, number>> {
-  const changes = await listRecentChangesAsync(projectRoot, { limit: 120 });
+  // Derive churn directly from git history so it survives reindexes and branch switches.
+  const fileChurn = await getFileChurnAsync(projectRoot, 200);
   const map = new Map<string, number>();
-  for (const change of changes) {
-    for (const file of change.files) {
-      const module = moduleFromFile(file);
-      map.set(module, (map.get(module) ?? 0) + 1);
-    }
+  for (const [file, count] of fileChurn.entries()) {
+    const module = moduleFromFile(file);
+    map.set(module, (map.get(module) ?? 0) + count);
   }
   return map;
 }

@@ -2074,15 +2074,17 @@ function createMcpServer(): McpServer {
         projectRoot: z.string().describe(PROJECT_ROOT_DESC),
         limit: z.number().int().min(1).max(25).optional().describe('Maximum number of symbol and file hotspots to return per section (default: 10).'),
         topic: z.string().optional().describe('Optional topic filter, for example "auth", "cache", or "graph".'),
+        sortBy: z.enum(['risk', 'churn', 'connectivity']).optional().describe("Sort hotspots by composite risk, raw churn, or graph connectivity. 'connectivity' automatically excludes sink nodes (inbound = 0)."),
+        excludeSinkNodes: z.boolean().optional().describe('Exclude symbols/files with zero inbound dependents from the results (default: true when sortBy=connectivity, false otherwise).'),
         format: z.enum(['text', 'json']).optional().describe('Output format. Use json for structured dependents, test-gap, and impact-surface metadata (default: text).'),
         qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
-    async ({ projectRoot, limit = 10, topic, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
+    async ({ projectRoot, limit = 10, topic, sortBy, excludeSinkNodes, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       await syncProjectMemory(root, qdrantUrl);
       try {
-        const hotspots = await getRiskHotspotsInsight(root, { limit, topic });
+        const hotspots = await getRiskHotspotsInsight(root, { limit, topic, sortBy, excludeSinkNodes });
         if (!hotspots) {
           return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
         }

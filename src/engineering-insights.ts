@@ -61,6 +61,8 @@ export interface SymbolHotspot {
   riskSummary: string;
   topics: string[];
   score: number;
+  churnScore: number;
+  connectivityScore: number;
 }
 
 export interface FileHotspot {
@@ -83,6 +85,8 @@ export interface FileHotspot {
   riskSummary: string;
   topics: string[];
   score: number;
+  churnScore: number;
+  connectivityScore: number;
 }
 
 export interface HotspotImpactSurface {
@@ -109,6 +113,8 @@ export interface RiskHotspotsResult {
 export interface RiskHotspotsOptions {
   limit?: number;
   topic?: string;
+  sortBy?: 'risk' | 'churn' | 'connectivity';
+  excludeSinkNodes?: boolean;
 }
 
 function isChangeEntry(entry: ProjectMemoryEntry): entry is ChangeMemoryEntry {
@@ -227,8 +233,14 @@ function impactedSymbolScore(entry: AffectedSymbolEntry): number {
   return strongestReason + entry.changeCount * 4 + entry.fixCount * 3 + entry.connectivity - entry.distance * 6;
 }
 
+function hotspotComponents(changeCount: number, fixCount: number, connectivity: number): { churnScore: number; connectivityScore: number; score: number } {
+  const churnScore = changeCount * 4 + fixCount * 3;
+  const connectivityScore = connectivity;
+  return { churnScore, connectivityScore, score: churnScore + connectivityScore };
+}
+
 function hotspotScore(changeCount: number, fixCount: number, connectivity: number): number {
-  return changeCount * 4 + fixCount * 3 + connectivity;
+  return hotspotComponents(changeCount, fixCount, connectivity).score;
 }
 
 function isTestPath(filePath: string | null | undefined): boolean {
@@ -501,15 +513,50 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
   }
   const graph = graphRaw;
 
-  const { limit: maxResults, topic } = typeof opts === 'number'
-    ? { limit: opts, topic: undefined as string | undefined }
-    : { limit: opts.limit ?? 10, topic: opts.topic?.toLowerCase() };
+  const {
+    limit: maxResults,
+    topic,
+    sortBy,
+    excludeSinkNodes,
+  } = typeof opts === 'number'
+    ? { limit: opts, topic: undefined as string | undefined, sortBy: 'risk' as const, excludeSinkNodes: false }
+    : {
+        limit: opts.limit ?? 10,
+        topic: opts.topic?.toLowerCase(),
+        sortBy: opts.sortBy ?? 'risk',
+        excludeSinkNodes: opts.excludeSinkNodes ?? (opts.sortBy === 'connectivity'),
+      };
   const entries = (await getProjectMemoryEntriesAsync(root))
     .filter(entry => !topic || (isChangeEntry(entry) && entry.topics.some(item => item.includes(topic))));
   const { changeEntries, symbolStats, fileStats } = buildChangeStats(entries);
+
+  const symbolsByFile = new Map<string, Set<string>>();
+  for (const [symbol, file] of Object.entries(graph.symbolFile)) {
+    if (!symbolsByFile.has(file)) symbolsByFile.set(file, new Set<string>());
+    symbolsByFile.get(file)!.add(symbol);
+  }
+
+  function symbolSortKey(entry: { score: number; churnScore: number; connectivityScore: number; dependentsCount: number; symbol: string }): number {
+    switch (sortBy) {
+      case 'churn': return entry.churnScore;
+      case 'connectivity': return entry.connectivityScore;
+      default: return entry.score;
+    }
+  }
+
+  function fileSortKey(entry: { score: number; churnScore: number; connectivityScore: number; dependentsCount: number; file: string }): number {
+    switch (sortBy) {
+      case 'churn': return entry.churnScore;
+      case 'connectivity': return entry.connectivityScore;
+      default: return entry.score;
+    }
+  }
+
   const rankedSymbolHotspots = [...symbolStats.entries()]
     .map(([symbol, stat]) => {
       const dependentsCount = (graph.callers[symbol] ?? []).length;
+      const connectivity = graphConnectivity(graph, symbol);
+      const { score, churnScore, connectivityScore } = hotspotComponents(stat.changeCount, stat.fixCount, connectivity);
       const tests = likelyTestCallers(graph, symbol);
       return {
         symbol,
@@ -518,28 +565,26 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
         fixCount: stat.fixCount,
         lastChanged: stat.lastChanged,
         lastChangeTitle: stat.lastChangeTitle,
-        connectivity: graphConnectivity(graph, symbol),
+        connectivity,
         dependentsCount,
         likelyTestCallers: tests,
         impactSurface: buildSymbolImpactSurface(graph, symbol),
         topics: toTopTopics(stat.topics),
-        score: hotspotScore(stat.changeCount, stat.fixCount, graphConnectivity(graph, symbol)),
+        score,
+        churnScore,
+        connectivityScore,
       };
     })
-    .sort((left, right) => right.score - left.score || left.symbol.localeCompare(right.symbol))
+    .filter(entry => !excludeSinkNodes || entry.dependentsCount > 0)
+    .sort((left, right) => symbolSortKey(right) - symbolSortKey(left) || left.symbol.localeCompare(right.symbol))
     .slice(0, maxResults);
-
-  const symbolsByFile = new Map<string, Set<string>>();
-  for (const [symbol, file] of Object.entries(graph.symbolFile)) {
-    if (!symbolsByFile.has(file)) symbolsByFile.set(file, new Set<string>());
-    symbolsByFile.get(file)!.add(symbol);
-  }
 
   const rankedFileHotspots = [...fileStats.entries()]
     .map(([file, stat]) => {
       const symbols = [...(symbolsByFile.get(file) ?? new Set<string>())];
       const connectivity = symbols.reduce((total, symbol) => total + graphConnectivity(graph, symbol), 0);
       const dependents = fileDependents(graph, symbols, file);
+      const { score, churnScore, connectivityScore } = hotspotComponents(stat.changeCount, stat.fixCount, connectivity);
       return {
         file,
         changeCount: stat.changeCount,
@@ -552,10 +597,13 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
         nearbyTests: nearbyTestFiles(file, graph),
         impactSurface: buildFileImpactSurface(graph, file, symbols),
         topics: toTopTopics(stat.topics),
-        score: hotspotScore(stat.changeCount, stat.fixCount, connectivity),
+        score,
+        churnScore,
+        connectivityScore,
       };
     })
-    .sort((left, right) => right.score - left.score || left.file.localeCompare(right.file))
+    .filter(entry => !excludeSinkNodes || entry.dependentsCount > 0)
+    .sort((left, right) => fileSortKey(right) - fileSortKey(left) || left.file.localeCompare(right.file))
     .slice(0, maxResults);
 
   const symbolHotspots: SymbolHotspot[] = await Promise.all(rankedSymbolHotspots.map(async entry => {
