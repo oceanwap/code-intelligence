@@ -58,9 +58,56 @@ interface WalkFilters {
 const walkFilterCache = new Map<string, WalkFilters>();
 
 export function stripJsonComments(text: string): string {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/^\s*\/\/.*$/gm, '');
+  let result = '';
+  let i = 0;
+  let inString = false;
+  let escaped = false;
+
+  while (i < text.length) {
+    const char = text[i];
+    const next = text[i + 1];
+
+    if (inString) {
+      if (escaped) {
+        result += char;
+        escaped = false;
+      } else if (char === '\\') {
+        result += char;
+        escaped = true;
+      } else if (char === '"') {
+        result += char;
+        inString = false;
+      } else {
+        result += char;
+      }
+      i++;
+      continue;
+    }
+
+    if (char === '"') {
+      result += char;
+      inString = true;
+      i++;
+      continue;
+    }
+
+    if (char === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') i++;
+      continue;
+    }
+
+    if (char === '/' && next === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+
+    result += char;
+    i++;
+  }
+
+  return result;
 }
 
 function escapeRegex(value: string): string {
