@@ -8,6 +8,7 @@ import {
   buildFeatureBrief,
   renderFeatureBrief,
 } from './feature-knowledge.js';
+import { smartQueryAsync } from './smart-query.js';
 import {
   getAffectedSymbols as getAffectedSymbolsInsight,
   getRiskHotspots as getRiskHotspotsInsight,
@@ -681,65 +682,19 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, question, model = 'qwen2.5:3b', ollamaUrl = 'http://localhost:11434', pageSize = 4, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      
-      // 1. Fetch code context via queryProjectPage (small pageSize to stay within token budget)
-      const response = await queryProjectPage(root, question, qdrantUrl, {
-        mode: 'default',
-        semanticThreshold: 0.5,
-        page: 1,
-        pageSize,
-      });
-      
-      const results = response.results;
-      
-      if (!results.length) {
-        return { content: [{ type: 'text', text: 'No relevant code found for this question.' }] };
-      }
-      
-      // 2. Build prompt
-      const contextParts = results.map(r => {
-        const lines = r.lineStart && r.lineEnd ? ` (lines ${r.lineStart}-${r.lineEnd})` : '';
-        return `File: ${r.file}${lines}\nSymbol: ${r.symbol} (${r.type})\n\n\`\`\`\n${r.code}\n\`\`\`\n`;
-      });
-      
-      const prompt = `You are a code intelligence assistant. Answer the user's question about the codebase using ONLY the provided code context. Be concise and accurate.\n\nQuestion: ${question}\n\nCode Context:\n\n${contextParts.join('\n---\n\n')}\n\nAnswer:`;
-      
-      // 3. Call Ollama
+
       try {
-        const res = await fetch(`${ollamaUrl}/api/generate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            prompt,
-            stream: false,
-          }),
+        const { answer } = await smartQueryAsync(root, question, {
+          model,
+          ollamaUrl,
+          pageSize,
+          qdrantUrl,
         });
-        
-        if (!res.ok) {
-          const errorText = await res.text().catch(() => 'Unknown error');
-          return {
-            content: [{ type: 'text', text: `Ollama request failed (${res.status}): ${errorText}\n\nHint: Make sure Ollama is running at ${ollamaUrl} and the model '${model}' is pulled.` }],
-            isError: true,
-          };
-        }
-        
-        const data = await res.json() as { response?: string; error?: string };
-        
-        if (data.error) {
-          return {
-            content: [{ type: 'text', text: `Ollama error: ${data.error}\n\nHint: Make sure the model '${model}' is available (run: ollama pull ${model})` }],
-            isError: true,
-          };
-        }
-        
-        const answer = data.response ?? 'No response from model.';
-        
         return { content: [{ type: 'text', text: answer }] };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return {
-          content: [{ type: 'text', text: `Failed to connect to Ollama at ${ollamaUrl}: ${message}\n\nHint: Make sure Ollama is running (ollama serve).` }],
+          content: [{ type: 'text', text: `${message}\n\nHint: Make sure Ollama is running (ollama serve) and the model '${model}' is pulled.` }],
           isError: true,
         };
       }

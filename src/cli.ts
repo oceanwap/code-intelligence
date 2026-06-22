@@ -44,6 +44,7 @@ import { whereShouldThisLive, renderPlacementOracle } from './placement-oracle.j
 import { validateIntent, renderIntentValidation } from './intent-validator.js';
 import { validateGeneratedCode, renderCodeValidation } from './code-validator.js';
 import { getModuleConventions, renderModuleConventions } from './module-conventions.js';
+import { smartQueryAsync } from './smart-query.js';
 import { loadArchitectureAsync, refreshArchitectureAsync } from './cognition/architecture/storage.js';
 import { findDependencyPath, topUnstableModules } from './cognition/architecture/analyzer.js';
 import {
@@ -371,6 +372,38 @@ program
       if (pagination.hasMore && pagination.nextPage) {
         console.log(`More context available: rerun with --page ${pagination.nextPage} --page-size ${pagination.pageSize}`);
       }
+    }
+  });
+
+program
+  .command('smart-query <question>')
+  .description('Answer a natural language question about the codebase via retrieval + local LLM (Ollama)')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--model <model>', 'Ollama model name', 'qwen2.5:3b')
+  .option('--ollama-url <url>', 'Ollama server URL', 'http://localhost:11434')
+  .option('--page-size <n>', 'Number of code chunks to retrieve (1..8)', '4')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .action(async (question: string, opts: { dir: string; model: string; ollamaUrl: string; pageSize: string; qdrant: string }) => {
+    const root = path.resolve(opts.dir);
+    const parsedPageSize = Number(opts.pageSize);
+    const pageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(8, Math.floor(parsedPageSize))) : 4;
+    try {
+      const { answer } = await smartQueryAsync(root, question, {
+        model: opts.model,
+        ollamaUrl: opts.ollamaUrl,
+        pageSize,
+        qdrantUrl: opts.qdrant,
+      });
+      console.log(answer);
+    } catch (error) {
+      if (error instanceof MissingCodeIndexError) {
+        console.log('No code index found for this project/branch yet.');
+        console.log(`Run this first: code-intel index "${root}" --qdrant "${opts.qdrant}"`);
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(message);
+      process.exitCode = 1;
     }
   });
 
