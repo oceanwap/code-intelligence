@@ -93,7 +93,17 @@ function isHighValuePath(relPath: string): boolean {
     || base === 'index.ts'
     || base === 'main.ts'
     || base === 'server.ts'
-    || normalized.startsWith('src/');
+    || normalized.startsWith('src/')
+    || normalized.startsWith('packages/types/src/');
+}
+
+function isForceIncludedPath(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, '/').toLowerCase();
+  if (normalized.endsWith('.resource.ts')) return true;
+  if (normalized.startsWith('packages/types/src/') && normalized.endsWith('.ts')) return true;
+  const ext = path.extname(normalized);
+  if (ext === '.tsx' && !isLowSignalPath(normalized)) return true;
+  return false;
 }
 
 async function fileSize(absPath: string): Promise<number> {
@@ -166,6 +176,10 @@ async function buildFastCandidateSet(projectRoot: string, churnMap: Map<string, 
 
   for (const file of scored) {
     if (isHighValuePath(file.relPath)) picked.add(file.relPath);
+  }
+
+  for (const file of scored) {
+    if (isForceIncludedPath(file.relPath)) picked.add(file.relPath);
   }
 
   const topChurnFiles = [...churnMap.entries()]

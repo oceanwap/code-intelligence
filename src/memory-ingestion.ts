@@ -45,6 +45,32 @@ async function runJsonTool(
   }
 }
 
+async function runTextTool(
+  projectRoot: string,
+  command: string,
+  args: string[],
+  env?: Record<string, string>
+): Promise<{ stdout: string; stderr: string; exitCode: number; warning?: string }> {
+  try {
+    const proc = Bun.spawn([command, ...args], {
+      cwd: projectRoot,
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, ...env },
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { stdout, stderr, exitCode };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { stdout: '', stderr: '', exitCode: 1, warning: `${command} failed: ${message}` };
+  }
+}
+
 function idForScan(projectRoot: string, scanType: string, contentSeed: string): string {
   const hash = crypto.createHash('sha256').update(`${scanType}\n${contentSeed}`).digest('hex').slice(0, 16);
   return `scan:${scanType}:${hash}`;
@@ -79,6 +105,15 @@ function buildScanEntry(
   };
 }
 
+function fileExistsAsync(absPath: string): Promise<boolean> {
+  return Bun.file(absPath).exists();
+}
+
+function truncate(value: unknown, maxLength: number): string {
+  const text = String(value ?? '');
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
 async function ingestPnpmAudit(projectRoot: string): Promise<ToolRunResult & { entries?: DocumentMemoryEntry[] }> {
   const result = await runJsonTool(projectRoot, 'pnpm', ['audit', '--json']);
   if (!result.output || typeof result.output !== 'object') {
@@ -87,54 +122,51 @@ async function ingestPnpmAudit(projectRoot: string): Promise<ToolRunResult & { e
 
   const data = result.output as Record<string, unknown>;
   const advisories = (data.advisories ?? {}) as Record<string, unknown>;
-  const metadata = (data.metadata ?? {}) as Record<string, unknown>;
 
-  const findings: string[] = [];
-  let critical = 0;
-  let high = 0;
-  let moderate = 0;
-  let low = 0;
-
+  const entries: DocumentMemoryEntry[] = [];
   for (const [id, advisory] of Object.entries(advisories)) {
     const adv = advisory as Record<string, unknown>;
     const severity = String(adv.severity ?? 'unknown');
     const title = String(adv.title ?? id);
     const moduleName = String(adv.module_name ?? '?');
-    const overview = String(adv.overview ?? '').slice(0, 200);
+    const overview = truncate(adv.overview, 240);
     const patchedVersions = String(adv.patched_versions ?? 'unknown');
-    const recommendation = String(adv.recommendation ?? '').slice(0, 200);
+    const vulnerableVersions = String(adv.vulnerable_versions ?? 'unknown');
+    const ghsa = Array.isArray(adv.github_advisory_id)
+      ? adv.github_advisory_id.join(', ')
+      : String(adv.github_advisory_id ?? '');
+    const cves = Array.isArray(adv.cves) ? (adv.cves as string[]).join(', ') : String(adv.cves ?? '');
+    const paths = Array.isArray(adv.findings)
+      ? (adv.findings as Array<{ paths?: string[] }>).flatMap(f => f.paths ?? []).slice(0, 5)
+      : [];
 
-    switch (severity) {
-      case 'critical': critical++; break;
-      case 'high': high++; break;
-      case 'moderate': moderate++; break;
-      case 'low': low++; break;
-    }
+    const tags = ['security', 'cve', 'vulnerability', 'audit', 'pnpm', moduleName, severity];
+    if (ghsa) tags.push(ghsa);
+    if (cves) tags.push(...cves.split(', '));
 
-    findings.push(`- [${severity.toUpperCase()}] ${moduleName}: ${title} (patched: ${patchedVersions})`);
-    if (overview) findings.push(`  ${overview}`);
-    if (recommendation) findings.push(`  ${recommendation}`);
+    const bodyLines = [
+      `Package: ${moduleName}`,
+      `Severity: ${severity}`,
+      ghsa ? `GHSA: ${ghsa}` : '',
+      cves ? `CVEs: ${cves}` : '',
+      `Vulnerable: ${vulnerableVersions}`,
+      `Patched: ${patchedVersions}`,
+      overview ? `Overview: ${overview}` : '',
+      paths.length > 0 ? `Paths: ${paths.join(', ')}` : '',
+    ].filter(Boolean);
+
+    entries.push(buildScanEntry(
+      projectRoot,
+      'pnpm-audit',
+      `[${severity.toUpperCase()}] ${moduleName}: ${title}`,
+      bodyLines.join('\n'),
+      `Security advisory for ${moduleName} (${severity}).`,
+      [...new Set(tags)],
+      paths.length > 0 ? paths : ['package.json'],
+    ));
   }
 
-  const vulnerabilitiesMeta = metadata.vulnerabilities as Record<string, unknown> | undefined;
-  const totalVulnerabilities = Number(vulnerabilitiesMeta?.total ?? findings.length);
-  if (findings.length === 0 && totalVulnerabilities === 0) {
-    return { output: result.output, entries: [] };
-  }
-
-  const summary = `pnpm audit found ${totalVulnerabilities} vulnerabilities (critical ${critical}, high ${high}, moderate ${moderate}, low ${low}).`;
-  const body = [summary, '', ...findings.slice(0, 200)].join('\n');
-  const entry = buildScanEntry(
-    projectRoot,
-    'pnpm-audit',
-    `Security audit: ${totalVulnerabilities} vulnerabilities`,
-    body,
-    summary,
-    ['security', 'cve', 'vulnerability', 'audit', 'pnpm'],
-    ['package.json']
-  );
-
-  return { output: result.output, entries: [entry] };
+  return { output: result.output, entries };
 }
 
 async function ingestPnpmOutdated(projectRoot: string): Promise<ToolRunResult & { entries?: DocumentMemoryEntry[] }> {
@@ -149,27 +181,31 @@ async function ingestPnpmOutdated(projectRoot: string): Promise<ToolRunResult & 
     return { output: result.output, entries: [] };
   }
 
-  const findings: string[] = [];
+  const entries: DocumentMemoryEntry[] = [];
   for (const [name, info] of packages) {
     const pkg = info as Record<string, unknown>;
     const current = String(pkg.current ?? '?');
     const latest = String(pkg.latest ?? '?');
     const wanted = String(pkg.wanted ?? latest);
-    findings.push(`- ${name}: ${current} → latest ${latest}${wanted !== latest ? ` (wanted ${wanted})` : ''}`);
+    const body = [
+      `Package: ${name}`,
+      `Current: ${current}`,
+      `Wanted: ${wanted}`,
+      `Latest: ${latest}`,
+    ].join('\n');
+
+    entries.push(buildScanEntry(
+      projectRoot,
+      'pnpm-outdated',
+      `Outdated package: ${name}`,
+      body,
+      `${name} is at ${current}; latest is ${latest}.`,
+      ['dependencies', 'outdated', 'versions', 'pnpm', name],
+      ['package.json'],
+    ));
   }
 
-  const summary = `${packages.length} outdated package(s) tracked by pnpm outdated.`;
-  const entry = buildScanEntry(
-    projectRoot,
-    'pnpm-outdated',
-    `Outdated packages: ${packages.length}`,
-    [summary, '', ...findings.slice(0, 200)].join('\n'),
-    summary,
-    ['dependencies', 'outdated', 'versions', 'pnpm'],
-    ['package.json']
-  );
-
-  return { output: result.output, entries: [entry] };
+  return { output: result.output, entries };
 }
 
 async function ingestKnip(projectRoot: string): Promise<ToolRunResult & { entries?: DocumentMemoryEntry[] }> {
@@ -278,33 +314,121 @@ async function ingestLintJson(projectRoot: string, command: string, args: string
     return { output: result.output, entries: [] };
   }
 
-  const byFile = new Map<string, LintFinding[]>();
-  for (const finding of findings) {
+  const entries: DocumentMemoryEntry[] = [];
+  for (const finding of findings.slice(0, 200)) {
     const file = finding.file ?? 'unknown';
-    if (!byFile.has(file)) byFile.set(file, []);
-    byFile.get(file)!.push(finding);
+    const rule = finding.rule ?? 'unknown';
+    const line = finding.line ?? 0;
+    const message = finding.message ?? '';
+    entries.push(buildScanEntry(
+      projectRoot,
+      `${command}-lint`,
+      `${rule} at ${file}:${line}`,
+      `${finding.severity?.toUpperCase() ?? 'WARN'}:${line} ${rule} — ${message}`,
+      `${rule}: ${message}`,
+      ['lint', 'complexity', command, rule, ...(file !== 'unknown' ? [file] : [])],
+      file !== 'unknown' ? [file] : [],
+    ));
   }
 
-  const lines: string[] = [];
-  for (const [file, fileFindings] of byFile) {
-    lines.push(`- ${file}`);
-    for (const finding of fileFindings.slice(0, 20)) {
-      lines.push(`  ${finding.severity?.toUpperCase() ?? 'WARN'}:${finding.line ?? '?'} ${finding.rule} — ${finding.message}`);
-    }
+  return { output: result.output, entries };
+}
+
+interface TscError {
+  file: string;
+  line: number;
+  code: string;
+  message: string;
+}
+
+async function ingestTscErrors(projectRoot: string): Promise<{ entries: DocumentMemoryEntry[]; warning?: string }> {
+  const tsconfigPath = path.join(projectRoot, 'tsconfig.json');
+  if (!(await fileExistsAsync(tsconfigPath))) {
+    return { entries: [], warning: 'tsconfig.json not found; skipping tsc error ingestion' };
   }
 
-  const summary = `${command} reported ${findings.length} lint/complexity finding(s) across ${byFile.size} file(s).`;
-  const entry = buildScanEntry(
-    projectRoot,
-    `${command}-lint`,
-    `Lint/complexity report: ${findings.length} findings`,
-    [summary, '', ...lines.slice(0, 300)].join('\n'),
-    summary,
-    ['lint', 'complexity', command, 'code-quality'],
-    [...byFile.keys()].slice(0, 20)
-  );
+  const { stdout, exitCode, warning } = await runTextTool(projectRoot, 'bunx', ['tsc', '--noEmit', '--pretty', 'false', '--noErrorTruncation']);
+  if (warning) {
+    return { entries: [], warning };
+  }
 
-  return { output: result.output, entries: [entry] };
+  const errors: TscError[] = [];
+  // Parse lines like: src/foo.ts(12,34): error TS2339: Property 'x' does not exist on type 'Y'.
+  const pattern = /^(.+)\((\d+),\d+\):\s*error\s+(TS\d+):\s*(.+)$/;
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trim();
+    const match = pattern.exec(line);
+    if (!match) continue;
+    const [, filePath, lineNo, code, message] = match;
+    errors.push({ file: filePath, line: Number(lineNo), code, message: message.trim() });
+  }
+
+  // tsc exits 0 when there are no errors, 2 when there are errors.
+  if (exitCode === 0 && errors.length === 0) {
+    return { entries: [] };
+  }
+
+  const entries: DocumentMemoryEntry[] = [];
+  for (const error of errors.slice(0, 200)) {
+    entries.push(buildScanEntry(
+      projectRoot,
+      'tsc-error',
+      `${error.code} at ${error.file}:${error.line}`,
+      `${error.code}: ${error.message}`,
+      `TypeScript error ${error.code}: ${error.message}`,
+      ['type-error', error.code, error.file],
+      [error.file],
+      'note',
+    ));
+  }
+
+  return { entries };
+}
+
+interface JscpdClone {
+  format: string;
+  lines: number;
+  tokens: number;
+  files: Array<{ path: string; start: number; end: number; line?: number; lines?: number }>;
+}
+
+async function ingestJscpdClones(projectRoot: string): Promise<{ entries: DocumentMemoryEntry[]; warning?: string }> {
+  const result = await runJsonTool(projectRoot, 'bunx', ['jscpd', '--reporters', 'json', '.']);
+  if (!result.output || typeof result.output !== 'object') {
+    return { entries: [], warning: result.warning ?? 'jscpd produced no JSON output' };
+  }
+
+  const data = result.output as Record<string, unknown>;
+  const duplicates = (data.duplicates ?? []) as JscpdClone[];
+  if (duplicates.length === 0) {
+    return { entries: [] };
+  }
+
+  const entries: DocumentMemoryEntry[] = [];
+  for (const duplicate of duplicates.slice(0, 100)) {
+    const files = duplicate.files.map(f => f.path);
+    const lines = duplicate.files.map(f => `${f.path}:${f.start ?? f.line ?? 0}`);
+    const contentSeed = files.join(':') + duplicate.lines;
+    entries.push({
+      id: idForScan(projectRoot, 'jscpd-clone', contentSeed),
+      kind: 'document',
+      timestamp: new Date().toISOString(),
+      title: `Copy-paste: ${duplicate.lines} lines across ${files.length} files`,
+      body: `Clone group of ${duplicate.lines} lines / ${duplicate.tokens} tokens:\n${lines.join('\n')}`,
+      summary: `Duplicate code block of ${duplicate.lines} lines in ${files.join(', ')}.`,
+      changeType: 'docs',
+      topics: ['clone', 'duplication', 'jscpd', ...files.map(f => path.basename(f, path.extname(f)))],
+      files,
+      symbols: [],
+      impacts: [],
+      path: 'jscpd-clone',
+      docType: 'note',
+      section: 'jscpd-clone',
+      sourceMtimeMs: Date.now(),
+    });
+  }
+
+  return { entries };
 }
 
 export async function ingestExternalScanDataAsync(projectRoot: string): Promise<ExternalScanIngestionResult> {
@@ -338,6 +462,14 @@ export async function ingestExternalScanDataAsync(projectRoot: string): Promise<
     }
     if (lint.warning) warnings.push(`${command}: ${lint.warning}`);
   }
+
+  const tsc = await ingestTscErrors(root);
+  if (tsc.entries.length > 0) entries.push(...tsc.entries);
+  if (tsc.warning) warnings.push(tsc.warning);
+
+  const clones = await ingestJscpdClones(root);
+  if (clones.entries.length > 0) entries.push(...clones.entries);
+  if (clones.warning) warnings.push(clones.warning);
 
   return { entries, warnings };
 }

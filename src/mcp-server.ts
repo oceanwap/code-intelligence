@@ -401,6 +401,26 @@ async function checkQdrantHealthAsync(qdrantUrl: string): Promise<{ status: 'hea
   }
 }
 
+function isQdrantUnavailableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return message.includes('fetch failed')
+    || message.includes('econnrefused')
+    || message.includes('connectionrefused')
+    || message.includes('unreachable')
+    || message.includes('connect')
+    || message.includes('qdrant')
+    || message.includes('collection')
+    || message.includes('not found');
+}
+
+function qdrantUnavailableResponse(qdrantUrl: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+  return {
+    content: [{ type: 'text', text: `Qdrant backend unavailable at ${qdrantUrl}` }],
+    isError: true,
+  };
+}
+
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
   attachToolLogging(server);
@@ -512,132 +532,137 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, question, mode = 'default', semanticThreshold = 0.5, page = 1, pageSize = 6, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const pipeline = await enforceCognitionPipeline(root, qdrantUrl);
-      
-      // Check constraint violations and show as warning (always return results)
-      const config = await loadCognitionConfigAsync(root);
-      let violationWarning = '';
-      if (config.policy.hardPolicyEnabled && config.policy.blockOnSeverity !== 'none') {
-        const violations = await listConstraintViolationsAsync(root);
-        const severityOrder = { high: 3, medium: 2, low: 1, none: 0 };
-        const blockThreshold = severityOrder[config.policy.blockOnSeverity];
-        const blockingViolations = violations.filter(v => severityOrder[v.severity] >= blockThreshold);
-        
-        if (blockingViolations.length > 0) {
-          violationWarning = `⚠️  CONSTRAINT VIOLATIONS (severity >= ${config.policy.blockOnSeverity}):\n${blockingViolations.map(v => `  - ${v.rule}: ${v.details} (in modules: ${v.modules.join(', ')})`).join('\n')}\n`;
-        }
-      }
-      
-      const response = await queryProjectPage(root, question, qdrantUrl, {
-        mode,
-        semanticThreshold,
-        page,
-        pageSize,
-      });
-      let results = response.results;
-      results = await rerankByAttentionAsync(root, results);
-      const memoryFreshness = await getProjectMemoryFreshnessAsync(root);
-      const structure = await loadStructureAsync(root);
-      await recordAttentionUsageAsync(root, {
-        tool: 'query_project',
-        symbols: results.map(result => result.symbol).slice(0, 10),
-        modules: results
-          .map(result => structure?.symbolToModule[result.symbol])
-          .filter((value): value is string => typeof value === 'string')
-          .slice(0, 10),
-      });
+      try {
+        const pipeline = await enforceCognitionPipeline(root, qdrantUrl);
 
-      if (!results.length) {
-        return { content: [{ type: 'text', text: 'No results found.' }] };
-      }
-      if (format === 'json') {
-        return { content: [{ type: 'text', text: JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness, response.pagination), null, 2) }] };
-      }
-      const sections = [];
-      if (violationWarning) {
-        sections.push(violationWarning);
-      }
-      sections.push(`Pipeline enforced: structure modules ${pipeline.structureModules}, critical attention ${pipeline.attentionCritical}, constraint violations ${pipeline.constraintViolations}`);
-      sections.push(`Results page ${response.pagination.page}/${response.pagination.totalPages} (page size ${response.pagination.pageSize}, total ${response.pagination.totalResults})`);
-      if (response.pagination.hasMore && response.pagination.nextPage) {
-        sections.push(`More context available: call query_project again with page=${response.pagination.nextPage} and pageSize=${response.pagination.pageSize}`);
-      }
-      if (response.pagination.symbolIndexByPage.length > 0) {
-        sections.push('Symbols by page:');
-        sections.push(...response.pagination.symbolIndexByPage.map(entry => `- page ${entry.page}: ${entry.symbols.join(', ') || '(none)'}`));
-      }
-      sections.push(...response.pagination.callGraphPreviewLines);
-      sections.push(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
-      if (memoryFreshness.reasons.length > 0) {
-        sections.push(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);
-      }
-      if (mode === 'architecture') {
-        const snapshot = await buildProjectIntentSnapshot(root);
-        if (snapshot) {
-          const overviewClaims = snapshot.claims
-            .filter(claim => claim.category === 'architecture' || claim.category === 'patterns' || claim.category === 'entrypoints')
-            .slice(0, 6)
-            .map(claim => `- [${claim.evidenceTier}] ${claim.statement}`);
-          if (overviewClaims.length > 0) {
-            sections.push('Architecture overview:');
-            sections.push(...overviewClaims);
+        // Check constraint violations and show as warning (always return results)
+        const config = await loadCognitionConfigAsync(root);
+        let violationWarning = '';
+        if (config.policy.hardPolicyEnabled && config.policy.blockOnSeverity !== 'none') {
+          const violations = await listConstraintViolationsAsync(root);
+          const severityOrder = { high: 3, medium: 2, low: 1, none: 0 };
+          const blockThreshold = severityOrder[config.policy.blockOnSeverity];
+          const blockingViolations = violations.filter(v => severityOrder[v.severity] >= blockThreshold);
+
+          if (blockingViolations.length > 0) {
+            violationWarning = `⚠️  CONSTRAINT VIOLATIONS (severity >= ${config.policy.blockOnSeverity}):\n${blockingViolations.map(v => `  - ${v.rule}: ${v.details} (in modules: ${v.modules.join(', ')})`).join('\n')}\n`;
           }
         }
+
+        const response = await queryProjectPage(root, question, qdrantUrl, {
+          mode,
+          semanticThreshold,
+          page,
+          pageSize,
+        });
+        let results = response.results;
+        results = await rerankByAttentionAsync(root, results);
+        const memoryFreshness = await getProjectMemoryFreshnessAsync(root);
+        const structure = await loadStructureAsync(root);
+        await recordAttentionUsageAsync(root, {
+          tool: 'query_project',
+          symbols: results.map(result => result.symbol).slice(0, 10),
+          modules: results
+            .map(result => structure?.symbolToModule[result.symbol])
+            .filter((value): value is string => typeof value === 'string')
+            .slice(0, 10),
+        });
+
+        if (!results.length) {
+          return { content: [{ type: 'text', text: 'No results found.' }] };
+        }
+        if (format === 'json') {
+          return { content: [{ type: 'text', text: JSON.stringify(serializeQueryProjectResponse(question, results, memoryFreshness, response.pagination), null, 2) }] };
+        }
+        const sections = [];
+        if (violationWarning) {
+          sections.push(violationWarning);
+        }
+        sections.push(`Pipeline enforced: structure modules ${pipeline.structureModules}, critical attention ${pipeline.attentionCritical}, constraint violations ${pipeline.constraintViolations}`);
+        sections.push(`Results page ${response.pagination.page}/${response.pagination.totalPages} (page size ${response.pagination.pageSize}, total ${response.pagination.totalResults})`);
+        if (response.pagination.hasMore && response.pagination.nextPage) {
+          sections.push(`More context available: call query_project again with page=${response.pagination.nextPage} and pageSize=${response.pagination.pageSize}`);
+        }
+        if (response.pagination.symbolIndexByPage.length > 0) {
+          sections.push('Symbols by page:');
+          sections.push(...response.pagination.symbolIndexByPage.map(entry => `- page ${entry.page}: ${entry.symbols.join(', ') || '(none)'}`));
+        }
+        sections.push(...response.pagination.callGraphPreviewLines);
+        sections.push(`Project memory refreshed: ${memoryFreshness.memoryRefreshedAt ?? 'unknown'}`);
+        if (memoryFreshness.reasons.length > 0) {
+          sections.push(`Project memory freshness: re-index recommended (${memoryFreshness.reasons.join('; ')})`);
+        }
+        if (mode === 'architecture') {
+          const snapshot = await buildProjectIntentSnapshot(root);
+          if (snapshot) {
+            const overviewClaims = snapshot.claims
+              .filter(claim => claim.category === 'architecture' || claim.category === 'patterns' || claim.category === 'entrypoints')
+              .slice(0, 6)
+              .map(claim => `- [${claim.evidenceTier}] ${claim.statement}`);
+            if (overviewClaims.length > 0) {
+              sections.push('Architecture overview:');
+              sections.push(...overviewClaims);
+            }
+          }
+        }
+        const output = results
+          .map(r => {
+            const hybridScore = r.score;
+            const semanticScore = r.semanticScore ?? 0;
+            return [
+              `**File:** ${r.file}`,
+              `**Symbol:** ${r.symbol} (${r.type})`,
+              r.lineStart && r.lineEnd ? `**Lines:** ${r.lineStart}-${r.lineEnd}` : '',
+              `**Ranking:** hybrid ${hybridScore.toFixed(3)} | semantic ${semanticScore.toFixed(3)}`,
+              r.freshness?.indexRefreshedAt
+                ? `**Slice index refreshed:** ${r.freshness.indexRefreshedAt}`
+                : '',
+              r.freshness?.latestChange
+                ? `**Latest slice change:** ${r.freshness.latestChange.timestamp || 'unknown'} ${r.freshness.latestChange.sha.slice(0, 12)} ${r.freshness.latestChange.title}`
+                : '',
+              r.freshness?.latestChange?.changedLines.length
+                ? `**Changed lines in slice:** ${formatLineRanges(r.freshness.latestChange.changedLines)}`
+                : '',
+              r.freshness && r.freshness.reasons.length > 0
+                ? `**Freshness:** re-index recommended (${r.freshness.reasons.join('; ')})`
+                : '',
+              formatGraphRelation('Calls', r.graphSummary?.calls),
+              formatCallSiteRelation('Call', r.graphSummary?.calls),
+              formatGraphRelation('Used by', r.graphSummary?.usedBy),
+              formatCallSiteRelation('Used by', r.graphSummary?.usedBy),
+              formatGraphRelation('Supertypes', r.graphSummary?.supertypes),
+              formatGraphRelation('Subtypes', r.graphSummary?.subtypes),
+              formatGraphRelation('Implements', r.graphSummary?.implements),
+              formatGraphRelation('Implemented by', r.graphSummary?.implementedBy),
+              (r.connectionsWithinResults?.total ?? 0) > 0
+                ? `**Connected returned slices:** ${r.connectionsWithinResults?.total}`
+                : '',
+              formatSymbolRelation('Returned calls', r.connectionsWithinResults?.calls),
+              formatSymbolRelation('Returned used by', r.connectionsWithinResults?.usedBy),
+              formatSymbolRelation('Returned supertypes', r.connectionsWithinResults?.supertypes),
+              formatSymbolRelation('Returned subtypes', r.connectionsWithinResults?.subtypes),
+              formatSymbolRelation('Returned implements', r.connectionsWithinResults?.implements),
+              formatSymbolRelation('Returned implemented by', r.connectionsWithinResults?.implementedBy),
+              r.rankingSignals && r.rankingSignals.length > 0
+                ? `**Ranking signals:** ${r.rankingSignals.join('; ')}`
+                : '',
+              r.scoreBreakdown
+                ? `**Score breakdown:** semantic ${r.scoreBreakdown.semantic.toFixed(2)}, symbol overlap ${r.scoreBreakdown.symbolOverlap.toFixed(2)}, file overlap ${r.scoreBreakdown.fileOverlap.toFixed(2)}, memory ${r.scoreBreakdown.directMemory.toFixed(2)}, neighbor support ${r.scoreBreakdown.neighborSupport.toFixed(2)}, connectivity ${r.scoreBreakdown.connectivity.toFixed(2)}`
+                : '',
+              `\`\`\`\n${r.code}\n\`\`\``,
+            ].join('\n');
+          })
+          .join('\n\n---\n\n');
+        sections.push(output);
+        sections.push(`Results page ${response.pagination.page}/${response.pagination.totalPages} (page size ${response.pagination.pageSize}, total ${response.pagination.totalResults})`);
+        if (response.pagination.hasMore && response.pagination.nextPage) {
+          sections.push(`More context available: call query_project again with page=${response.pagination.nextPage} and pageSize=${response.pagination.pageSize}`);
+        }
+        return { content: [{ type: 'text', text: sections.join('\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
       }
-      const output = results
-        .map(r => {
-          const hybridScore = r.score;
-          const semanticScore = r.semanticScore ?? 0;
-          return [
-            `**File:** ${r.file}`,
-            `**Symbol:** ${r.symbol} (${r.type})`,
-            r.lineStart && r.lineEnd ? `**Lines:** ${r.lineStart}-${r.lineEnd}` : '',
-            `**Ranking:** hybrid ${hybridScore.toFixed(3)} | semantic ${semanticScore.toFixed(3)}`,
-            r.freshness?.indexRefreshedAt
-              ? `**Slice index refreshed:** ${r.freshness.indexRefreshedAt}`
-              : '',
-            r.freshness?.latestChange
-              ? `**Latest slice change:** ${r.freshness.latestChange.timestamp || 'unknown'} ${r.freshness.latestChange.sha.slice(0, 12)} ${r.freshness.latestChange.title}`
-              : '',
-            r.freshness?.latestChange?.changedLines.length
-              ? `**Changed lines in slice:** ${formatLineRanges(r.freshness.latestChange.changedLines)}`
-              : '',
-            r.freshness && r.freshness.reasons.length > 0
-              ? `**Freshness:** re-index recommended (${r.freshness.reasons.join('; ')})`
-              : '',
-            formatGraphRelation('Calls', r.graphSummary?.calls),
-            formatCallSiteRelation('Call', r.graphSummary?.calls),
-            formatGraphRelation('Used by', r.graphSummary?.usedBy),
-            formatCallSiteRelation('Used by', r.graphSummary?.usedBy),
-            formatGraphRelation('Supertypes', r.graphSummary?.supertypes),
-            formatGraphRelation('Subtypes', r.graphSummary?.subtypes),
-            formatGraphRelation('Implements', r.graphSummary?.implements),
-            formatGraphRelation('Implemented by', r.graphSummary?.implementedBy),
-            (r.connectionsWithinResults?.total ?? 0) > 0
-              ? `**Connected returned slices:** ${r.connectionsWithinResults?.total}`
-              : '',
-            formatSymbolRelation('Returned calls', r.connectionsWithinResults?.calls),
-            formatSymbolRelation('Returned used by', r.connectionsWithinResults?.usedBy),
-            formatSymbolRelation('Returned supertypes', r.connectionsWithinResults?.supertypes),
-            formatSymbolRelation('Returned subtypes', r.connectionsWithinResults?.subtypes),
-            formatSymbolRelation('Returned implements', r.connectionsWithinResults?.implements),
-            formatSymbolRelation('Returned implemented by', r.connectionsWithinResults?.implementedBy),
-            r.rankingSignals && r.rankingSignals.length > 0
-              ? `**Ranking signals:** ${r.rankingSignals.join('; ')}`
-              : '',
-            r.scoreBreakdown
-              ? `**Score breakdown:** semantic ${r.scoreBreakdown.semantic.toFixed(2)}, symbol overlap ${r.scoreBreakdown.symbolOverlap.toFixed(2)}, file overlap ${r.scoreBreakdown.fileOverlap.toFixed(2)}, memory ${r.scoreBreakdown.directMemory.toFixed(2)}, neighbor support ${r.scoreBreakdown.neighborSupport.toFixed(2)}, connectivity ${r.scoreBreakdown.connectivity.toFixed(2)}`
-              : '',
-            `\`\`\`\n${r.code}\n\`\`\``,
-          ].join('\n');
-        })
-        .join('\n\n---\n\n');
-      sections.push(output);
-      sections.push(`Results page ${response.pagination.page}/${response.pagination.totalPages} (page size ${response.pagination.pageSize}, total ${response.pagination.totalResults})`);
-      if (response.pagination.hasMore && response.pagination.nextPage) {
-        sections.push(`More context available: call query_project again with page=${response.pagination.nextPage} and pageSize=${response.pagination.pageSize}`);
-      }
-      return { content: [{ type: 'text', text: sections.join('\n\n') }] };
     }
   );
 
@@ -2057,12 +2082,17 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, seeds, hops = 2, direction = 'both', limit = 15, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      await syncProjectMemory(root, qdrantUrl);
-      const analysis = await getAffectedSymbolsInsight(root, seeds, { hops, direction, limit });
-      if (!analysis) {
-        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      try {
+        await syncProjectMemory(root, qdrantUrl);
+        const analysis = await getAffectedSymbolsInsight(root, seeds, { hops, direction, limit });
+        if (!analysis) {
+          return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        }
+        return { content: [{ type: 'text', text: renderAffectedSymbolsInsight(analysis) }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
       }
-      return { content: [{ type: 'text', text: renderAffectedSymbolsInsight(analysis) }] };
     }
   );
 
@@ -2184,25 +2214,30 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, symbol, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
-      const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
+      try {
+        const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+        const qdrant = new QdrantClient({ url: qdrantUrl });
+        const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { points } = await qdrant.scroll(collection, {
-        filter: { must: [{ key: 'symbol', match: { value: symbol } }] } as any,
-        with_payload: true,
-        with_vector: false,
-        limit: 10,
-      });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { points } = await qdrant.scroll(collection, {
+          filter: { must: [{ key: 'symbol', match: { value: symbol } }] } as any,
+          with_payload: true,
+          with_vector: false,
+          limit: 10,
+        });
 
-      if (points.length === 0) {
-        return { content: [{ type: 'text', text: `Symbol "${symbol}" not found in index.` }] };
+        if (points.length === 0) {
+          return { content: [{ type: 'text', text: `Symbol "${symbol}" not found in index.` }] };
+        }
+
+        const output = await Promise.all(points.map(p => renderIndexedSymbol(root, graph, symbol, p)));
+
+        return { content: [{ type: 'text', text: output.join('\n\n---\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
       }
-
-      const output = await Promise.all(points.map(p => renderIndexedSymbol(root, graph, symbol, p)));
-
-      return { content: [{ type: 'text', text: output.join('\n\n---\n\n') }] };
     }
   );
 
@@ -2219,48 +2254,53 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, symbols, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
-      const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
+      try {
+        const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+        const qdrant = new QdrantClient({ url: qdrantUrl });
+        const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
 
-      // Single Qdrant scroll with OR filter — O(1) round trip regardless of symbol count
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { points } = await qdrant.scroll(collection, {
-        filter: {
-          should: symbols.map(s => ({ key: 'symbol', match: { value: s } })),
-        } as any,
-        with_payload: true,
-        with_vector: false,
-        limit: symbols.length * 3, // allow multiple chunks per symbol
-      });
+        // Single Qdrant scroll with OR filter — O(1) round trip regardless of symbol count
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { points } = await qdrant.scroll(collection, {
+          filter: {
+            should: symbols.map(s => ({ key: 'symbol', match: { value: s } })),
+          } as any,
+          with_payload: true,
+          with_vector: false,
+          limit: symbols.length * 3, // allow multiple chunks per symbol
+        });
 
-      if (points.length === 0) {
-        return { content: [{ type: 'text', text: `None of the requested symbols were found in the index.` }] };
-      }
-
-      // Group points by symbol to deduplicate
-      const bySymbol = new Map<string, typeof points>();
-      for (const p of points) {
-        const sym = p.payload!['symbol'] as string;
-        if (!bySymbol.has(sym)) bySymbol.set(sym, []);
-        bySymbol.get(sym)!.push(p);
-      }
-
-      // Report any not found
-      const notFound = symbols.filter(s => !bySymbol.has(s));
-
-      const sections: string[] = [];
-      for (const [sym, pts] of bySymbol) {
-        for (const p of pts) {
-          sections.push(await renderIndexedSymbol(root, graph, sym, p));
+        if (points.length === 0) {
+          return { content: [{ type: 'text', text: `None of the requested symbols were found in the index.` }] };
         }
-      }
 
-      if (notFound.length) {
-        sections.push(`**Not found:** ${notFound.join(', ')}`);
-      }
+        // Group points by symbol to deduplicate
+        const bySymbol = new Map<string, typeof points>();
+        for (const p of points) {
+          const sym = p.payload!['symbol'] as string;
+          if (!bySymbol.has(sym)) bySymbol.set(sym, []);
+          bySymbol.get(sym)!.push(p);
+        }
 
-      return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+        // Report any not found
+        const notFound = symbols.filter(s => !bySymbol.has(s));
+
+        const sections: string[] = [];
+        for (const [sym, pts] of bySymbol) {
+          for (const p of pts) {
+            sections.push(await renderIndexedSymbol(root, graph, sym, p));
+          }
+        }
+
+        if (notFound.length) {
+          sections.push(`**Not found:** ${notFound.join(', ')}`);
+        }
+
+        return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
+      }
     }
   );
 
@@ -2277,21 +2317,22 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, symbol, limit = 10, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+      try {
+        const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
 
-      if (!graph) {
-        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
-      }
+        if (!graph) {
+          return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        }
 
-      const callers = graph.callers?.[symbol] ?? [];
-      const implementations = graph.implementations?.[symbol] ?? [];
-      const totalReferences = new Set([...callers, ...implementations]);
+        const callers = graph.callers?.[symbol] ?? [];
+        const implementations = graph.implementations?.[symbol] ?? [];
+        const totalReferences = new Set([...callers, ...implementations]);
 
-      if (totalReferences.size === 0) {
-        return { content: [{ type: 'text', text: `No direct graph references found for "${symbol}".` }] };
-      }
+        if (totalReferences.size === 0) {
+          return { content: [{ type: 'text', text: `No direct graph references found for "${symbol}".` }] };
+        }
 
-      const shownSymbols = [...totalReferences].slice(0, limit);
+        const shownSymbols = [...totalReferences].slice(0, limit);
       const shownSet = new Set(shownSymbols);
       const qdrant = new QdrantClient({ url: qdrantUrl });
       const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
@@ -2318,6 +2359,10 @@ function createMcpServer(): McpServer {
       }
 
       return { content: [{ type: 'text', text: sections.join('\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
+      }
     }
   );
 
@@ -2334,34 +2379,39 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, symbol, limit = 10, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+      try {
+        const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
 
-      if (!graph) {
-        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        if (!graph) {
+          return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        }
+
+        const implementations = graph.implementations?.[symbol] ?? [];
+        if (implementations.length === 0) {
+          return { content: [{ type: 'text', text: `No implementations found for "${symbol}".` }] };
+        }
+
+        const shownSymbols = implementations.slice(0, limit);
+        const qdrant = new QdrantClient({ url: qdrantUrl });
+        const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
+        const pointMap = groupPointsBySymbol(await scrollSymbolPoints(qdrant, collection, shownSymbols));
+
+        const sections: string[] = [
+          `**Implementations of ${symbol}**`,
+          graph.symbolFile[symbol] ? `Declared in: ${graph.symbolFile[symbol]}` : '',
+          `Known implementations: ${implementations.length}`,
+          shownSymbols.length < implementations.length ? `Showing first ${shownSymbols.length} implementations.` : '',
+        ].filter(Boolean);
+
+        for (const implementation of shownSymbols) {
+          sections.push(await renderIndexedSymbol(root, graph, implementation, pointMap.get(implementation)?.[0]));
+        }
+
+        return { content: [{ type: 'text', text: sections.join('\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
       }
-
-      const implementations = graph.implementations?.[symbol] ?? [];
-      if (implementations.length === 0) {
-        return { content: [{ type: 'text', text: `No implementations found for "${symbol}".` }] };
-      }
-
-      const shownSymbols = implementations.slice(0, limit);
-      const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
-      const pointMap = groupPointsBySymbol(await scrollSymbolPoints(qdrant, collection, shownSymbols));
-
-      const sections: string[] = [
-        `**Implementations of ${symbol}**`,
-        graph.symbolFile[symbol] ? `Declared in: ${graph.symbolFile[symbol]}` : '',
-        `Known implementations: ${implementations.length}`,
-        shownSymbols.length < implementations.length ? `Showing first ${shownSymbols.length} implementations.` : '',
-      ].filter(Boolean);
-
-      for (const implementation of shownSymbols) {
-        sections.push(await renderIndexedSymbol(root, graph, implementation, pointMap.get(implementation)?.[0]));
-      }
-
-      return { content: [{ type: 'text', text: sections.join('\n\n') }] };
     }
   );
 
@@ -2380,49 +2430,54 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, seeds, hops = 2, direction = 'both', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+      try {
+        const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
 
-      if (!graph) {
-        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        if (!graph) {
+          return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        }
+
+        // BFS expansion (shared utility)
+        const { discovered, capped } = expandGraphBfs(graph, seeds, hops, direction);
+        const symbolList = [...discovered].slice(0, 60);
+
+        const qdrant = new QdrantClient({ url: qdrantUrl });
+        const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { points } = await qdrant.scroll(collection, {
+          filter: {
+            should: symbolList.map(s => ({ key: 'symbol', match: { value: s } })),
+          } as any,
+          with_payload: true,
+          with_vector: false,
+          limit: symbolList.length * 2,
+        });
+
+        const bySymbol = new Map<string, typeof points[0]>();
+        for (const p of points) {
+          const sym = p.payload!['symbol'] as string;
+          if (!bySymbol.has(sym)) bySymbol.set(sym, p); // first chunk wins
+        }
+
+        const sections: string[] = [
+          `**Subgraph: ${discovered.size} symbols reachable from [${seeds.join(', ')}]** (${hops}-hop ${direction})${capped ? ' — capped at 60' : ''}`,
+          '',
+        ];
+
+        // Output seeds first, then rest
+        const ordered = [...seeds, ...symbolList.filter(s => !seeds.includes(s))];
+        for (const sym of ordered) {
+          const p = bySymbol.get(sym);
+          sections.push(`### ${sym}`);
+          sections.push(await renderIndexedSymbol(root, graph, sym, p));
+        }
+
+        return { content: [{ type: 'text', text: sections.join('\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
       }
-
-      // BFS expansion (shared utility)
-      const { discovered, capped } = expandGraphBfs(graph, seeds, hops, direction);
-      const symbolList = [...discovered].slice(0, 60);
-
-      const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { points } = await qdrant.scroll(collection, {
-        filter: {
-          should: symbolList.map(s => ({ key: 'symbol', match: { value: s } })),
-        } as any,
-        with_payload: true,
-        with_vector: false,
-        limit: symbolList.length * 2,
-      });
-
-      const bySymbol = new Map<string, typeof points[0]>();
-      for (const p of points) {
-        const sym = p.payload!['symbol'] as string;
-        if (!bySymbol.has(sym)) bySymbol.set(sym, p); // first chunk wins
-      }
-
-      const sections: string[] = [
-        `**Subgraph: ${discovered.size} symbols reachable from [${seeds.join(', ')}]** (${hops}-hop ${direction})${capped ? ' — capped at 60' : ''}`,
-        '',
-      ];
-
-      // Output seeds first, then rest
-      const ordered = [...seeds, ...symbolList.filter(s => !seeds.includes(s))];
-      for (const sym of ordered) {
-        const p = bySymbol.get(sym);
-        sections.push(`### ${sym}`);
-        sections.push(await renderIndexedSymbol(root, graph, sym, p));
-      }
-
-      return { content: [{ type: 'text', text: sections.join('\n\n') }] };
     }
   );
 
@@ -2482,25 +2537,30 @@ function createMcpServer(): McpServer {
     },
     async ({ projectRoot, file, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
-      const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
+      try {
+        const qdrant = new QdrantClient({ url: qdrantUrl });
+        const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const { points } = await qdrant.scroll(collection, {
-        filter: { must: [{ key: 'file', match: { value: file } }] } as any,
-        with_payload: true,
-        with_vector: false,
-        limit: 100,
-      });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { points } = await qdrant.scroll(collection, {
+          filter: { must: [{ key: 'file', match: { value: file } }] } as any,
+          with_payload: true,
+          with_vector: false,
+          limit: 100,
+        });
 
-      if (points.length === 0) {
-        return { content: [{ type: 'text', text: `No chunks found for "${file}". Path must be relative to project root.` }] };
+        if (points.length === 0) {
+          return { content: [{ type: 'text', text: `No chunks found for "${file}". Path must be relative to project root.` }] };
+        }
+
+        const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+        const output = await Promise.all(points.map(p => renderIndexedSymbol(root, graph, p.payload!['symbol'] as string, p)));
+
+        return { content: [{ type: 'text', text: output.join('\n\n---\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
       }
-
-      const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
-      const output = await Promise.all(points.map(p => renderIndexedSymbol(root, graph, p.payload!['symbol'] as string, p)));
-
-      return { content: [{ type: 'text', text: output.join('\n\n---\n\n') }] };
     }
   );
 
