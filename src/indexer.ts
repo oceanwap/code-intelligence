@@ -57,7 +57,7 @@ interface WalkFilters {
 
 const walkFilterCache = new Map<string, WalkFilters>();
 
-function stripJsonComments(text: string): string {
+export function stripJsonComments(text: string): string {
   return text
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^\s*\/\/.*$/gm, '');

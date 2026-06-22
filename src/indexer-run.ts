@@ -1,11 +1,13 @@
 import * as path from 'path';
 import { indexDirectory, buildManifestAsync, loadManifestAsync, saveManifestAsync, listIndexableFiles } from './indexer.js';
 import type { CodeChunk } from './indexer.js';
-import { embedAndStore, deletePoints, deleteOrphanPoints } from './embedder.js';
+import { QdrantClient } from '@qdrant/js-client-rest';
+import { embedAndStore, deletePoints, deleteOrphanPoints, ensureActiveAliasAsync, cleanupOrphanedCollectionsAsync } from './embedder.js';
+import { ingestExternalScanDataAsync } from './memory-ingestion.js';
 import { buildGraphAsync, saveGraph } from './graph.js';
-import { syncProjectMemory } from './project-memory.js';
+import { syncProjectMemory, appendDocumentEntriesAsync } from './project-memory.js';
 import { retrieve, retrievePage, type RetrievedChunk, type RetrievalMode, type RetrievalResponse } from './retriever.js';
-import { getDataDir } from './git.js';
+import { getDataDir, getFileChurnAsync } from './git.js';
 import { refreshArchitectureAsync } from './cognition/architecture/storage.js';
 import { refreshStructureAsync } from './cognition/structure/engine.js';
 import { refreshAttentionAsync } from './cognition/attention/engine.js';
@@ -28,6 +30,8 @@ export interface IndexResult {
   memoryEntries: number;
   newMemoryEntries: number;
   staleMemoryRemoved: number;
+  memoryDriftWarning?: string;
+  externalScanEntries: number;
   architectureModules: number;
   reflectionGenerated: boolean;
   failureRecords: number;
@@ -52,6 +56,8 @@ const FAST_KEEP_RATIO = 0.3;
 const FAST_KEEP_MIN = 90;
 const FAST_CHUNK_SCORE_THRESHOLD = 7;
 const FAST_MAX_CHUNKS_DEFAULT = 3500;
+const TOP_CHURN_INCLUDE_COUNT = 40;
+const CHURN_BOOST_MAX = 8;
 
 function fastChunkBudget(): number {
   const override = Number(process.env.CODE_INTEL_FAST_MAX_CHUNKS ?? '');
@@ -112,11 +118,14 @@ async function cheapContentSignal(absPath: string): Promise<number> {
   }
 }
 
-async function buildFastCandidateSet(projectRoot: string): Promise<Set<string>> {
+async function buildFastCandidateSet(projectRoot: string, churnMap: Map<string, number>): Promise<Set<string>> {
   const absFiles = await listIndexableFiles(projectRoot);
+  const maxChurn = Math.max(1, ...churnMap.values());
+  const absFilesSet = new Set<string>(absFiles.map(absPath => path.relative(projectRoot, absPath).replace(/\\/g, '/')));
   const scored = await Promise.all(absFiles.map(async absPath => {
     const relPath = path.relative(projectRoot, absPath);
     const normalized = relPath.replace(/\\/g, '/').toLowerCase();
+    const forwardRel = relPath.replace(/\\/g, '/');
     const ext = path.extname(normalized);
     let score = 0;
 
@@ -140,6 +149,12 @@ async function buildFastCandidateSet(projectRoot: string): Promise<Set<string>> 
     }
 
     score += await cheapContentSignal(absPath);
+
+    const churn = churnMap.get(forwardRel) ?? 0;
+    if (churn > 0) {
+      score += 2 + Math.min(CHURN_BOOST_MAX - 2, Math.round((churn / maxChurn) * (CHURN_BOOST_MAX - 2)));
+    }
+
     return { relPath, score };
   }));
 
@@ -153,6 +168,15 @@ async function buildFastCandidateSet(projectRoot: string): Promise<Set<string>> 
     if (isHighValuePath(file.relPath)) picked.add(file.relPath);
   }
 
+  const topChurnFiles = [...churnMap.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, TOP_CHURN_INCLUDE_COUNT)
+    .map(([relPath]) => relPath)
+    .filter(relPath => absFilesSet.has(relPath));
+  for (const relPath of topChurnFiles) {
+    picked.add(relPath);
+  }
+
   return picked;
 }
 
@@ -163,11 +187,14 @@ function highValueFile(relPath: string): boolean {
 
 function chunkScore(
   chunk: CodeChunk,
-  graph: { symbols: Record<string, string[]>; callers: Record<string, string[]> }
+  graph: { symbols: Record<string, string[]>; callers: Record<string, string[]> },
+  churnMap: Map<string, number>
 ): number {
   let score = 0;
   const normalizedFile = chunk.file.replace(/\\/g, '/').toLowerCase();
+  const fileKey = chunk.file.replace(/\\/g, '/');
   const degree = (graph.symbols[chunk.symbol]?.length ?? 0) + (graph.callers[chunk.symbol]?.length ?? 0);
+  const churn = churnMap.get(fileKey) ?? 0;
 
   if (chunk.type !== 'file') score += 5;
   if (chunk.type === 'class') score += 2;
@@ -179,6 +206,7 @@ function chunkScore(
   if (chunk.type === 'file' && !highValueFile(normalizedFile)) score -= 2;
 
   score += Math.min(4, degree);
+  score += Math.min(4, churn / 2);
   if (highValueFile(normalizedFile)) score += 3;
   return score;
 }
@@ -186,14 +214,15 @@ function chunkScore(
 function selectChunksForIndex(
   chunks: CodeChunk[],
   graph: { symbols: Record<string, string[]>; callers: Record<string, string[]> },
-  mode: IndexMode
+  mode: IndexMode,
+  churnMap: Map<string, number>
 ): CodeChunk[] {
   if (mode === 'full') return chunks;
   const selected = chunks.filter(chunk => {
     const degree = (graph.symbols[chunk.symbol]?.length ?? 0) + (graph.callers[chunk.symbol]?.length ?? 0);
     if (highValueFile(chunk.file)) return true;
     if (degree >= 2 && chunk.type !== 'file') return true;
-    return chunkScore(chunk, graph) >= FAST_CHUNK_SCORE_THRESHOLD;
+    return chunkScore(chunk, graph, churnMap) >= FAST_CHUNK_SCORE_THRESHOLD;
   });
 
   const budget = fastChunkBudget();
@@ -202,8 +231,8 @@ function selectChunksForIndex(
   return selected
     .slice()
     .sort((left, right) => {
-      const leftScore = chunkScore(left, graph);
-      const rightScore = chunkScore(right, graph);
+      const leftScore = chunkScore(left, graph, churnMap);
+      const rightScore = chunkScore(right, graph, churnMap);
       return rightScore - leftScore
         || left.file.localeCompare(right.file)
         || left.symbol.localeCompare(right.symbol);
@@ -236,10 +265,12 @@ export async function indexProject(
   const manifestFile = path.join(dataDir, 'manifest.json');
   const cacheFile = path.join(dataDir, 'cache.json');
 
+  const churnMap = await getFileChurnAsync(root, 200);
+
   let includeFiles: Set<string> | undefined;
   if (mode === 'fast') {
     onProgress?.('pre-scanning', 0, 1);
-    includeFiles = await measure('pre-scanning', () => buildFastCandidateSet(root));
+    includeFiles = await measure('pre-scanning', () => buildFastCandidateSet(root, churnMap));
     onProgress?.('pre-scanning', 1, 1);
   }
 
@@ -252,7 +283,7 @@ export async function indexProject(
   await saveGraph(graph, path.join(dataDir, 'graph.json'));
   onProgress?.('building-graph', 1, 1);
 
-  const chunks = selectChunksForIndex(discoveredChunks, graph, mode);
+  const chunks = selectChunksForIndex(discoveredChunks, graph, mode, churnMap);
 
   onProgress?.('building-manifest', 0, 1);
   const [oldManifest, newManifest] = await measure('building-manifest', async () => {
@@ -310,7 +341,28 @@ export async function indexProject(
   onProgress?.('syncing-memory', 0, 1);
   const memory = await measure('syncing-memory', () => syncProjectMemory(root, qdrantUrl));
   onProgress?.('syncing-memory', 1, 1);
-  
+
+  // Update stable aliases so semantic tools can resolve collections across branch switches
+  await measure('updating-aliases', async () => {
+    const qdrant = new QdrantClient({ url: qdrantUrl });
+    await ensureActiveAliasAsync(qdrant, root, 'code');
+    await ensureActiveAliasAsync(qdrant, root, 'memory');
+    await cleanupOrphanedCollectionsAsync(qdrant, root);
+  });
+
+  // Ingest external scan data (CVEs, outdated packages, dead code, lint) into project memory
+  let externalScanEntries = 0;
+  await measure('ingesting-external-scans', async () => {
+    const { entries, warnings } = await ingestExternalScanDataAsync(root);
+    if (entries.length > 0) {
+      const result = await appendDocumentEntriesAsync(root, entries, qdrantUrl);
+      externalScanEntries = result.appendedCount;
+    }
+    if (warnings.length > 0) {
+      console.warn('[index_project] External scan ingestion warnings:', warnings);
+    }
+  });
+
   onProgress?.('computing-cognition', 0, 8);
   const cognition = await measure('computing-cognition', async () => {
     const structure = await refreshStructureAsync(root);
@@ -359,6 +411,8 @@ export async function indexProject(
     memoryEntries: memory.totalEntries,
     newMemoryEntries: memory.newEntries,
     staleMemoryRemoved: memory.staleRemoved,
+    memoryDriftWarning: memory.driftWarning,
+    externalScanEntries,
     architectureModules: architecture?.modules.length ?? 0,
     reflectionGenerated: reflection !== null,
     failureRecords: failures.totalFailures,

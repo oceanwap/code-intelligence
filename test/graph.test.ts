@@ -110,3 +110,61 @@ test('buildGraph tracks PHP implementations and method overrides', async t => {
   assert.ok(graph.callSites?.['App\\BaseRunner::run']?.some(site => site.symbol === 'helper' && site.line === 15));
   assert.ok(graph.calledBySites?.['helper']?.some(site => site.symbol === 'App\\ConcreteRunner::run' && site.line === 21));
 });
+
+test('buildGraph detects TypeORM entity relation decorators', async t => {
+  const dir = makeTempDir(t);
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'src', 'entities.ts'),
+    [
+      "import { Entity, ManyToOne, OneToMany, ManyToMany } from 'typeorm';",
+      '',
+      '@Entity()',
+      'class Contact {',
+      '  @ManyToOne(() => Lead)',
+      '  lead: Lead;',
+      '',
+      '  @OneToMany(() => Account, account => account.contact)',
+      '  accounts: Account[];',
+      '}',
+      '',
+      '@Entity()',
+      'class Lead {',
+      '  @OneToMany(() => Contact, contact => contact.lead)',
+      '  contacts: Contact[];',
+      '}',
+      '',
+      '@Entity()',
+      'class Account {',
+      '  @ManyToOne("Contact")',
+      '  contact: Contact;',
+      '',
+      '  @ManyToMany(() => Tag, tag => tag.accounts)',
+      '  tags: Tag[];',
+      '}',
+      '',
+      '@Entity()',
+      'class Tag {',
+      '  @ManyToMany(() => Account, account => account.tags)',
+      '  accounts: Account[];',
+      '}',
+      '',
+    ].join('\n')
+  );
+
+  const graph = await buildGraphAsync(dir);
+
+  assert.ok(graph.symbols['Contact']?.includes('Lead'));
+  assert.ok(graph.symbols['Contact']?.includes('Account'));
+  assert.ok(graph.symbols['Lead']?.includes('Contact'));
+  assert.ok(graph.symbols['Account']?.includes('Contact'));
+  assert.ok(graph.symbols['Account']?.includes('Tag'));
+  assert.ok(graph.symbols['Tag']?.includes('Account'));
+
+  assert.ok(graph.callers['Lead']?.includes('Contact'));
+  assert.ok(graph.callers['Account']?.includes('Contact'));
+  assert.ok(graph.callers['Contact']?.includes('Lead'));
+  assert.ok(graph.callers['Tag']?.includes('Account'));
+
+  assert.deepEqual(graph.entityRelations?.['Account'], ['Contact', 'Tag']);
+});

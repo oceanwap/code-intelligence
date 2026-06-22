@@ -4,7 +4,7 @@
  */
 import { QdrantClient } from '@qdrant/js-client-rest';
 import * as path from 'path';
-import { collectionNameAsync } from './embedder.js';
+import { resolveActiveCollectionAsync } from './embedder.js';
 import { loadGraphAsync, type GraphData } from './graph.js';
 import { getDataDir } from './git.js';
 import { buildEnrichedSymbolContextAsync, type IndexedSymbolPoint } from './symbol-context.js';
@@ -148,6 +148,6 @@ export async function loadProjectGraph(projectRoot: string): Promise<GraphData |
 
 export async function makeProjectQdrantClient(projectRoot: string, qdrantUrl: string): Promise<{ client: QdrantClient; collection: string }> {
   const client = new QdrantClient({ url: qdrantUrl });
-  const collection = await collectionNameAsync(projectRoot);
+  const collection = await resolveActiveCollectionAsync(client, projectRoot, 'code');
   return { client, collection };
 }

@@ -4,7 +4,7 @@ import * as path from 'path';
 import { mkdir } from 'node:fs/promises';
 import { buildDocumentEntriesAsync, type DocumentMemoryEntry } from './document-memory.js';
 import { extractSemanticTouch, prefersOldRevision } from './change-semantic.js';
-import { VECTOR_SIZE, embedQuery, embedTexts, scopedCollectionNameAsync } from './embedder.js';
+import { VECTOR_SIZE, embedQuery, embedTexts, scopedCollectionNameAsync, activeAliasNameAsync } from './embedder.js';
 import {
     getCommitPatchAsync,
     getCurrentBranchAsync,
@@ -88,6 +88,7 @@ export interface ProjectMemorySyncResult {
     newEntries: number;
     staleRemoved: number;
     latestChangeSha: string | null;
+    driftWarning?: string;
 }
 
 export interface ProjectMemoryFreshness {
@@ -271,6 +272,16 @@ export function readAnonymousVectorSize(vectors: unknown): number | null {
 
 async function memoryCollectionNameAsync(projectRoot: string): Promise<string> {
     return await scopedCollectionNameAsync(projectRoot, 'memory');
+}
+
+async function resolveMemoryCollectionAsync(qdrant: QdrantClient, projectRoot: string): Promise<string> {
+    const alias = await activeAliasNameAsync(projectRoot, 'memory');
+    try {
+        await qdrant.getCollection(alias);
+        return alias;
+    } catch {
+        return await memoryCollectionNameAsync(projectRoot);
+    }
 }
 
 function memoryPointId(entryId: string): string {
@@ -855,6 +866,61 @@ async function deleteStaleMemoryEntries(
     return staleIds.length;
 }
 
+const MEMORY_DRIFT_THRESHOLD = 0.01; // 1%
+
+async function saveMemorySnapshotBackup(projectRoot: string, snapshot: ProjectMemorySnapshot | null): Promise<void> {
+    if (!snapshot) return;
+    const backupFile = `${projectMemoryFile(projectRoot)}.bak`;
+    await Bun.write(backupFile, JSON.stringify(snapshot, null, 2));
+}
+
+async function loadMemorySnapshotBackup(projectRoot: string): Promise<ProjectMemorySnapshot | null> {
+    const backupFile = `${projectMemoryFile(projectRoot)}.bak`;
+    try {
+        const raw = await Bun.file(backupFile).text();
+        return JSON.parse(raw) as ProjectMemorySnapshot;
+    } catch {
+        return null;
+    }
+}
+
+function computeMemoryDriftWarning(oldCount: number, newCount: number): string | undefined {
+    if (oldCount === 0) return undefined;
+    const drop = oldCount - newCount;
+    if (drop <= 0) return undefined;
+    const ratio = drop / oldCount;
+    if (ratio < MEMORY_DRIFT_THRESHOLD) return undefined;
+    return `Memory entry count dropped from ${oldCount} to ${newCount} (${(ratio * 100).toFixed(1)}% loss). If this was not intentional, restore from project-memory.json.bak.`;
+}
+
+export async function appendDocumentEntriesAsync(
+    projectRoot: string,
+    documents: DocumentMemoryEntry[],
+    qdrantUrl = 'http://localhost:6333'
+): Promise<{ totalEntries: number; appendedCount: number }> {
+    const root = path.resolve(projectRoot);
+    const snapshot = await loadMemorySnapshotAsync(root);
+    if (!snapshot) return { totalEntries: 0, appendedCount: 0 };
+
+    const existingIds = new Set(snapshot.entries.map(entry => entry.id));
+    const newDocs = documents.filter(doc => !existingIds.has(doc.id));
+    if (newDocs.length === 0) return { totalEntries: snapshot.entries.length, appendedCount: 0 };
+
+    const nextEntries = [...snapshot.entries, ...newDocs]
+        .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp));
+    const nextSnapshot: ProjectMemorySnapshot = {
+        ...snapshot,
+        syncedAt: new Date().toISOString(),
+        entries: nextEntries,
+    };
+
+    const cacheFile = projectMemoryCacheFile(root);
+    await upsertMemoryEntries(root, nextEntries, cacheFile, qdrantUrl);
+    await saveMemorySnapshot(root, nextSnapshot);
+
+    return { totalEntries: nextEntries.length, appendedCount: newDocs.length };
+}
+
 export async function syncProjectMemory(
     projectRoot: string,
     qdrantUrl = 'http://localhost:6333'
@@ -870,6 +936,9 @@ export async function syncProjectMemory(
         entries,
     };
 
+    // Durability: backup previous snapshot before mutation
+    await saveMemorySnapshotBackup(root, oldSnapshot);
+
     const cacheFile = projectMemoryCacheFile(root);
     const oldIds = new Set((oldSnapshot?.entries ?? []).map(entry => entry.id));
     const newIds = new Set(entries.map(entry => entry.id));
@@ -880,11 +949,14 @@ export async function syncProjectMemory(
     const staleRemoved = await deleteStaleMemoryEntries(root, staleIds, cacheFile, qdrantUrl);
     await saveMemorySnapshot(root, snapshot);
 
+    const driftWarning = computeMemoryDriftWarning(oldSnapshot?.entries.length ?? 0, entries.length);
+
     return {
         totalEntries: entries.length,
         newEntries: newEntries.length,
         staleRemoved,
         latestChangeSha,
+        driftWarning,
     };
 }
 
@@ -948,8 +1020,9 @@ export async function queryProjectMemory(
     const snapshot = await loadMemorySnapshotAsync(root);
     if (!snapshot || snapshot.entries.length === 0) return [];
 
-    const { qdrant } = await ensureMemoryCollection(root, qdrantUrl);
-    const hits = await qdrant.search(await memoryCollectionNameAsync(root), {
+    const qdrant = new QdrantClient({ url: qdrantUrl });
+    const collection = await resolveMemoryCollectionAsync(qdrant, root);
+    const hits = await qdrant.search(collection, {
         vector: await embedQuery(question),
         limit: Math.max(limit * 2, 10),
         with_payload: true,

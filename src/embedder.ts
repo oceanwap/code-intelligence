@@ -194,6 +194,87 @@ export async function scopedCollectionNameAsync(projectRoot: string, scope: 'cod
   return `${scope}-${hash}`;
 }
 
+function projectHash(projectRoot: string): string {
+  const root = path.resolve(projectRoot);
+  return crypto
+    .createHash('sha256')
+    .update(root)
+    .digest('hex')
+    .slice(0, 8);
+}
+
+export async function activeAliasNameAsync(projectRoot: string, scope: 'code' | 'memory'): Promise<string> {
+  return `${scope}-active-${projectHash(projectRoot)}`;
+}
+
+export async function ensureActiveAliasAsync(
+  qdrant: QdrantClient,
+  projectRoot: string,
+  scope: 'code' | 'memory'
+): Promise<void> {
+  const alias = await activeAliasNameAsync(projectRoot, scope);
+  const target = await scopedCollectionNameAsync(projectRoot, scope);
+
+  // Ensure target collection exists before aliasing
+  const existing = await qdrant.getCollections();
+  if (!existing.collections.some(c => c.name === target)) {
+    return;
+  }
+
+  try {
+    await qdrant.updateCollectionAliases({
+      actions: [
+        { create_alias: { alias_name: alias, collection_name: target } },
+      ],
+    });
+  } catch (error) {
+    runtimeLog(`Failed to update alias ${alias} -> ${target}: ${error instanceof Error ? error.message : String(error)}`, 'error');
+  }
+}
+
+export async function resolveActiveCollectionAsync(
+  qdrant: QdrantClient,
+  projectRoot: string,
+  scope: 'code' | 'memory'
+): Promise<string> {
+  const alias = await activeAliasNameAsync(projectRoot, scope);
+  try {
+    const aliasInfo = await qdrant.getCollection(alias);
+    if (aliasInfo) return alias;
+  } catch {
+    // alias missing or invalid — fall back to branch-scoped collection
+  }
+  return await scopedCollectionNameAsync(projectRoot, scope);
+}
+
+export async function cleanupOrphanedCollectionsAsync(
+  qdrant: QdrantClient,
+  projectRoot: string
+): Promise<number> {
+  // Only remove stale alias-formatted collections for this project (e.g. from older alias naming schemes).
+  // Branch-scoped collections (code-<hash>, memory-<hash>) are intentionally left alone because the same
+  // Qdrant instance may be shared across projects and we cannot reliably attribute them.
+  const codeAlias = await activeAliasNameAsync(projectRoot, 'code');
+  const memoryAlias = await activeAliasNameAsync(projectRoot, 'memory');
+  const projectPrefix = projectHash(projectRoot);
+
+  let removed = 0;
+  const existing = await qdrant.getCollections();
+  for (const collection of existing.collections) {
+    const name = collection.name;
+    if (name === codeAlias || name === memoryAlias) continue;
+    if (name.startsWith(`code-active-${projectPrefix}`) || name.startsWith(`memory-active-${projectPrefix}`)) {
+      try {
+        await qdrant.deleteCollection(name);
+        removed++;
+      } catch {
+        // ignore cleanup failures
+      }
+    }
+  }
+  return removed;
+}
+
 export async function collectionNameAsync(projectRoot: string): Promise<string> {
   return await scopedCollectionNameAsync(projectRoot, 'code');
 }

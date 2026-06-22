@@ -480,10 +480,26 @@ export function renderAffectedSymbols(result: AffectedSymbolsResult): string {
   return sections.join('\n\n');
 }
 
+function isValidGraph(value: unknown): value is GraphData {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<GraphData>;
+  return (
+    typeof candidate.symbols === 'object' &&
+    candidate.symbols !== null &&
+    typeof candidate.callers === 'object' &&
+    candidate.callers !== null &&
+    typeof candidate.symbolFile === 'object' &&
+    candidate.symbolFile !== null
+  );
+}
+
 export async function getRiskHotspots(projectRoot: string, opts: number | RiskHotspotsOptions = 10): Promise<RiskHotspotsResult | null> {
   const root = path.resolve(projectRoot);
-  const graph = await loadGraphAsync(graphFile(root));
-  if (!graph) return null;
+  const graphRaw = await loadGraphAsync(graphFile(root));
+  if (!isValidGraph(graphRaw)) {
+    return null;
+  }
+  const graph = graphRaw;
 
   const { limit: maxResults, topic } = typeof opts === 'number'
     ? { limit: opts, topic: undefined as string | undefined }

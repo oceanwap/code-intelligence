@@ -36,7 +36,7 @@ import {
   syncProjectMemory,
 } from './project-memory.js';
 import { QdrantClient } from '@qdrant/js-client-rest';
-import { collectionNameAsync } from './embedder.js';
+import { collectionNameAsync, resolveActiveCollectionAsync } from './embedder.js';
 import { getDataDir, getCurrentBranchAsync } from './git.js';
 import {
   serializeFeatureBriefResponse,
@@ -389,6 +389,18 @@ async function enforceCognitionPipeline(projectRoot: string, qdrantUrl = 'http:/
   };
 }
 
+async function checkQdrantHealthAsync(qdrantUrl: string): Promise<{ status: 'healthy' | 'degraded' | 'unavailable'; message?: string }> {
+  try {
+    const res = await fetch(`${qdrantUrl.replace(/\/$/, '')}/healthz`);
+    if (res.ok) return { status: 'healthy' };
+    const text = await res.text().catch(() => '');
+    return { status: 'degraded', message: `Qdrant healthz returned ${res.status}: ${text}` };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { status: 'unavailable', message: `Qdrant unreachable at ${qdrantUrl}: ${message}` };
+  }
+}
+
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
   attachToolLogging(server);
@@ -476,6 +488,8 @@ function createMcpServer(): McpServer {
       if (result.orphansRemoved > 0) lines.push(`Removed ${result.orphansRemoved} orphaned chunk(s)`);
       if (result.newMemoryEntries > 0) lines.push(`Added ${result.newMemoryEntries} new project-memory entr${result.newMemoryEntries === 1 ? 'y' : 'ies'}`);
       if (result.staleMemoryRemoved > 0) lines.push(`Removed ${result.staleMemoryRemoved} stale project-memory entr${result.staleMemoryRemoved === 1 ? 'y' : 'ies'}`);
+      if (result.memoryDriftWarning) lines.push(`⚠️ ${result.memoryDriftWarning}`);
+      if (result.externalScanEntries > 0) lines.push(`Ingested ${result.externalScanEntries} external scan entr${result.externalScanEntries === 1 ? 'y' : 'ies'} (audit/outdated/knip/lint)`);
       if (result.reflectionGenerated) lines.push('Generated reflection entry for latest indexed change');
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -714,14 +728,17 @@ function createMcpServer(): McpServer {
       description: 'Lightweight readiness check. Use this before exploration when you are not sure the current branch is indexed, or when results may be stale after branch/file changes. If the project is not indexed, call index_project next. If it is indexed, choose project_status for a current-state summary, feature_map for high-level project understanding, query_project for code questions, or query_project_memory for history/status questions.',
       inputSchema: {
         projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
       },
     },
-    async ({ projectRoot }) => {
+    async ({ projectRoot, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       const branch = await getCurrentBranchAsync(root);
       const dataDir = getDataDir(root);
       const manifestFile = path.join(dataDir, 'manifest.json');
       const graphFile = path.join(dataDir, 'graph.json');
+
+      const qdrantHealth = await checkQdrantHealthAsync(qdrantUrl);
 
       let manifestRaw: string | null = null;
       try {
@@ -731,10 +748,13 @@ function createMcpServer(): McpServer {
       }
 
       if (!manifestRaw) {
-        const msg = branch
-          ? `Not indexed on branch "${branch}".\nRun index_project on: ${root}`
-          : `Not indexed.\nRun index_project on: ${root}`;
-        return { content: [{ type: 'text', text: msg }] };
+        const lines = [
+          `Status:  Not indexed`,
+          ...(branch ? [`Branch:  ${branch}`] : []),
+          `Qdrant:  ${qdrantHealth.status}${qdrantHealth.message ? ` (${qdrantHealth.message})` : ''}`,
+          `Run index_project on: ${root}`,
+        ];
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
       }
 
       const manifest = JSON.parse(manifestRaw) as {
@@ -763,6 +783,7 @@ function createMcpServer(): McpServer {
         `Symbols: ${symbolCount}`,
         `Call graph edges: ${edgeCount}`,
         `Project memory entries: ${await getProjectMemoryCountAsync(root)}`,
+        `Qdrant:  ${qdrantHealth.status}${qdrantHealth.message ? ` (${qdrantHealth.message})` : ''}`,
       ];
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -2060,14 +2081,24 @@ function createMcpServer(): McpServer {
     async ({ projectRoot, limit = 10, topic, format = 'text', qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       await syncProjectMemory(root, qdrantUrl);
-      const hotspots = await getRiskHotspotsInsight(root, { limit, topic });
-      if (!hotspots) {
-        return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+      try {
+        const hotspots = await getRiskHotspotsInsight(root, { limit, topic });
+        if (!hotspots) {
+          return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        }
+        if (format === 'json') {
+          return { content: [{ type: 'text', text: JSON.stringify(hotspots, null, 2) }] };
+        }
+        return { content: [{ type: 'text', text: renderRiskHotspotsInsight(hotspots) }] };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const stack = error instanceof Error ? error.stack : '';
+        mcpLog('error', `risk_hotspots failed: ${message}`, { topic, stack });
+        return {
+          content: [{ type: 'text', text: `risk_hotspots failed: ${message}\n${stack ?? ''}` }],
+          isError: true,
+        };
       }
-      if (format === 'json') {
-        return { content: [{ type: 'text', text: JSON.stringify(hotspots, null, 2) }] };
-      }
-      return { content: [{ type: 'text', text: renderRiskHotspotsInsight(hotspots) }] };
     }
   );
 
@@ -2153,7 +2184,7 @@ function createMcpServer(): McpServer {
       const root = path.resolve(projectRoot);
       const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
       const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await collectionNameAsync(root);
+      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { points } = await qdrant.scroll(collection, {
@@ -2188,7 +2219,7 @@ function createMcpServer(): McpServer {
       const root = path.resolve(projectRoot);
       const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
       const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await collectionNameAsync(root);
+      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
 
       // Single Qdrant scroll with OR filter — O(1) round trip regardless of symbol count
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2261,7 +2292,7 @@ function createMcpServer(): McpServer {
       const shownSymbols = [...totalReferences].slice(0, limit);
       const shownSet = new Set(shownSymbols);
       const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await collectionNameAsync(root);
+      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
       const pointMap = groupPointsBySymbol(await scrollSymbolPoints(qdrant, collection, shownSymbols));
 
       const sections: string[] = [
@@ -2314,7 +2345,7 @@ function createMcpServer(): McpServer {
 
       const shownSymbols = implementations.slice(0, limit);
       const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await collectionNameAsync(root);
+      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
       const pointMap = groupPointsBySymbol(await scrollSymbolPoints(qdrant, collection, shownSymbols));
 
       const sections: string[] = [
@@ -2358,7 +2389,7 @@ function createMcpServer(): McpServer {
       const symbolList = [...discovered].slice(0, 60);
 
       const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await collectionNameAsync(root);
+      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { points } = await qdrant.scroll(collection, {
@@ -2450,7 +2481,7 @@ function createMcpServer(): McpServer {
     async ({ projectRoot, file, qdrantUrl = 'http://localhost:6333' }) => {
       const root = path.resolve(projectRoot);
       const qdrant = new QdrantClient({ url: qdrantUrl });
-      const collection = await collectionNameAsync(root);
+      const collection = await resolveActiveCollectionAsync(qdrant, root, 'code');
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { points } = await qdrant.scroll(collection, {

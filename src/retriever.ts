@@ -1,6 +1,6 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { loadGraphAsync, type GraphCallSite, type GraphData } from './graph.js';
-import { collectionNameAsync, embedQuery } from './embedder.js';
+import { resolveActiveCollectionAsync, embedQuery } from './embedder.js';
 import { getProjectMemoryEntriesAsync, type ProjectMemoryEntry } from './project-memory.js';
 import { getRetrievedSliceFreshnessAsync, type RetrievedSliceFreshness } from './query-freshness.js';
 import { renderCompactCallGraphLines } from './call-graph-preview.js';
@@ -441,7 +441,7 @@ export async function retrievePage(
   const currentPage = normalizePage(page);
   const currentPageSize = normalizePageSize(pageSize);
   const qdrant = new QdrantClient({ url: qdrantUrl });
-  const collection = await collectionNameAsync(projectRoot);
+  const collection = await resolveActiveCollectionAsync(qdrant, projectRoot, 'code');
 
   // 1. Embed the query locally (no API key needed)
   const queryVec = await embedQuery(query);

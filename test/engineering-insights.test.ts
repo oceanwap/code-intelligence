@@ -186,3 +186,27 @@ test('getRiskHotspots filters history by topic before ranking', async t => {
   assert.deepEqual(result.symbols.map(entry => entry.symbol), ['Base.run']);
   assert.deepEqual(result.files.map(entry => entry.file), ['src/base.ts']);
 });
+
+test('getRiskHotspots returns null when graph is missing', async t => {
+  const dir = makeTempDir(t);
+  const dataDir = path.join(dir, '.code-intelligence');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'project-memory.json'), JSON.stringify({ entries: [] }));
+
+  const result = await getRiskHotspots(dir, 5);
+  assert.equal(result, null);
+});
+
+test('getRiskHotspots returns null for malformed graph instead of throwing', async t => {
+  const dir = makeTempDir(t);
+  const dataDir = path.join(dir, '.code-intelligence');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dataDir, 'graph.json'),
+    JSON.stringify({ symbols: {}, callers: {} })
+  );
+  fs.writeFileSync(path.join(dataDir, 'project-memory.json'), JSON.stringify({ entries: [] }));
+
+  const result = await getRiskHotspots(dir, 5);
+  assert.equal(result, null);
+});

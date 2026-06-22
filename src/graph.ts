@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { walkFiles } from './indexer.js';
 import { buildPhpGraphAsync } from './php-graph.js';
 import type { IndexingMode } from './indexer.js';
+import { loadWorkspaceResolverAsync, resolveImportToFile } from './workspace-imports.js';
 
 export interface GraphCallSite {
   symbol: string;
@@ -32,6 +33,10 @@ export interface GraphData {
   implementations: Record<string, string[]>;
   /** symbol name → base symbols it implements or overrides */
   implementedFrom: Record<string, string[]>;
+  /** symbol name → related entity symbols discovered via TypeORM decorators (optional, also mirrored into symbols/callers) */
+  entityRelations?: Record<string, string[]>;
+  /** relative file path → list of resolved imported file paths (relative to projectRoot) */
+  resolvedImports: Record<string, string[]>;
 }
 
 type FnLike = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
@@ -50,6 +55,71 @@ function addCallSite(target: Record<string, GraphCallSite[]>, key: string, value
   if (!entries.some(entry => entry.symbol === value.symbol && entry.file === value.file && entry.line === value.line)) {
     entries.push(value);
   }
+}
+
+async function buildResolvedImportsAsync(graph: GraphData, rootDir: string): Promise<void> {
+  const resolver = await loadWorkspaceResolverAsync(rootDir);
+  for (const [filePath, specifiers] of Object.entries(graph.files)) {
+    const resolved: string[] = [];
+    for (const spec of specifiers) {
+      const target = await resolveImportToFile(filePath, spec, resolver);
+      if (target && target !== filePath) resolved.push(target);
+    }
+    if (resolved.length > 0) graph.resolvedImports[filePath] = resolved;
+  }
+}
+
+function isTypeOrmEntity(cls: import('ts-morph').ClassDeclaration): boolean {
+  return cls.getDecorators().some(decorator => decorator.getName() === 'Entity');
+}
+
+function extractTypeOrmRelationTargets(cls: import('ts-morph').ClassDeclaration): string[] {
+  const targets = new Set<string>();
+  const RELATION_DECORATORS = new Set([
+    'ManyToOne', 'OneToMany', 'ManyToMany', 'OneToOne',
+    'JoinColumn', 'JoinTable',
+  ]);
+
+  for (const property of cls.getInstanceProperties()) {
+    for (const decorator of property.getDecorators()) {
+      const name = decorator.getName();
+      if (!RELATION_DECORATORS.has(name)) continue;
+
+      const args = decorator.getArguments();
+      for (const arg of args) {
+        // String form: @ManyToOne('Contact')
+        if (arg.getKind() === SyntaxKind.StringLiteral) {
+          const text = (arg as import('ts-morph').StringLiteral).getLiteralValue();
+          if (text) targets.add(text);
+          continue;
+        }
+
+        // Arrow function form: @ManyToOne(() => Contact)
+        if (arg.getKind() === SyntaxKind.ArrowFunction) {
+          const body = (arg as import('ts-morph').ArrowFunction).getBody();
+          if (body.getKind() === SyntaxKind.Identifier) {
+            targets.add(body.getText());
+          }
+          continue;
+        }
+
+        // Function form: @ManyToOne(function() { return Contact; })
+        if (arg.getKind() === SyntaxKind.FunctionExpression) {
+          const returns = (arg as import('ts-morph').FunctionExpression).getStatements()
+            .filter(stmt => stmt.getKind() === SyntaxKind.ReturnStatement)
+            .map(stmt => stmt as import('ts-morph').ReturnStatement);
+          for (const ret of returns) {
+            const expr = ret.getExpression();
+            if (expr && expr.getKind() === SyntaxKind.Identifier) {
+              targets.add(expr.getText());
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return [...targets];
 }
 
 function normalizeTypeName(name: string | null | undefined): string | null {
@@ -182,6 +252,8 @@ export async function buildGraph(rootDir: string, options?: { mode?: IndexingMod
     subtypes: Object.create(null) as Record<string, string[]>,
     implementations: Object.create(null) as Record<string, string[]>,
     implementedFrom: Object.create(null) as Record<string, string[]>,
+    entityRelations: Object.create(null) as Record<string, string[]>,
+    resolvedImports: Object.create(null) as Record<string, string[]>,
   };
 
   const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
@@ -240,6 +312,18 @@ export async function buildGraph(rootDir: string, options?: { mode?: IndexingMod
       if (!className) continue;
 
       typeNames.add(className);
+
+      if (isTypeOrmEntity(cls)) {
+        const relationTargets = extractTypeOrmRelationTargets(cls);
+        if (relationTargets.length > 0) {
+          graph.entityRelations![className] = relationTargets;
+          for (const target of relationTargets) {
+            addUnique(graph.symbols, className, target);
+            addUnique(graph.callers, target, className);
+          }
+        }
+      }
+
       typeMembers[className] = new Set(cls.getMethods().map(method => method.getName()));
       const directSupertypes = directTypeReferences([
         cls.getExtends()?.getExpression().getText(),
@@ -264,6 +348,8 @@ export async function buildGraph(rootDir: string, options?: { mode?: IndexingMod
       }
     }
   }
+
+  await buildResolvedImportsAsync(graph, rootDir);
 
   return graph;
 }
@@ -295,6 +381,8 @@ export async function buildGraphAsync(rootDir: string, options?: { mode?: Indexi
     subtypes: Object.create(null) as Record<string, string[]>,
     implementations: Object.create(null) as Record<string, string[]>,
     implementedFrom: Object.create(null) as Record<string, string[]>,
+    entityRelations: Object.create(null) as Record<string, string[]>,
+    resolvedImports: Object.create(null) as Record<string, string[]>,
   };
 
   const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
@@ -351,6 +439,18 @@ export async function buildGraphAsync(rootDir: string, options?: { mode?: Indexi
       if (!className) continue;
 
       typeNames.add(className);
+
+      if (isTypeOrmEntity(cls)) {
+        const relationTargets = extractTypeOrmRelationTargets(cls);
+        if (relationTargets.length > 0) {
+          graph.entityRelations![className] = relationTargets;
+          for (const target of relationTargets) {
+            addUnique(graph.symbols, className, target);
+            addUnique(graph.callers, target, className);
+          }
+        }
+      }
+
       typeMembers[className] = new Set(cls.getMethods().map(method => method.getName()));
       const directSupertypes = directTypeReferences([
         cls.getExtends()?.getExpression().getText(),
@@ -377,6 +477,8 @@ export async function buildGraphAsync(rootDir: string, options?: { mode?: Indexi
   }
 
   await buildPhpGraphAsync(rootDir, graph, { includeFiles });
+
+  await buildResolvedImportsAsync(graph, rootDir);
 
   return graph;
 }

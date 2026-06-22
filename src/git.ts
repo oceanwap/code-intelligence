@@ -259,6 +259,48 @@ export async function getHeadCommitAsync(projectRoot: string): Promise<string | 
   }
 }
 
+/**
+ * Count how many recent commits touched each indexable file.
+ * Returns paths relative to projectRoot (forward-slash normalized).
+ */
+export async function getFileChurnAsync(projectRoot: string, maxCount = 200): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  const gitRoot = await findGitRootAsync(projectRoot);
+  if (!gitRoot) return counts;
+
+  const resolvedRoot = path.resolve(projectRoot);
+  let raw = '';
+  try {
+    const format = '%H%x00';
+    raw = await runGitAsync(projectRoot, [
+      'log',
+      `--max-count=${maxCount}`,
+      `--pretty=format:${format}`,
+      '--name-only',
+      '--diff-filter=AM',
+      'HEAD',
+    ]);
+  } catch {
+    return counts;
+  }
+
+  const segments = raw.split('\0');
+  for (const segment of segments) {
+    const lines = segment.split('\n').map(line => line.trim()).filter(Boolean);
+    // First line is the commit SHA, remaining lines are changed file paths.
+    for (let index = 1; index < lines.length; index += 1) {
+      const gitRel = lines[index];
+      if (!gitRel) continue;
+      const absPath = path.join(gitRoot, gitRel);
+      const relToProject = path.relative(resolvedRoot, absPath).replace(/\\/g, '/');
+      if (relToProject.startsWith('..')) continue;
+      counts.set(relToProject, (counts.get(relToProject) ?? 0) + 1);
+    }
+  }
+
+  return counts;
+}
+
 export async function listRecentCommitMetadataAsync(projectRoot: string, maxCount = 150): Promise<GitCommitMetadata[]> {
   if (!await isGitRepoAsync(projectRoot)) return [];
 

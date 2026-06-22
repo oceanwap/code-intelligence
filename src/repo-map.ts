@@ -98,11 +98,19 @@ function resolveImportSpecifier(
 function buildFileImportGraph(graph: GraphData): Map<string, string[]> {
   const knownFiles = new Set(Object.keys(graph.files));
   const fileImports = new Map<string, string[]>();
-  for (const [filePath, specifiers] of Object.entries(graph.files)) {
+  for (const filePath of Object.keys(graph.files)) {
     const resolved: string[] = [];
-    for (const spec of specifiers) {
-      const target = resolveImportSpecifier(filePath, spec, knownFiles);
-      if (target && target !== filePath) resolved.push(target);
+    // Prefer pre-resolved cross-package/workspace imports from the graph.
+    const preResolved = graph.resolvedImports?.[filePath];
+    if (preResolved) {
+      for (const target of preResolved) {
+        if (target !== filePath) resolved.push(target);
+      }
+    } else {
+      for (const spec of graph.files[filePath] ?? []) {
+        const target = resolveImportSpecifier(filePath, spec, knownFiles);
+        if (target && target !== filePath) resolved.push(target);
+      }
     }
     if (resolved.length > 0) fileImports.set(filePath, resolved);
   }
