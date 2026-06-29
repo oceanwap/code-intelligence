@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "updated": "2026-06-29T04-15:00Z",
+  "items": [
+    {
+      "id": "cognition-layer",
+      "title": "Cognition Layer + Superpowered Combo Tools",
+      "type": "feature",
+      "status": "draft",
+      "prd": ".prd/prd-cognition-layer.md",
+      "summary": "Lift the 25 leaf tools with a signalization layer, blackboard, composite scoring, and 4 superpowered combo tools (audit_symbol, plan_refactor, trace_workflow, collaborate) plus a goal/intent API. Leaves stay; never replaced.",
+      "sprints": [
+        {
+          "id": "sprint-1",
+          "name": "Sprint 1: P0 foundation + P1 leaf upgrades",
+          "loc_estimate": 1470,
+          "stories": ["US-001", "US-002"]
+        },
+        {
+          "id": "sprint-2",
+          "name": "Sprint 2: P2 composite scoring + cross-output index",
+          "loc_estimate": 430,
+          "stories": ["US-003"]
+        },
+        {
+          "id": "sprint-3",
+          "name": "Sprint 3: P3a audit_symbol + plan_refactor",
+          "loc_estimate": 950,
+          "stories": ["US-004"]
+        },
+        {
+          "id": "sprint-4",
+          "name": "Sprint 4: P3b trace_workflow + collaborate + P4 intents/recommend/session_status",
+          "loc_estimate": 1700,
+          "stories": ["US-005", "US-006"]
+        }
+      ],
+      "totals": {
+        "loc_estimate": 4850,
+        "sprints": 4,
+        "user_stories": 6
+      },
+      "open_questions": [
+        "OQ-1: collaborate intent classification (heuristic vs Ollama)",
+        "OQ-2: blast_radius storage (composite-scores.json vs attention.json)",
+        "OQ-3: cross-output embedding cost (TTL/per-commit)",
+        "OQ-4: recommended_next cold start (heuristic vs learned)",
+        "OQ-5: audit_symbol writeToBlackboard default"
+      ],
+      "next_step": "Engineer for US-001 (P0 cognition foundation)"
+    }
+  ]
+}
