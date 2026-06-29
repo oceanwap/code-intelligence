@@ -5,6 +5,7 @@ import { walkFiles } from './indexer.js';
 import { buildPhpGraphAsync } from './php-graph.js';
 import type { IndexingMode } from './indexer.js';
 import { loadWorkspaceResolverAsync, resolveImportToFile } from './workspace-imports.js';
+import { extractSideEffects, type SideEffect } from './behavior-graph.js';
 
 export interface GraphCallSite {
   symbol: string;
@@ -37,6 +38,8 @@ export interface GraphData {
   entityRelations?: Record<string, string[]>;
   /** relative file path → list of resolved imported file paths (relative to projectRoot) */
   resolvedImports: Record<string, string[]>;
+  /** symbol name → side effects detected for that symbol (DB, HTTP, cache, queue, events, etc.) */
+  sideEffects?: Record<string, SideEffect[]>;
 }
 
 type FnLike = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
@@ -160,6 +163,19 @@ function registerImplementation(graph: GraphData, baseSymbol: string, implementa
   addUnique(graph.implementedFrom, implementationSymbol, baseSymbol);
 }
 
+function extractSideEffectsMap(project: Project, rootDir: string): Map<string, SideEffect[]> {
+  const combined = new Map<string, SideEffect[]>();
+  for (const sf of project.getSourceFiles()) {
+    const effects = extractSideEffects(sf, rootDir);
+    for (const [symbol, list] of effects) {
+      const existing = combined.get(symbol);
+      if (existing) existing.push(...list);
+      else combined.set(symbol, [...list]);
+    }
+  }
+  return combined;
+}
+
 /** Extract a display name for any function-like node */
 function getFnName(node: FnLike, parentName?: string): string | null {
   if (Node.isFunctionDeclaration(node)) return node.getName() ?? null;
@@ -254,6 +270,7 @@ export async function buildGraph(rootDir: string, options?: { mode?: IndexingMod
     implementedFrom: Object.create(null) as Record<string, string[]>,
     entityRelations: Object.create(null) as Record<string, string[]>,
     resolvedImports: Object.create(null) as Record<string, string[]>,
+    sideEffects: Object.create(null) as Record<string, SideEffect[]>,
   };
 
   const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
@@ -349,6 +366,11 @@ export async function buildGraph(rootDir: string, options?: { mode?: IndexingMod
     }
   }
 
+  const sideEffectsMap = extractSideEffectsMap(project, rootDir);
+  for (const [symbol, effects] of sideEffectsMap) {
+    if (effects.length > 0) graph.sideEffects![symbol] = effects;
+  }
+
   await buildResolvedImportsAsync(graph, rootDir);
 
   return graph;
@@ -383,6 +405,7 @@ export async function buildGraphAsync(rootDir: string, options?: { mode?: Indexi
     implementedFrom: Object.create(null) as Record<string, string[]>,
     entityRelations: Object.create(null) as Record<string, string[]>,
     resolvedImports: Object.create(null) as Record<string, string[]>,
+    sideEffects: Object.create(null) as Record<string, SideEffect[]>,
   };
 
   const typeMembers: TypeMembers = Object.create(null) as TypeMembers;
@@ -478,6 +501,11 @@ export async function buildGraphAsync(rootDir: string, options?: { mode?: Indexi
 
   await buildPhpGraphAsync(rootDir, graph, { includeFiles });
 
+  const sideEffectsMap = extractSideEffectsMap(project, rootDir);
+  for (const [symbol, effects] of sideEffectsMap) {
+    if (effects.length > 0) graph.sideEffects![symbol] = effects;
+  }
+
   await buildResolvedImportsAsync(graph, rootDir);
 
   return graph;
@@ -488,10 +516,51 @@ export async function saveGraph(graph: GraphData, outPath: string): Promise<void
   await Bun.write(outPath, JSON.stringify(graph, null, 2));
 }
 
+function nullPrototypeRecord<T>(record: Record<string, T> | undefined): Record<string, T> {
+  if (!record) return Object.create(null) as Record<string, T>;
+  const safe = Object.create(null) as Record<string, T>;
+  for (const [key, value] of Object.entries(record)) {
+    safe[key] = value;
+  }
+  return safe;
+}
+
+function normalizeGraphRelations(graph: GraphData): GraphData {
+  const relationKeys: Array<keyof GraphData> = [
+    'symbols', 'callers', 'supertypes', 'subtypes', 'implementations', 'implementedFrom',
+    'files', 'resolvedImports', 'callSites', 'calledBySites', 'entityRelations',
+  ];
+  for (const key of relationKeys) {
+    const record = graph[key] as Record<string, unknown> | undefined;
+    if (!record) continue;
+    const safe = Object.create(null) as Record<string, unknown>;
+    for (const [entryKey, value] of Object.entries(record)) {
+      safe[entryKey] = Array.isArray(value) ? value : [];
+    }
+    (graph as unknown as Record<string, unknown>)[key] = safe;
+  }
+  // symbolFile is also a plain object that can collide with prototype methods.
+  if (graph.symbolFile) {
+    graph.symbolFile = nullPrototypeRecord(graph.symbolFile);
+  }
+  // sideEffects is optional (added later than other relations) — default when missing
+  // so older graph.json snapshots still load.
+  if (!graph.sideEffects) {
+    graph.sideEffects = Object.create(null) as Record<string, SideEffect[]>;
+  } else {
+    const safe = Object.create(null) as Record<string, unknown>;
+    for (const [entryKey, value] of Object.entries(graph.sideEffects)) {
+      safe[entryKey] = Array.isArray(value) ? value : [];
+    }
+    graph.sideEffects = safe as Record<string, SideEffect[]>;
+  }
+  return graph;
+}
+
 export async function loadGraphAsync(graphPath: string): Promise<GraphData | null> {
   try {
     const raw = await Bun.file(graphPath).text();
-    return JSON.parse(raw) as GraphData;
+    return normalizeGraphRelations(JSON.parse(raw) as GraphData);
   } catch {
     return null;
   }
@@ -501,7 +570,7 @@ export async function loadGraphAsyncStrict(graphPath: string): Promise<GraphData
   try {
     const file = Bun.file(graphPath);
     if (!(await file.exists())) return null;
-    return JSON.parse(await file.text()) as GraphData;
+    return normalizeGraphRelations(JSON.parse(await file.text()) as GraphData);
   } catch {
     return null;
   }
