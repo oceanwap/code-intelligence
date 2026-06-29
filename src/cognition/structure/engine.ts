@@ -4,6 +4,7 @@ import { loadGraphAsync, type GraphData } from '../../graph.js';
 import { loadArchitectureAsync, refreshArchitectureAsync } from '../architecture/storage.js';
 import { type StructureCycle, type StructureDependency, type StructureModule, type StructureSnapshot } from './types.js';
 import { moduleFromFile } from '../../utils/module-path.js';
+import { saveValidatedSnapshotAsync, loadValidatedSnapshotAsync } from '../../pipeline-contract.js';
 
 function structureFile(projectRoot: string): string {
   return path.join(getDataDir(projectRoot), 'structure.json');

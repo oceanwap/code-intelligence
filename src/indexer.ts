@@ -12,12 +12,27 @@ export interface CodeChunk {
   imports: string[];
   lineStart: number;
   lineEnd: number;
+  /** SHA256 hex digest of the file's full content at parse time. US-002 / P1-1. */
+  content_hash?: string;
 }
 
 export type IndexingMode = 'fast' | 'full';
 export interface IndexDirectoryOptions {
   mode?: IndexingMode;
   includeFiles?: Set<string>;
+  /** Content-hash cache. When provided, files whose SHA256 matches a cache
+   *  entry are reused verbatim — the ts-morph parse is skipped for them. */
+  contentHashCache?: ContentHashCache;
+}
+
+export interface ContentHashCacheEntry {
+  content_hash: string;
+  chunks: Array<Omit<CodeChunk, 'content_hash'>>;
+}
+
+export interface ContentHashCache {
+  entries: Record<string, ContentHashCacheEntry>;
+  generatedAt?: string;
 }
 
 // Extensions indexed as whole-file plain-text chunks (no AST)
@@ -344,24 +359,60 @@ async function indexPlainFilesAsync(rootDir: string, mode: IndexingMode, include
 export async function indexDirectory(rootDir: string, options?: IndexDirectoryOptions): Promise<CodeChunk[]> {
   const mode = options?.mode ?? 'full';
   const includeFiles = options?.includeFiles;
+  const cache = options?.contentHashCache;
+
+  // Compute hashes for every indexable TS/JS/PHP file up front so we can decide
+  // which ones to re-parse. Files whose hash matches the cache are reused
+  // verbatim — the ts-morph parse is skipped.
+  const absFiles: string[] = [];
+  const tsJs = await walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']);
+  for (const f of tsJs) {
+    const rel = path.relative(rootDir, f).replace(/\\/g, '/');
+    if (includeFiles && !includeFiles.has(rel)) continue;
+    if (mode === 'fast' && isLowSignalPathForFast(rel)) continue;
+    absFiles.push(f);
+  }
+
+  const hashByPath = new Map<string, string>();
+  const filesToParse: string[] = [];
+  for (const abs of absFiles) {
+    const rel = path.relative(rootDir, abs).replace(/\\/g, '/');
+    const hash = await sha256File(abs);
+    hashByPath.set(rel, hash);
+    const cached = cache?.entries[rel];
+    if (cached && cached.content_hash === hash && cached.chunks.length > 0) {
+      continue;
+    }
+    filesToParse.push(abs);
+  }
+
   const project = new Project({
     skipAddingFilesFromTsConfig: true,
     compilerOptions: { allowJs: true },
   });
-
-  const tsFiles = await walkFiles(rootDir, ['.ts', '.tsx', '.js', '.jsx']);
-  tsFiles.forEach(f => {
-    const relPath = path.relative(rootDir, f);
-    if (includeFiles && !includeFiles.has(relPath)) return;
-    if (mode === 'fast' && isLowSignalPathForFast(relPath)) return;
+  for (const f of filesToParse) {
     project.addSourceFileAtPath(f);
-  });
+  }
 
   const chunks: CodeChunk[] = [];
 
+  if (cache) {
+    for (const abs of absFiles) {
+      const rel = path.relative(rootDir, abs).replace(/\\/g, '/');
+      const hash = hashByPath.get(rel);
+      const cached = cache.entries[rel];
+      if (cached && cached.content_hash === hash && cached.chunks.length > 0) {
+        for (const c of cached.chunks) {
+          chunks.push({ ...c, content_hash: hash });
+        }
+      }
+    }
+  }
+
   for (const sf of project.getSourceFiles()) {
-    const relPath = path.relative(rootDir, sf.getFilePath());
+    const relPath = path.relative(rootDir, sf.getFilePath()).replace(/\\/g, '/');
     const imports = sf.getImportDeclarations().map(d => d.getModuleSpecifierValue());
+    const hash = hashByPath.get(relPath);
 
     for (const fn of sf.getFunctions()) {
       const name = fn.getName() ?? '<anonymous>';
@@ -373,6 +424,7 @@ export async function indexDirectory(rootDir: string, options?: IndexDirectoryOp
         type: 'function',
         code: fn.getText(),
         imports,
+        content_hash: hash,
         ...range,
       });
     }
@@ -387,6 +439,7 @@ export async function indexDirectory(rootDir: string, options?: IndexDirectoryOp
         type: 'class',
         code: cls.getText(),
         imports,
+        content_hash: hash,
         ...classRange,
       });
 
@@ -400,6 +453,7 @@ export async function indexDirectory(rootDir: string, options?: IndexDirectoryOp
           type: 'method',
           code: method.getText(),
           imports,
+          content_hash: hash,
           ...methodRange,
         });
       }
@@ -509,6 +563,56 @@ export function chunkId(file: string, symbol: string): string {
     .update(`${file}::${symbol}`)
     .digest('hex')
     .slice(0, 32);
+}
+
+/** SHA256 hex digest of a file's full content. Returns empty string when the
+ *  file cannot be read. */
+export async function sha256File(absPath: string): Promise<string> {
+  try {
+    const file = Bun.file(absPath);
+    if (!(await file.exists())) return '';
+    const buf = await file.arrayBuffer();
+    return crypto.createHash('sha256').update(Buffer.from(buf)).digest('hex');
+  } catch {
+    return '';
+  }
+}
+
+/** Build a content-hash cache from a parsed chunk list, keyed by `chunk.file`. */
+export function buildContentHashCache(chunks: CodeChunk[]): ContentHashCache {
+  const entries: Record<string, ContentHashCacheEntry> = {};
+  for (const c of chunks) {
+    if (!c.content_hash) continue;
+    const list = entries[c.file] ?? (entries[c.file] = { content_hash: c.content_hash, chunks: [] });
+    list.chunks.push({
+      id: c.id,
+      file: c.file,
+      symbol: c.symbol,
+      type: c.type,
+      code: c.code,
+      imports: c.imports,
+      lineStart: c.lineStart,
+      lineEnd: c.lineEnd,
+    });
+  }
+  return { entries, generatedAt: new Date().toISOString() };
+}
+
+export async function loadContentHashCacheAsync(cacheFile: string): Promise<ContentHashCache> {
+  try {
+    const file = Bun.file(cacheFile);
+    if (!(await file.exists())) return { entries: {} };
+    const raw = await file.text();
+    const parsed = JSON.parse(raw) as ContentHashCache;
+    if (!parsed || typeof parsed !== 'object' || !parsed.entries) return { entries: {} };
+    return parsed;
+  } catch {
+    return { entries: {} };
+  }
+}
+
+export async function saveContentHashCacheAsync(cache: ContentHashCache, cacheFile: string): Promise<void> {
+  await Bun.write(cacheFile, JSON.stringify(cache));
 }
 
 // Format 32-char hex as UUID for Qdrant point IDs

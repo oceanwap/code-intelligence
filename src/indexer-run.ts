@@ -1,5 +1,14 @@
 import * as path from 'path';
-import { indexDirectory, buildManifestAsync, loadManifestAsync, saveManifestAsync, listIndexableFiles } from './indexer.js';
+import {
+  indexDirectory,
+  buildManifestAsync,
+  loadManifestAsync,
+  saveManifestAsync,
+  listIndexableFiles,
+  buildContentHashCache,
+  loadContentHashCacheAsync,
+  saveContentHashCacheAsync,
+} from './indexer.js';
 import type { CodeChunk } from './indexer.js';
 import { QdrantClient } from '@qdrant/js-client-rest';
 import { embedAndStore, deletePoints, deleteOrphanPoints, ensureActiveAliasAsync, cleanupOrphanedCollectionsAsync } from './embedder.js';
@@ -16,6 +25,8 @@ import { refreshFailureIntelligenceAsync } from './cognition/failures/engine.js'
 import { validateArchitectureAsync } from './cognition/constraints/engine.js';
 import { refreshEvolutionAsync } from './cognition/evolution/engine.js';
 import { refreshMemoryGovernanceAsync } from './cognition/governance/engine.js';
+import { validateIndexerOutput, validateGraphOutput } from './pipeline-contract.js';
+import { detectCommunities, saveCommunitiesAsync } from './cognition/communities.js';
 
 export interface IndexResult {
   mode: IndexMode;
@@ -263,7 +274,8 @@ export async function indexProject(
   qdrantUrl = 'http://localhost:6333',
   onProgress?: ProgressCallback,
   fromScratch = false,
-  mode: IndexMode = 'fast'
+  mode: IndexMode = 'fast',
+  pathFilter?: Set<string>
 ): Promise<IndexResult> {
   const runStartedAt = nowMs();
   const stageDurationsMs: Record<string, number> = {};
@@ -282,18 +294,26 @@ export async function indexProject(
   const churnMap = await getFileChurnAsync(root, 200);
 
   let includeFiles: Set<string> | undefined;
-  if (mode === 'fast') {
+  if (pathFilter && pathFilter.size > 0) {
+    // Path filter from CLI (e.g. post-commit hook) wins over the fast-mode
+    // candidate set: it limits the index to the files the caller cares about.
+    includeFiles = pathFilter;
+  } else if (mode === 'fast') {
     onProgress?.('pre-scanning', 0, 1);
     includeFiles = await measure('pre-scanning', () => buildFastCandidateSet(root, churnMap));
     onProgress?.('pre-scanning', 1, 1);
   }
 
   onProgress?.('parsing', 0, 1);
-  const discoveredChunks = await measure('parsing', () => indexDirectory(root, { mode, includeFiles }));
+  const contentHashCache = await loadContentHashCacheAsync(cacheFile);
+  const discoveredChunks = await measure('parsing', () => indexDirectory(root, { mode, includeFiles, contentHashCache }));
+  validateIndexerOutput(discoveredChunks);
+  await saveContentHashCacheAsync(buildContentHashCache(discoveredChunks), cacheFile);
   onProgress?.('parsing', 1, 1);
 
   onProgress?.('building-graph', 0, 1);
   const graph = await measure('building-graph', () => buildGraphAsync(root, { mode, includeFiles }));
+  validateGraphOutput(graph);
   await saveGraph(graph, path.join(dataDir, 'graph.json'));
   onProgress?.('building-graph', 1, 1);
 
@@ -392,6 +412,10 @@ export async function indexProject(
     onProgress?.('computing-cognition', 7, 8);
     const governance = await refreshMemoryGovernanceAsync(root);
     onProgress?.('computing-cognition', 8, 8);
+    // US-002 / P1-7: Louvain communities over entity+symbol subgraph.
+    // Written to communities.json; served via list_communities MCP tool.
+    const communitiesSnapshot = detectCommunities(graph);
+    await saveCommunitiesAsync(root, communitiesSnapshot);
     return {
       structure,
       architecture,

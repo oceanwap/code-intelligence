@@ -74,6 +74,8 @@ import {
   validateArchitectureAsync,
 } from './cognition/constraints/engine.js';
 import { loadCognitionConfigAsync } from './cognition/config.js';
+import { safeFetch, SecurityError } from './utils/security.js';
+import { loadCommunitiesAsync, listCommunitiesForSymbol } from './cognition/communities.js';
 import {
   architectureDriftAsync,
   hotspotAnalysisAsync,
@@ -117,6 +119,17 @@ import { validateIntent, renderIntentValidation } from './intent-validator.js';
 import { validateGeneratedCode, renderCodeValidation } from './code-validator.js';
 import { getModuleConventions, renderModuleConventions } from './module-conventions.js';
 import { buildRepoMap, renderRepoMap } from './repo-map.js';
+import { withSignals as withSignalsEnvelope, isToolResult as isEnvelope } from './cognition/signalization/builder.js';
+import {
+  type ToolResult,
+  type ConfidenceTier,
+} from './cognition/signalization/types.js';
+import {
+  readScratchpad,
+  appendScratchpad,
+  clearScratchpad,
+  type ScratchpadEntry,
+} from './cognition/blackboard/scratchpad.js';
 
 const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositories, indexes and project memory are branch-scoped, so check status or re-index after switching branches.';
 const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
@@ -395,11 +408,14 @@ async function enforceCognitionPipeline(projectRoot: string, qdrantUrl = 'http:/
 
 async function checkQdrantHealthAsync(qdrantUrl: string): Promise<{ status: 'healthy' | 'degraded' | 'unavailable'; message?: string }> {
   try {
-    const res = await fetch(`${qdrantUrl.replace(/\/$/, '')}/healthz`);
+    const res = await safeFetch(`${qdrantUrl.replace(/\/$/, '')}/healthz`, { allowLocal: true });
     if (res.ok) return { status: 'healthy' };
     const text = await res.text().catch(() => '');
     return { status: 'degraded', message: `Qdrant healthz returned ${res.status}: ${text}` };
   } catch (error) {
+    if (error instanceof SecurityError) {
+      return { status: 'unavailable', message: error.message };
+    }
     const message = error instanceof Error ? error.message : String(error);
     return { status: 'unavailable', message: `Qdrant unreachable at ${qdrantUrl}: ${message}` };
   }
@@ -425,7 +441,31 @@ function qdrantUnavailableResponse(qdrantUrl: string): { content: Array<{ type: 
   };
 }
 
-function createMcpServer(): McpServer {
+/**
+ * wrapLeaf — opt-in envelope wrapper for NEW tool registrations (US-001 P0).
+ *
+ * Existing 25 leaves were registered before this helper existed and keep their
+ * native shape (PRD FR-2, NG-1). Future tools may wrap themselves through
+ * `wrapLeaf(name, fn)` so their handler returns a ToolResult<T> envelope.
+ *
+ * The wrapped handler:
+ *   - awaits the leaf function,
+ *   - if it already produced a ToolResult (pass-through), keeps it,
+ *   - else wraps the return value as `data` with default EXTRACTED confidence,
+ *   - also attaches `name` so downstream tools can attribute the call.
+ *
+ * This helper is intentionally synchronous: it does not touch the scratchpad
+ * here. Wiring pre/post hooks around every call is a later step (US-006 P4);
+ * for now, the envelope is what we ship.
+ */
+function wrapLeaf<T>(
+  name: string,
+  fn: (...args: any[]) => T | Promise<T>,
+): (...args: any[]) => Promise<ToolResult<T>> {
+  return withSignalsEnvelope(fn, { name });
+}
+
+export function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
   attachToolLogging(server);
 
@@ -2344,6 +2384,44 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // --- list_communities (US-002 / P1-7) ---
+  // Returns Louvain communities over the entity+symbol subgraph. Reads from
+  // .code-intelligence/<branch>/communities.json (written during indexProject
+  // pipeline refresh). Returns the same shape as render_behavior:
+  //   z.object inputSchema → { content: [{ type: 'text', text }] }.
+  server.registerTool(
+    'list_communities',
+    {
+      description: 'List Louvain communities detected over the entity+symbol graph. Without a symbol, returns every community. With `symbol`, returns only the community that contains that symbol. Use after get_symbol to find structurally related symbols in the same community cluster.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbol: z.string().optional().describe('Optional exact symbol name to filter to its containing community.'),
+        branch: z.string().optional().describe('Optional branch override (defaults to the currently checked-out branch).'),
+      },
+    },
+    async ({ projectRoot, symbol, branch }) => {
+      const root = path.resolve(projectRoot);
+      try {
+        const snapshot = await loadCommunitiesAsync(root);
+        if (!snapshot || snapshot.totalCommunities === 0) {
+          return { content: [{ type: 'text', text: `No communities recorded yet. Run index_project first.` }] };
+        }
+        const result = listCommunitiesForSymbol(snapshot, symbol);
+        const header = `Communities for branch "${branch ?? 'current'}" — ${snapshot.totalCommunities} communities, modularity ${snapshot.modularity}, ${snapshot.totalNodes} nodes`;
+        if (result.communities.length === 0) {
+          return { content: [{ type: 'text', text: `${header}\nNo community contains symbol "${symbol}".` }] };
+        }
+        const body = result.communities
+          .map(c => `### Community ${c.id} (size ${c.size})\n${c.members.join(', ')}`)
+          .join('\n\n');
+        return { content: [{ type: 'text', text: `${header}\n\n${body}` }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse('http://localhost:6333');
+        throw error;
+      }
+    }
+  );
+
   server.registerTool(
     'find_references',
     {
@@ -2713,6 +2791,40 @@ function createMcpServer(): McpServer {
         includeMethods: includeMethods !== false,
       });
       return { content: [{ type: 'text', text: renderRepoMap(result) }] };
+    }
+  );
+
+  // --- session_scratchpad ---
+  // Read-only inspector for the per-session blackboard append-log.
+  // This is FR-9's test surface for free — it lets a caller verify that a
+  // session has been writing through the blackboard without mutating it.
+  server.registerTool(
+    'session_scratchpad',
+    {
+      description: 'Read the per-session blackboard scratchpad for a given sessionId. Returns the JSON append-log as a pretty-printed array. Read-only — refuses to mutate. Use this as a sanity check after wrapping calls in `withSignals` to confirm ToolResult entries are landing in the scratchpad. Path: .code-intelligence/<branch>/scratchpad/<sessionId>.json.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        sessionId: z.string().describe('Session identifier (must be non-empty). The same sessionId passed to wrapped tool calls.'),
+        clear: z.boolean().optional().describe('If true, delete the scratchpad file after reading. Defaults to false. Equivalent to calling clearScratchpad directly — use sparingly.'),
+      },
+    },
+    async ({ projectRoot, sessionId, clear }) => {
+      try {
+        const root = path.resolve(projectRoot);
+        const entries = await readScratchpad(sessionId, { projectRoot: root });
+        if (clear === true) {
+          await clearScratchpad(sessionId, { projectRoot: root });
+        }
+        if (entries.length === 0) {
+          return { content: [{ type: 'text', text: `Scratchpad for session "${sessionId}" is empty.` }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(entries, null, 2) }] };
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: `Error reading scratchpad: ${(error as Error).message}` }],
+          isError: true,
+        };
+      }
     }
   );
 

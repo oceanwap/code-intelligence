@@ -217,9 +217,14 @@ program
   .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
   .option('--from-scratch', 'Delete all previous index data and rebuild from zero', false)
   .option('--full-index', 'Index all chunks, including lower-relevance docs/config/plain-file slices (default is fast mode)', false)
-  .action(async (dir: string, opts: { qdrant: string; fromScratch: boolean; fullIndex: boolean }) => {
+  .option('--incremental', 'No-op: indexer is already incremental via mtime + content-hash cache. Accepted for hook compatibility.', false)
+  .option('--paths <paths>', 'Comma-separated relative paths to re-index (used by the post-commit hook).')
+  .action(async (dir: string, opts: { qdrant: string; fromScratch: boolean; fullIndex: boolean; incremental: boolean; paths?: string }) => {
     const root = path.resolve(dir);
     const indexMode = opts.fullIndex ? 'full' : 'fast';
+    const pathFilter = opts.paths
+      ? new Set(opts.paths.split(',').map(p => p.trim()).filter(Boolean).map(p => p.replace(/^\.\//, '')))
+      : undefined;
 
     console.log(`Scanning ${root}...`);
     if (opts.fromScratch) {
@@ -258,7 +263,7 @@ program
         // Progress with counter
         drawBar(label, done, total);
       }
-    }, opts.fromScratch, indexMode);
+    }, opts.fromScratch, indexMode, pathFilter);
 
     console.log(''); // final newline
     console.log(`  ${result.discoveredChunks} chunks discovered`);
@@ -1744,6 +1749,140 @@ program
       const { saveSemanticDuplicatesAsync } = await import('./cognition/duplicates/storage.js');
       await saveSemanticDuplicatesAsync(root, snapshot);
       console.log(`Saved to .code-intelligence/<branch>/semantic-duplicates.json`);
+    }
+  });
+
+// ─── US-002 / P1-3: hook install ──────────────────────────────────────────────
+
+const POST_COMMIT_HOOK_TEMPLATE = `#!/usr/bin/env bash
+# Installed by code-intelligence (US-002 / P1-3). Idempotent.
+# Triggers an incremental index for the files changed in the most recent commit.
+set -e
+ROOT="\$(git rev-parse --show-toplevel)"
+CHANGED="\$(git diff-tree --no-commit-id --name-only -r HEAD~1 HEAD 2>/dev/null || true)"
+if [ -z "\$CHANGED" ]; then
+  exit 0
+fi
+exec code-intelligence index "\$ROOT" --incremental --paths \$CHANGED >/dev/null 2>&1 || true
+`;
+
+program
+  .command('hook <action>')
+  .description('Manage the post-commit git hook (action: install | uninstall | status)')
+  .action(async (action: string) => {
+    const root = path.resolve('.');
+    const hookPath = path.join(root, '.git', 'hooks', 'post-commit');
+    if (action === 'install') {
+      try {
+        const existing = await Bun.file(hookPath).text().catch(() => '');
+        if (existing.includes('Installed by code-intelligence')) {
+          console.log(`Hook already installed at ${hookPath}`);
+          console.log(`Idempotent: re-installing (same template).`);
+        }
+        await Bun.write(hookPath, POST_COMMIT_HOOK_TEMPLATE);
+        // Make executable (best-effort — chmod may fail on some filesystems).
+        const { chmod } = await import('node:fs/promises');
+        await chmod(hookPath, 0o755).catch(() => undefined);
+        console.log(`Installed post-commit hook → ${hookPath}`);
+      } catch (err) {
+        console.error(`Failed to install hook: ${(err as Error).message}`);
+        process.exitCode = 1;
+      }
+    } else if (action === 'uninstall') {
+      try {
+        const existing = await Bun.file(hookPath).text().catch(() => '');
+        if (!existing.includes('Installed by code-intelligence')) {
+          console.log(`No code-intelligence hook found at ${hookPath}; nothing to remove.`);
+          return;
+        }
+        const { unlink } = await import('node:fs/promises');
+        await unlink(hookPath);
+        console.log(`Removed post-commit hook → ${hookPath}`);
+      } catch (err) {
+        console.error(`Failed to uninstall hook: ${(err as Error).message}`);
+        process.exitCode = 1;
+      }
+    } else if (action === 'status') {
+      try {
+        const existing = await Bun.file(hookPath).text();
+        if (existing.includes('Installed by code-intelligence')) {
+          console.log(`installed: ${hookPath}`);
+        } else {
+          console.log(`not-installed: ${hookPath}`);
+        }
+      } catch {
+        console.log(`not-installed: ${hookPath}`);
+      }
+    } else {
+      console.error(`Unknown action "${action}". Use install | uninstall | status.`);
+      process.exitCode = 1;
+    }
+  });
+
+// ─── US-002 / P1-6: graph export CLI ──────────────────────────────────────────
+
+import { writeGraphExportAsync } from './graph-export.js';
+
+program
+  .command('export graph')
+  .description('Export the indexed graph in HTML (vis.js), SVG, or GraphML format')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--format <format>', 'Output format: html|svg|graphml', 'html')
+  .option('--out <path>', 'Output file path (required)')
+  .action(async (opts: { dir: string; format: string; out?: string }) => {
+    if (!opts.out) {
+      console.error('Missing required --out <path> argument.');
+      process.exitCode = 1;
+      return;
+    }
+    const root = path.resolve(opts.dir);
+    try {
+      const result = await writeGraphExportAsync(root, opts.format as 'html' | 'svg' | 'graphml', path.resolve(opts.out));
+      console.log(`Wrote ${opts.format} graph → ${result.outPath} (${result.byteCount} bytes, ${result.nodeCount} nodes, ${result.edgeCount} edges)`);
+    } catch (err) {
+      console.error(`Graph export failed: ${(err as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+// ─── US-002 / P1-4: watch CLI ─────────────────────────────────────────────────
+
+import { startWatchAsync } from './watch-cli.js';
+
+program
+  .command('watch')
+  .description('Watch the project and reindex on change. Survives restart via pidfile.')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--paths <paths>', 'Comma-separated paths to watch (relative to --dir, or absolute). Defaults to the project root.')
+  .option('--qdrant <url>', 'Qdrant URL', 'http://localhost:6333')
+  .option('--debounce <ms>', 'Debounce delay in ms', '500')
+  .option('--foreground', 'Run in the foreground (default: detach and exit)', false)
+  .action(async (opts: { dir: string; paths?: string; qdrant: string; debounce: string; foreground: boolean }) => {
+    const root = path.resolve(opts.dir);
+    const debounce = Math.max(50, Math.min(10_000, Number(opts.debounce) || 500));
+    const watchPaths = opts.paths
+      ? opts.paths.split(',').map(p => p.trim()).filter(Boolean).map(p => path.isAbsolute(p) ? p : path.resolve(root, p))
+      : [root];
+    try {
+      const result = await startWatchAsync({
+        projectRoot: root,
+        watchPaths,
+        qdrantUrl: opts.qdrant,
+        debounceMs: debounce,
+        foreground: opts.foreground,
+      });
+      if (result.tookOver) console.log(`Took over stale watch process (pidfile: ${result.pidfile})`);
+      if (opts.foreground) {
+        console.log(`Watching ${watchPaths.join(', ')} (debounce ${debounce}ms). Press Ctrl+C to stop.`);
+        // Foreground: keep process alive.
+        process.on('SIGINT', () => { console.log('Stopping watch.'); process.exit(0); });
+        // Block forever — startWatchAsync keeps the process alive internally.
+        return;
+      }
+      console.log(`Watch detached → pid ${result.pid}, pidfile ${result.pidfile}`);
+    } catch (err) {
+      console.error(`Watch failed: ${(err as Error).message}`);
+      process.exitCode = 1;
     }
   });
 

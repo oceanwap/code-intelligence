@@ -46,6 +46,28 @@ export interface SideEffect {
   evidence: string;
 }
 
+/**
+ * Categorical confidence tier alongside the numeric `confidence` field.
+ * US-002 / P1-5: thresholds are ≥0.8 → EXTRACTED, ≥0.5 → INFERRED, <0.5 → AMBIGUOUS.
+ *
+ * TODO(US-001 P0): once `src/cognition/signalization/types.ts` lands its
+ * `confidence_tier` enum, import it here and re-export as the canonical type.
+ */
+export type ConfidenceTier = 'EXTRACTED' | 'INFERRED' | 'AMBIGUOUS';
+
+export function tierForConfidence(confidence: number): ConfidenceTier {
+  if (!Number.isFinite(confidence)) return 'AMBIGUOUS';
+  if (confidence >= 0.8) return 'EXTRACTED';
+  if (confidence >= 0.5) return 'INFERRED';
+  return 'AMBIGUOUS';
+}
+
+const TIER_LABEL: Record<ConfidenceTier, string> = {
+  EXTRACTED: 'EXTRACTED',
+  INFERRED: 'INFERRED',
+  AMBIGUOUS: 'AMBIGUOUS',
+};
+
 type FnLike = FunctionDeclaration | ArrowFunction | FunctionExpression | MethodDeclaration;
 
 interface KindMatcher {
@@ -410,7 +432,7 @@ export function renderBehaviorChecklist(effects: SideEffect[]): string {
     if (!existing || e.confidence > existing.confidence) best.set(key, e);
   }
   const sorted = [...best.values()].sort((a, b) => b.confidence - a.confidence || a.kind.localeCompare(b.kind));
-  return sorted.map(e => `✓ ${KIND_LABEL[e.kind]} ${e.target}  ${Math.round(e.confidence * 100)}%`).join('\n');
+  return sorted.map(e => `✓ ${KIND_LABEL[e.kind]} ${e.target}  ${Math.round(e.confidence * 100)}% [${TIER_LABEL[tierForConfidence(e.confidence)]}]`).join('\n');
 }
 
 export function extractSideEffects(sourceFile: SourceFile, projectRoot: string): Map<string, SideEffect[]> {

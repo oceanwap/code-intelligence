@@ -8,6 +8,7 @@ import { resolveActiveCollectionAsync } from './embedder.js';
 import { loadGraphAsync, type GraphData } from './graph.js';
 import { getDataDir } from './git.js';
 import { buildEnrichedSymbolContextAsync, type IndexedSymbolPoint } from './symbol-context.js';
+import { tierForConfidence } from './behavior-graph.js';
 
 export type { IndexedSymbolPoint };
 
@@ -73,9 +74,14 @@ export async function renderSymbolText(
   point?: IndexedSymbolPoint,
 ): Promise<string> {
   const ctx = await buildEnrichedSymbolContextAsync(projectRoot, graph, symbol, point);
+  const effects = graph?.sideEffects?.[ctx.symbol] ?? [];
+  const effectLine = effects.length > 0
+    ? `Side effects: ${effects.map(e => `${e.kind}:${e.target}@${Math.round(e.confidence * 100)}%[${tierForConfidence(e.confidence)}]`).join(', ')}`
+    : '';
   const lines = [
     `Symbol: ${ctx.symbol} (${ctx.type}) — ${ctx.file}`,
     ctx.lineStart && ctx.lineEnd ? `Lines: ${ctx.lineStart}-${ctx.lineEnd}` : '',
+    effectLine,
     ctx.freshness.indexRefreshedAt ? `Slice index refreshed: ${ctx.freshness.indexRefreshedAt}` : '',
     ctx.freshness.latestChange
       ? `Latest slice change: ${ctx.freshness.latestChange.timestamp || 'unknown'} ${ctx.freshness.latestChange.sha.slice(0, 12)} ${ctx.freshness.latestChange.title}`

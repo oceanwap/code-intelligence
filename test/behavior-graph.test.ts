@@ -739,3 +739,65 @@ test('deriveTargetFromReceiver wraps degenerate receivers in angle brackets (Fix
   assert.equal(writesC.length, 1);
   assert.equal(writesC[0]!.target, '<manager>');
 });
+
+// ─── P1-5 Confidence labels (US-002) ─────────────────────────────────────────
+
+test('tierForConfidence maps numeric confidence to categorical tier', () => {
+  const { tierForConfidence } = require('../src/behavior-graph.js') as typeof import('../src/behavior-graph.js');
+  assert.equal(tierForConfidence(1.0), 'EXTRACTED');
+  assert.equal(tierForConfidence(0.9), 'EXTRACTED');
+  assert.equal(tierForConfidence(0.8), 'EXTRACTED');
+  assert.equal(tierForConfidence(0.7), 'INFERRED');
+  assert.equal(tierForConfidence(0.5), 'INFERRED');
+  assert.equal(tierForConfidence(0.4), 'AMBIGUOUS');
+  assert.equal(tierForConfidence(0.0), 'AMBIGUOUS');
+  assert.equal(tierForConfidence(NaN), 'AMBIGUOUS');
+});
+
+test('renderBehaviorChecklist surfaces tier label alongside confidence %', () => {
+  const { renderBehaviorChecklist } = require('../src/behavior-graph.js') as typeof import('../src/behavior-graph.js');
+  const effects = [
+    {
+      kind: 'db.write' as const,
+      target: 'Booking',
+      callSite: { file: 'x.ts', line: 1 },
+      confidence: 1.0,
+      evidence: 'foo()',
+    },
+  ];
+  const out = renderBehaviorChecklist(effects);
+  assert.match(out, /100%/);
+  assert.match(out, /\[EXTRACTED\]/);
+});
+
+test('renderBehaviorChecklist marks mid-confidence as INFERRED', () => {
+  const { renderBehaviorChecklist } = require('../src/behavior-graph.js') as typeof import('../src/behavior-graph.js');
+  const effects = [
+    {
+      kind: 'http.out' as const,
+      target: '/api/x',
+      callSite: { file: 'x.ts', line: 5 },
+      confidence: 0.6,
+      evidence: 'http.get("/api/x")',
+    },
+  ];
+  const out = renderBehaviorChecklist(effects);
+  assert.match(out, /60%/);
+  assert.match(out, /\[INFERRED\]/);
+});
+
+test('renderBehaviorChecklist marks low-confidence as AMBIGUOUS', () => {
+  const { renderBehaviorChecklist } = require('../src/behavior-graph.js') as typeof import('../src/behavior-graph.js');
+  const effects = [
+    {
+      kind: 'db.write' as const,
+      target: 'X',
+      callSite: { file: 'x.ts', line: 1 },
+      confidence: 0.3,
+      evidence: 'foo()',
+    },
+  ];
+  const out = renderBehaviorChecklist(effects);
+  assert.match(out, /30%/);
+  assert.match(out, /\[AMBIGUOUS\]/);
+});
