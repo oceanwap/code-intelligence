@@ -12,18 +12,32 @@
  */
 
 import * as path from 'path';
+import { Project, SyntaxKind, type Node as MorphNode } from 'ts-morph';
 import { findExisting, type ExistingMatch } from './find-existing.js';
 import { loadArchitectureAsync } from './cognition/architecture/storage.js';
 import { listConstraintViolationsAsync } from './cognition/constraints/engine.js';
 import { moduleFromFile } from './utils/module-path.js';
 import { loadGraphAsync } from './graph.js';
 import { getDataDir } from './git.js';
+import { MissingCodeIndexError } from './retriever.js';
+import { loadSemanticDuplicates } from './cognition/duplicates/orchestrator.js';
+import { type SemanticDuplicatePattern } from './cognition/duplicates/types.js';
+import { normalizeBodyText, hashNormalized } from './cognition/duplicates/engine.js';
 
 export type ValidationSeverity = 'PASS' | 'WARN' | 'BLOCK';
 
 export interface DuplicateFlag {
   generatedSymbol: string;
   existingMatch: ExistingMatch;
+}
+
+export interface StructuralDuplicateFlag {
+  generatedSymbol: string;
+  patternId: string;
+  category: string;
+  occurrenceCount: number;
+  existingLocations: Array<{ file: string; symbol: string; line: number }>;
+  recommendation: string;
 }
 
 export interface ConstraintFlag {
@@ -42,6 +56,7 @@ export interface NamingFlag {
 export interface CodeValidationResult {
   verdict: ValidationSeverity;
   duplicateFlags: DuplicateFlag[];
+  structuralDuplicateFlags: StructuralDuplicateFlag[];
   constraintFlags: ConstraintFlag[];
   namingFlags: NamingFlag[];
   summary: string;
@@ -78,6 +93,69 @@ function extractImports(code: string): string[] {
     if (match[1]) imports.push(match[1]);
   }
   return imports;
+}
+
+function detectStructuralDuplicatesInCode(
+  code: string,
+  duplicateSnapshot: { patterns: SemanticDuplicatePattern[] } | null
+): StructuralDuplicateFlag[] {
+  if (!duplicateSnapshot || duplicateSnapshot.patterns.length === 0) return [];
+  const patternsByHash = new Map<string, SemanticDuplicatePattern>();
+  for (const pattern of duplicateSnapshot.patterns) {
+    const hash = pattern.id.split(':')[2];
+    if (hash) patternsByHash.set(hash, pattern);
+  }
+  if (patternsByHash.size === 0) return [];
+
+  const project = new Project({ useInMemoryFileSystem: true, skipAddingFilesFromTsConfig: true });
+  const sourceFile = project.createSourceFile('generated.ts', code);
+
+  const flags: StructuralDuplicateFlag[] = [];
+  const seen = new Set<string>();
+
+  const checkNode = (name: string, body: MorphNode | undefined) => {
+    if (!body) return;
+    const { normalized } = normalizeBodyText(body);
+    const hash = hashNormalized(normalized);
+    const pattern = patternsByHash.get(hash);
+    if (pattern && !seen.has(pattern.id)) {
+      seen.add(pattern.id);
+      flags.push({
+        generatedSymbol: name,
+        patternId: pattern.id,
+        category: pattern.category,
+        occurrenceCount: pattern.locations.length,
+        existingLocations: pattern.locations.slice(0, 5).map(loc => ({
+          file: loc.file,
+          symbol: loc.symbol,
+          line: loc.line,
+        })),
+        recommendation: pattern.recommendation ?? 'Review existing occurrences before adding another copy.',
+      });
+    }
+  };
+
+  for (const fn of sourceFile.getFunctions()) {
+    checkNode(fn.getName() ?? '<anonymous>', fn.getBody());
+  }
+  for (const cls of sourceFile.getClasses()) {
+    for (const method of cls.getMethods()) {
+      checkNode(`${cls.getName() ?? '<anonymous>'}.${method.getName()}`, method.getBody());
+    }
+  }
+  for (const arrow of sourceFile.getDescendants().filter(n => n.isKind(SyntaxKind.ArrowFunction))) {
+    const body = arrow.getBody();
+    if (!body) continue;
+    if (body.getKind() !== SyntaxKind.Block && body.getText().length < 20) continue;
+    const parent = arrow.getParent();
+    let name = '<anonymous-arrow>';
+    if (parent?.isKind(SyntaxKind.VariableDeclaration)) {
+      name = (parent as { getName?(): string }).getName?.() ?? name;
+    }
+    checkNode(name, body);
+  }
+
+  return flags;
 }
 
 // ── Naming pattern analysis ───────────────────────────────────────────────────
@@ -168,19 +246,28 @@ export async function validateGeneratedCode(
     architecture,
     violations,
     graph,
+    duplicateSnapshot,
   ] = await Promise.all([
     // Check each extracted symbol for duplicates.
     Promise.all(
-      generatedSymbols.slice(0, 8).map(sym =>
-        findExisting(root, sym, qdrantUrl, 3),
-      ),
+      generatedSymbols.slice(0, 8).map(async sym => {
+        try {
+          return await findExisting(root, sym, qdrantUrl, 3);
+        } catch (error) {
+          if (error instanceof MissingCodeIndexError) {
+            return { matches: [], verdict: 'SAFE_TO_CREATE' as const };
+          }
+          throw error;
+        }
+      }),
     ),
     loadArchitectureAsync(root),
     listConstraintViolationsAsync(root, { limit: 50 }),
     loadGraphAsync(path.join(getDataDir(root), 'graph.json')),
+    loadSemanticDuplicates(root),
   ]);
 
-  // 1. Duplicate flags.
+  // 1. Semantic duplicate flags (embedding-based).
   const duplicateFlags: DuplicateFlag[] = [];
   for (const [i, result] of duplicateResults.entries()) {
     for (const match of result.matches) {
@@ -189,6 +276,9 @@ export async function validateGeneratedCode(
       }
     }
   }
+
+  // 1b. Structural duplicate flags (AST-normalized shapes already in the codebase).
+  const structuralDuplicateFlags = detectStructuralDuplicatesInCode(code, duplicateSnapshot);
 
   // 2. Constraint flags — check whether generated imports touch violated modules.
   const constraintFlags: ConstraintFlag[] = [];
@@ -229,14 +319,20 @@ export async function validateGeneratedCode(
 
   // 4. Derive verdict.
   const hasBlocking = duplicateFlags.length > 0
+    || structuralDuplicateFlags.length > 0
     || constraintFlags.some(f => f.severity === 'high');
-  const hasWarnings = constraintFlags.length > 0 || namingFlags.length > 0;
+  const hasWarnings = constraintFlags.length > 0
+    || namingFlags.length > 0
+    || structuralDuplicateFlags.some(f => f.occurrenceCount >= 3);
   const verdict: ValidationSeverity = hasBlocking ? 'BLOCK' : hasWarnings ? 'WARN' : 'PASS';
 
   // 5. Summary.
   const parts: string[] = [];
   if (duplicateFlags.length > 0) {
-    parts.push(`${duplicateFlags.length} likely duplicate(s): ${duplicateFlags.map(f => f.generatedSymbol).join(', ')}`);
+    parts.push(`${duplicateFlags.length} likely semantic duplicate(s): ${duplicateFlags.map(f => f.generatedSymbol).join(', ')}`);
+  }
+  if (structuralDuplicateFlags.length > 0) {
+    parts.push(`${structuralDuplicateFlags.length} structural duplicate pattern(s): ${structuralDuplicateFlags.map(f => f.generatedSymbol).join(', ')}`);
   }
   if (constraintFlags.length > 0) {
     parts.push(`${constraintFlags.length} constraint warning(s)`);
@@ -248,18 +344,29 @@ export async function validateGeneratedCode(
     ? 'PASS — no issues detected. Code looks clean.'
     : `${verdict} — ${parts.join('; ')}.`;
 
-  return { verdict, duplicateFlags, constraintFlags, namingFlags, summary };
+  return { verdict, duplicateFlags, structuralDuplicateFlags, constraintFlags, namingFlags, summary };
 }
 
 export function renderCodeValidation(result: CodeValidationResult): string {
   const lines = [`## Code Validation — ${result.verdict}`, '', result.summary];
 
   if (result.duplicateFlags.length > 0) {
-    lines.push('', '### Duplicate Flags (BLOCK)');
+    lines.push('', '### Semantic Duplicate Flags (BLOCK)');
     for (const f of result.duplicateFlags) {
       lines.push(
         `- **${f.generatedSymbol}** → ${f.existingMatch.recommendation}`,
         `  Existing: \`${f.existingMatch.symbol}\` @ ${f.existingMatch.file} (similarity ${f.existingMatch.similarityScore.toFixed(2)}, ${f.existingMatch.usageCount} callers)`,
+      );
+    }
+  }
+
+  if (result.structuralDuplicateFlags.length > 0) {
+    lines.push('', '### Structural Duplicate Flags');
+    for (const f of result.structuralDuplicateFlags) {
+      lines.push(
+        `- **${f.generatedSymbol}** matches existing ${f.category} pattern (${f.occurrenceCount} occurrences)`,
+        `  ${f.recommendation}`,
+        `  Existing: ${f.existingLocations.map(loc => `${loc.symbol} @ ${loc.file}:${loc.line}`).join(', ')}`,
       );
     }
   }

@@ -5,3 +5,5 @@ dist/
 local_cache
 .repowise
 .aider*
+.sessions
+.opencode

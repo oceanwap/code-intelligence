@@ -211,6 +211,50 @@ test('getRiskHotspots returns null for malformed graph instead of throwing', asy
   assert.equal(result, null);
 });
 
+test('getRiskHotspots handles prototype-method symbol names without crashing', async t => {
+  const dir = makeTempDir(t);
+  const dataDir = path.join(dir, '.code-intelligence');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dataDir, 'graph.json'),
+    JSON.stringify({
+      symbols: { toString: [], valueOf: ['toString'] },
+      callers: { toString: ['valueOf'] },
+      files: {},
+      symbolFile: { toString: 'src/util.ts', valueOf: 'src/util.ts' },
+    })
+  );
+  fs.writeFileSync(
+    path.join(dataDir, 'project-memory.json'),
+    JSON.stringify({
+      entries: [
+        {
+          id: 'change:toString',
+          kind: 'change',
+          sha: 'sha1',
+          parents: [],
+          authorName: 'Test User',
+          authorEmail: 'test@example.com',
+          timestamp: '2026-05-05T10:00:00.000Z',
+          title: 'Tweak toString',
+          body: '',
+          changeType: 'feature',
+          summary: 'feature change: touches toString.',
+          topics: ['util'],
+          files: ['src/util.ts'],
+          symbols: ['toString'],
+          impacts: [],
+        },
+      ],
+    })
+  );
+
+  const result = await getRiskHotspots(dir, 5);
+  assert.ok(result);
+  const symbolNames = result!.symbols.map(s => s.symbol);
+  assert.ok(symbolNames.includes('toString'));
+});
+
 test('getRiskHotspots can sort by churn separately from connectivity', async t => {
   const dir = makeTempDir(t);
   writeFixtures(dir);

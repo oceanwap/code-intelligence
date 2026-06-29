@@ -28,11 +28,16 @@
     "ts-morph": "^23.0.0"
   },
   "devDependencies": {
+    "@ast-grep/cli": "^0.44.0",
     "@swc/cli": "^0.8.0",
     "@swc/core": "^1.15.21",
     "@types/bun": "^1.3.13",
     "@types/treeify": "^1.0.3",
+    "madge": "^8.0.0",
     "tsx": "^4.11.0",
     "typescript": "^5.4.5"
-  }
+  },
+  "trustedDependencies": [
+    "@ast-grep/cli"
+  ]
 }

@@ -8,6 +8,8 @@ export interface CognitionConfig {
   constraints: {
     unstableImportInstabilityThreshold: number;
     unstableImportWeightThreshold: number;
+    duplicateDensityThreshold: number;
+    duplicateMinSymbols: number;
   };
   evolution: {
     maxTrendPoints: number;
@@ -41,6 +43,8 @@ const DEFAULT_CONFIG: CognitionConfig = {
   constraints: {
     unstableImportInstabilityThreshold: 0.75,
     unstableImportWeightThreshold: 2,
+    duplicateDensityThreshold: 0.25,
+    duplicateMinSymbols: 5,
   },
   evolution: {
     maxTrendPoints: 30,

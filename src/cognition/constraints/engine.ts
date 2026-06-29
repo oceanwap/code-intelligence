@@ -6,6 +6,8 @@ import { loadCognitionConfigAsync } from '../config.js';
 import { type ArchitectureSnapshot } from '../architecture/types.js';
 import { type ConstraintRule, type ConstraintSeverity, type ConstraintSnapshot, type ConstraintViolation } from './types.js';
 import { moduleFromFile } from '../../utils/module-path.js';
+import { loadSemanticDuplicates } from '../duplicates/orchestrator.js';
+import { getDuplicateDensityByModule } from '../duplicates/signals.js';
 
 const RULES: ConstraintRule[] = [
   {
@@ -32,6 +34,11 @@ const RULES: ConstraintRule[] = [
     rule: 'prevent_layer_bypass',
     severity: 'medium',
     description: 'Application layers should avoid bypassing expected boundaries (for example direct links into test/docs zones).',
+  },
+  {
+    rule: 'duplicate_dense_module',
+    severity: 'medium',
+    description: 'Modules with a high density of duplicated code shapes suggest missing shared abstractions.',
   },
 ];
 
@@ -124,6 +131,29 @@ function detectDomainInfrastructure(snapshot: ArchitectureSnapshot): ConstraintV
     }));
 }
 
+async function detectDuplicateDenseModulesAsync(
+  projectRoot: string,
+  densityThreshold: number,
+  minSymbols: number
+): Promise<ConstraintViolation[]> {
+  const [duplicateSnapshot, graph] = await Promise.all([
+    loadSemanticDuplicates(projectRoot),
+    loadGraphAsync(path.join(getDataDir(projectRoot), 'graph.json')),
+  ]);
+  if (!duplicateSnapshot) return [];
+
+  const densities = getDuplicateDensityByModule(duplicateSnapshot, graph);
+  return densities
+    .filter(item => item.totalSymbols >= minSymbols && item.density >= densityThreshold)
+    .slice(0, 15)
+    .map(item => ({
+      rule: 'duplicate_dense_module',
+      severity: severityOf('duplicate_dense_module'),
+      details: `${item.module} has ${item.duplicateLocationCount} duplicated symbol locations out of ${item.totalSymbols} symbols (density ${item.density.toFixed(2)}).`,
+      modules: [item.module],
+    }));
+}
+
 async function detectDtoBoundaryAsync(projectRoot: string): Promise<ConstraintViolation[]> {
   const graph = await loadGraphAsync(path.join(getDataDir(projectRoot), 'graph.json'));
   if (!graph) return [];
@@ -162,6 +192,7 @@ export async function validateArchitectureAsync(projectRoot: string): Promise<Co
         ...detectLayerBypass(architecture),
         ...detectDomainInfrastructure(architecture),
         ...(await detectDtoBoundaryAsync(projectRoot)),
+        ...(await detectDuplicateDenseModulesAsync(projectRoot, cfg.constraints.duplicateDensityThreshold, cfg.constraints.duplicateMinSymbols)),
       ]
     : [];
 

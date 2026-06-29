@@ -165,6 +165,54 @@ code-intel memory-query "what changed in caching recently" --dir .
 
 Project-memory entries are built locally from recent git history plus markdown/text docs. For supported languages, changed hunks are mapped to impacted symbols so history is stored as semantic impact instead of raw line diffs. Document memory is section-based, so README/docs/ADR-style files become searchable project facts. Bug memory is the first structured failure layer on top of that: fix commits become bug entries only when the commit text yields concrete evidence such as symptoms, failing-test names, or explicit error signatures, so agents can ask what broke recently without falling back to vague fix history. The initial implementation indexes the most recent 150 commits per branch.
 
+### Semantic duplicate detection
+
+Detect structurally similar functions and methods across the codebase, even when identifiers and literals differ. The built-in analyzer uses the existing `ts-morph` dependency, so no external tools are required. Results are written to `.code-intelligence/<branch>/semantic-duplicates.json`.
+
+```bash
+# Default scan (ts-morph only)
+code-intel semantic-duplicates --dir .
+
+# Recompute from source
+code-intel semantic-duplicates --dir . --refresh
+
+# Tune sensitivity
+code-intel semantic-duplicates --dir . --min-body-tokens 6 --max-body-tokens 300 --min-occurrences 3
+
+# Include external analyzers when installed
+code-intel semantic-duplicates --dir . --with-ast-grep --with-semgrep --with-madge
+
+# JSON output for downstream processing
+code-intel semantic-duplicates --dir . --format json
+```
+
+Optional thin wrappers are also provided for external tools. `ast-grep` and `madge` are included as dev dependencies, so their commands work after `bun install`. `semgrep` is not available on npm and must be installed separately.
+
+```bash
+# ast-grep (already installed via @ast-grep/cli)
+code-intel ast-grep ./my-rules --dir . --save
+
+# semgrep (install separately: brew install semgrep, or pip install semgrep)
+code-intel semgrep auto --dir . --save
+
+# madge circular dependencies (already installed via madge)
+code-intel madge --dir . --save
+```
+
+If an external tool is not installed, the wrapper reports that clearly and does not fail the overall workflow.
+
+### How duplicates connect to the rest of the system
+
+Semantic duplicates are not just a standalone report. They feed into the cognition layers agents already use:
+
+- **`cognition-gate`** — prints total duplicate patterns and top duplicate-heavy modules as part of the pre-generation gate.
+- **`project-brief`** — includes a “Semantic Duplicate Hotspots” section so onboarding agents know where abstractions are missing.
+- **`task-context`** — surfaces duplicate signals when the task area overlaps known duplicate clusters, warning the agent before it re-implements an existing shape.
+- **`validate-generated-code`** — flags generated function bodies that are structurally identical to an existing duplicate pattern, blocking or warning before the code is written.
+- **`constraint-violations`** — adds a `duplicate_dense_module` rule that flags modules with a high density of duplicated code shapes.
+- **`cognition-diff` / `compare-branches`** — include duplicate pattern counts and top modules in branch snapshot summaries.
+- **MCP `semantic_duplicates`** — exposes the same data to VS Code Copilot / other agents.
+
 ---
 
 ## MCP Server
@@ -206,6 +254,7 @@ Runs on `http://localhost:3737/mcp`.
 | `historical_regressions` | List likely recurrent regressions, optionally scoped to a target area. |
 | `validate_architecture` | Run architecture constraint validation and summarize violations by severity. |
 | `constraint_violations` | Retrieve detailed architecture constraint violations with optional severity filter. |
+| `semantic_duplicates` | Detect structurally similar code patterns across the codebase with severity, affected modules/files, and recommendations. |
 | `boundary_analysis` | Inspect boundary pressure (inbound/outbound, instability, coupling) per module. |
 | `architecture_drift` | Track module-level drift in instability, coupling, and risk over time. |
 | `hotspot_analysis` | Rank temporal architecture hotspots by churn, bugs, instability, and coupling. |
@@ -361,6 +410,7 @@ Typical response shape:
 | `<project>/.code-intelligence/<branch>/project-memory.json` | Offline semantic project memory derived from git history |
 | `<project>/.code-intelligence/cognition-config.json` | Optional cognition thresholds and tuning config for failure, constraints, evolution, governance |
 | `<project>/.code-intelligence/<branch>/project-memory-cache.json` | Embedding cache for project-memory entries |
+| `<project>/.code-intelligence/<branch>/semantic-duplicates.json` | Semantic duplicate patterns: ts-morph structural duplicates + normalized output from ast-grep/semgrep/madge |
 | Qdrant collection `code-<hash>`              | Vector embeddings + payloads, one collection per project    |
 | Qdrant collection `memory-<hash>`            | Semantic embeddings for project-memory entries              |
 

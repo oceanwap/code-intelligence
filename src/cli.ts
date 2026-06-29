@@ -98,6 +98,12 @@ import { getDataDir, getCurrentBranchAsync } from './git.js';
 import { getProjectMemoryCountAsync } from './project-memory.js';
 import { buildRepoMap, renderRepoMap } from './repo-map.js';
 import { loadStructureAsync, refreshStructureAsync } from './cognition/structure/engine.js';
+import {
+  detectSemanticDuplicatesAsync,
+  loadSemanticDuplicates,
+} from './cognition/duplicates/orchestrator.js';
+import { runAstGrepAsync, runSemgrepAsync, runMadgeAsync } from './cognition/duplicates/external.js';
+import { getDuplicateSummary } from './cognition/duplicates/signals.js';
 
 function formatLineRanges(ranges: Array<{ startLine: number; endLine: number }>): string {
   return ranges
@@ -1379,6 +1385,8 @@ program
     await refreshFailureIntelligenceAsync(root);
     await refreshEvolutionAsync(root);
     await refreshMemoryGovernanceAsync(root);
+    const duplicateSnapshot = await detectSemanticDuplicatesAsync(root, { withEnrichment: true });
+    const duplicateSummary = getDuplicateSummary(duplicateSnapshot);
     const focusedTarget = opts.target ?? opts.topic ?? architecture?.modules[0]?.name ?? 'project';
     const risk = await regressionRiskAsync(root, focusedTarget);
     const hotspots = await hotspotAnalysisAsync(root, 5, opts.topic);
@@ -1387,6 +1395,8 @@ program
     console.log(`Gate target: ${focusedTarget}`);
     console.log(architecture ? `Architecture: ${architecture.modules.length} modules, ${architecture.dependencies.length} dependencies` : 'Architecture: unavailable');
     console.log(`Constraint violations: ${constraints.violations.length}`);
+    console.log(`Semantic duplicate patterns: ${duplicateSummary.totalPatterns} (high=${duplicateSummary.bySeverity.high ?? 0}, medium=${duplicateSummary.bySeverity.medium ?? 0})`);
+    console.log(`Duplicate hotspots: ${duplicateSummary.topModules.slice(0, 5).map(m => `${m.module} (${m.patternCount})`).join(', ') || 'none'}`);
     console.log(`Regression risk: ${risk.score.toFixed(3)} (${risk.level})`);
     console.log(`Risk signals: ${risk.signals.join(', ')}`);
     console.log(`Temporal hotspots: ${hotspots.map(h => `${h.module} (${h.riskScore.toFixed(2)})`).join(', ') || 'none'}`);
@@ -1404,6 +1414,8 @@ program
     console.log(`Branch: ${diff.branch ?? 'n/a'}  Indexed at: ${diff.indexedAt ?? 'unknown'}`);
     console.log(`Critical attention modules: ${diff.attentionCritical}`);
     console.log(`Constraint violations: ${diff.constraints}`);
+    console.log(`Semantic duplicate patterns: ${diff.duplicatePatterns}`);
+    console.log(`Duplicate hotspots: ${diff.duplicateTopModules.join(', ') || 'none'}`);
     console.log(`Stale memory entries: ${diff.staleMemory}`);
     console.log(`Top hotspots: ${diff.topHotspots.join(', ') || 'none'}`);
   });
@@ -1416,9 +1428,9 @@ program
     const cmp = await compareBranchCognition(path.resolve(opts.dir), targetBranch);
     if (!cmp.current && !cmp.target) { console.log('No branch-scoped cognition snapshots found.'); return; }
     console.log(`Current: ${cmp.currentBranch ?? 'n/a'}  Target: ${cmp.targetBranch}`);
-    console.log(`Current: ${cmp.current ? `modules=${cmp.current.modules}, constraints=${cmp.current.constraints}, criticalAttention=${cmp.current.criticalAttention}, staleMemory=${cmp.current.staleMemory}` : 'no snapshot'}`);
-    console.log(`Target:  ${cmp.target ? `modules=${cmp.target.modules}, constraints=${cmp.target.constraints}, criticalAttention=${cmp.target.criticalAttention}, staleMemory=${cmp.target.staleMemory}` : 'no snapshot'}`);
-    console.log(`Delta:   modules=${cmp.deltas.modules >= 0 ? '+' : ''}${cmp.deltas.modules}, constraints=${cmp.deltas.constraints >= 0 ? '+' : ''}${cmp.deltas.constraints}, criticalAttention=${cmp.deltas.criticalAttention >= 0 ? '+' : ''}${cmp.deltas.criticalAttention}, staleMemory=${cmp.deltas.staleMemory >= 0 ? '+' : ''}${cmp.deltas.staleMemory}`);
+    console.log(`Current: ${cmp.current ? `modules=${cmp.current.modules}, constraints=${cmp.current.constraints}, criticalAttention=${cmp.current.criticalAttention}, staleMemory=${cmp.current.staleMemory}, duplicates=${cmp.current.duplicatePatterns}` : 'no snapshot'}`);
+    console.log(`Target:  ${cmp.target ? `modules=${cmp.target.modules}, constraints=${cmp.target.constraints}, criticalAttention=${cmp.target.criticalAttention}, staleMemory=${cmp.target.staleMemory}, duplicates=${cmp.target.duplicatePatterns}` : 'no snapshot'}`);
+    console.log(`Delta:   modules=${cmp.deltas.modules >= 0 ? '+' : ''}${cmp.deltas.modules}, constraints=${cmp.deltas.constraints >= 0 ? '+' : ''}${cmp.deltas.constraints}, criticalAttention=${cmp.deltas.criticalAttention >= 0 ? '+' : ''}${cmp.deltas.criticalAttention}, staleMemory=${cmp.deltas.staleMemory >= 0 ? '+' : ''}${cmp.deltas.staleMemory}, duplicates=${cmp.deltas.duplicatePatterns >= 0 ? '+' : ''}${cmp.deltas.duplicatePatterns}`);
   });
 
 program
@@ -1451,7 +1463,11 @@ program
       const signals = {
         task, generatedAt: new Date().toISOString(),
         changeSignals: { totalChangedFiles: preflight.totalChangedFiles, highRiskFiles: preflight.highRiskFiles },
-        contextSignals: { dominantModules: context.topModules.slice(0, 5).map(m => m.module), semanticSnippetCount: context.semanticCode.length },
+        contextSignals: {
+          dominantModules: context.topModules.slice(0, 5).map(m => m.module),
+          semanticSnippetCount: context.semanticCode.length,
+          duplicateSignals: context.duplicateSignals.length,
+        },
         testSignals: opts.target ? { target: testImpact.target, likelyTestCount: testImpact.tests.length } : null,
       };
       console.log(JSON.stringify(opts.format === 'signals' ? signals : { signals, preflight, context, testImpact }, null, 2));
@@ -1460,7 +1476,12 @@ program
     console.log(`Task: ${task}`);
     console.log(`Changed files: ${preflight.totalChangedFiles}  High risk: ${preflight.highRiskFiles}`);
     console.log(`Dominant modules: ${context.topModules.slice(0, 5).map(m => m.module).join(', ') || 'none'}`);
-    preflight.entries.slice(0, 8).forEach(e => console.log(`  ${e.path} [${e.status}] attention=${e.attentionTier} risk=${e.regressionLevel}(${e.regressionRisk.toFixed(3)})`));
+    if (context.duplicateSignals.length > 0) {
+      console.log(`Duplicate signals: ${context.duplicateSignals.length}`);
+      context.duplicateSignals.slice(0, 5).forEach(d =>
+        console.log(`  [${d.severity}] ${d.category} (${d.occurrenceCount} occurrences) in ${d.affectedModules.join(', ')}`));
+    }
+    preflight.entries.slice(0, 8).forEach(e => console.log(`  ${e.path} [${e.status}] attention=${e.attentionTier} risk=${e.regressionLevel}(${e.regressionRisk.toFixed(3)})${e.duplicateFlags.length > 0 ? ` duplicates=${e.duplicateFlags.join('; ')}` : ''}`));
     if (opts.target) {
       console.log(`\nTest Impact (${testImpact.target}): ${testImpact.tests.length} likely tests`);
       testImpact.tests.slice(0, 10).forEach(t => console.log(`  ${t.file} (score ${t.score})`));
@@ -1516,6 +1537,214 @@ program
       includeMethods: opts.methods !== false,
     });
     console.log(renderRepoMap(result));
+  });
+
+// ─── Semantic duplicate detection ─────────────────────────────────────────────
+
+program
+  .command('semantic-duplicates')
+  .description('Detect semantic duplicate patterns using ts-morph (and optional external analyzers)')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--refresh', 'Recompute from source (default is load cached snapshot)', false)
+  .option('--min-occurrences <n>', 'Minimum occurrences for a structural duplicate', '2')
+  .option('--min-body-tokens <n>', 'Minimum normalized body token count', '8')
+  .option('--max-body-tokens <n>', 'Maximum normalized body token count', '400')
+  .option('--include-tests', 'Include test/spec files', false)
+  .option('--with-ast-grep', 'Also run ast-grep if installed', false)
+  .option('--ast-grep-rule <path>', 'Path to an ast-grep rule file or directory')
+  .option('--with-semgrep', 'Also run semgrep if installed', false)
+  .option('--semgrep-config <config>', 'semgrep config (default: auto)', 'auto')
+  .option('--with-madge', 'Also run madge circular dependency check if installed', false)
+  .option('--format <format>', 'Output format: text|json', 'text')
+  .action(async (opts: {
+    dir: string;
+    refresh: boolean;
+    minOccurrences: string;
+    minBodyTokens: string;
+    maxBodyTokens: string;
+    includeTests: boolean;
+    withAstGrep: boolean;
+    astGrepRule?: string;
+    withSemgrep: boolean;
+    semgrepConfig: string;
+    withMadge: boolean;
+    format: 'text' | 'json';
+  }) => {
+    const root = path.resolve(opts.dir);
+    const snapshot = opts.refresh
+      ? await detectSemanticDuplicatesAsync(root, {
+          minOccurrences: Number(opts.minOccurrences) || 2,
+          minBodyTokens: Number(opts.minBodyTokens) || 8,
+          maxBodyTokens: Number(opts.maxBodyTokens) || 400,
+          includeTests: opts.includeTests,
+          withAstGrep: opts.withAstGrep,
+          astGrepRulePath: opts.astGrepRule,
+          withSemgrep: opts.withSemgrep,
+          semgrepConfig: opts.semgrepConfig,
+          withMadge: opts.withMadge,
+        })
+      : (await loadSemanticDuplicates(root)) ?? await detectSemanticDuplicatesAsync(root, {
+          minOccurrences: Number(opts.minOccurrences) || 2,
+          minBodyTokens: Number(opts.minBodyTokens) || 8,
+          maxBodyTokens: Number(opts.maxBodyTokens) || 400,
+          includeTests: opts.includeTests,
+          withAstGrep: opts.withAstGrep,
+          astGrepRulePath: opts.astGrepRule,
+          withSemgrep: opts.withSemgrep,
+          semgrepConfig: opts.semgrepConfig,
+          withMadge: opts.withMadge,
+        });
+
+    if (opts.format === 'json') {
+      console.log(JSON.stringify(snapshot, null, 2));
+      return;
+    }
+
+    console.log(`Semantic duplicates generated: ${snapshot.generatedAt}`);
+    console.log(`Patterns: ${snapshot.totalPatterns}`);
+    console.log(`By source: ${Object.entries(snapshot.bySource).map(([s, n]) => `${s}=${n}`).join(', ') || 'none'}`);
+    console.log(`By severity: ${Object.entries(snapshot.bySeverity).map(([s, n]) => `${s}=${n}`).join(', ') || 'none'}`);
+    for (const p of snapshot.patterns.slice(0, 20)) {
+      console.log(`${'─'.repeat(60)}`);
+      console.log(`[${p.severity}] ${p.title} (${p.source}${p.ruleId ? ` / ${p.ruleId}` : ''})`);
+      if (p.recommendation) console.log(`Recommendation: ${p.recommendation}`);
+      else console.log(p.description);
+      if (p.signals) {
+        const sigs = [
+          p.signals.crossModule ? 'cross-module' : '',
+          p.signals.crossLayer ? 'cross-layer' : '',
+          p.signals.inHotspot ? 'hotspot' : '',
+          p.signals.inUnstableModule ? 'unstable' : '',
+        ].filter(Boolean);
+        if (sigs.length > 0) console.log(`Signals: ${sigs.join(', ')}`);
+      }
+      for (const loc of p.locations.slice(0, 5)) {
+        console.log(`  - ${loc.file}:${loc.line} (${loc.symbol})`);
+      }
+      if (p.locations.length > 5) {
+        console.log(`  ... and ${p.locations.length - 5} more`);
+      }
+    }
+    if (snapshot.patterns.length > 20) {
+      console.log(`\n... ${snapshot.patterns.length - 20} more patterns (use --format json to see all).`);
+    }
+  });
+
+program
+  .command('ast-grep [rule]')
+  .description('Run ast-grep against the workspace and normalize matches into semantic-duplicates.json')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--target <path>', 'File or directory to scan')
+  .option('--save', 'Merge results into the semantic-duplicates snapshot', false)
+  .action(async (rule: string | undefined, opts: { dir: string; target?: string; save: boolean }) => {
+    const root = path.resolve(opts.dir);
+    const result = await runAstGrepAsync(root, rule, opts.target);
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      console.log(`ast-grep not available: ${result.stderr}`);
+      return;
+    }
+    console.log(`ast-grep matches: ${result.patterns.length}`);
+    for (const p of result.patterns.slice(0, 15)) {
+      console.log(`[${p.severity}] ${p.title}`);
+      for (const loc of p.locations.slice(0, 3)) {
+        console.log(`  - ${loc.file}:${loc.line}`);
+      }
+    }
+    if (opts.save && result.patterns.length > 0) {
+      const snapshot = await detectSemanticDuplicatesAsync(root, { withAstGrep: false });
+      snapshot.patterns.push(...result.patterns);
+      snapshot.totalPatterns = snapshot.patterns.length;
+      snapshot.generatedAt = new Date().toISOString();
+      await loadSemanticDuplicates(root); // ensure directory exists via side effect
+      // Re-save by recomputing aggregates manually.
+      const bySource = {} as Record<string, number>;
+      const bySeverity = {} as Record<string, number>;
+      for (const p of snapshot.patterns) {
+        bySource[p.source] = (bySource[p.source] ?? 0) + 1;
+        bySeverity[p.severity] = (bySeverity[p.severity] ?? 0) + 1;
+      }
+      snapshot.bySource = bySource;
+      snapshot.bySeverity = bySeverity;
+      const { saveSemanticDuplicatesAsync } = await import('./cognition/duplicates/storage.js');
+      await saveSemanticDuplicatesAsync(root, snapshot);
+      console.log(`Saved to .code-intelligence/<branch>/semantic-duplicates.json`);
+    }
+  });
+
+program
+  .command('semgrep [config]')
+  .description('Run semgrep against the workspace and normalize matches into semantic-duplicates.json')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--target <path>', 'File or directory to scan')
+  .option('--save', 'Merge results into the semantic-duplicates snapshot', false)
+  .action(async (config: string | undefined, opts: { dir: string; target?: string; save: boolean }) => {
+    const root = path.resolve(opts.dir);
+    const result = await runSemgrepAsync(root, config, opts.target);
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      console.log(`semgrep not available: ${result.stderr}`);
+      return;
+    }
+    console.log(`semgrep matches: ${result.patterns.length}`);
+    for (const p of result.patterns.slice(0, 15)) {
+      console.log(`[${p.severity}] ${p.title}`);
+      for (const loc of p.locations.slice(0, 3)) {
+        console.log(`  - ${loc.file}:${loc.line}`);
+      }
+    }
+    if (opts.save && result.patterns.length > 0) {
+      const snapshot = await detectSemanticDuplicatesAsync(root, { withSemgrep: false });
+      snapshot.patterns.push(...result.patterns);
+      snapshot.totalPatterns = snapshot.patterns.length;
+      snapshot.generatedAt = new Date().toISOString();
+      const bySource = {} as Record<string, number>;
+      const bySeverity = {} as Record<string, number>;
+      for (const p of snapshot.patterns) {
+        bySource[p.source] = (bySource[p.source] ?? 0) + 1;
+        bySeverity[p.severity] = (bySeverity[p.severity] ?? 0) + 1;
+      }
+      snapshot.bySource = bySource;
+      snapshot.bySeverity = bySeverity;
+      const { saveSemanticDuplicatesAsync } = await import('./cognition/duplicates/storage.js');
+      await saveSemanticDuplicatesAsync(root, snapshot);
+      console.log(`Saved to .code-intelligence/<branch>/semantic-duplicates.json`);
+    }
+  });
+
+program
+  .command('madge')
+  .description('Run madge circular dependency check and normalize output into semantic-duplicates.json')
+  .option('--dir <path>', 'Project root directory', '.')
+  .option('--target <path>', 'Entry file or directory')
+  .option('--save', 'Merge results into the semantic-duplicates snapshot', false)
+  .action(async (opts: { dir: string; target?: string; save: boolean }) => {
+    const root = path.resolve(opts.dir);
+    const result = await runMadgeAsync(root, opts.target);
+    if (result.exitCode !== 0) {
+      console.log(`madge not available: ${result.stderr}`);
+      return;
+    }
+    console.log(`madge circular dependencies: ${result.patterns.length}`);
+    for (const p of result.patterns) {
+      console.log(`[${p.severity}] ${p.title}`);
+      console.log(`  ${p.locations.map(l => l.file).join(' -> ')}`);
+    }
+    if (opts.save && result.patterns.length > 0) {
+      const snapshot = await detectSemanticDuplicatesAsync(root, { withMadge: false });
+      snapshot.patterns.push(...result.patterns);
+      snapshot.totalPatterns = snapshot.patterns.length;
+      snapshot.generatedAt = new Date().toISOString();
+      const bySource = {} as Record<string, number>;
+      const bySeverity = {} as Record<string, number>;
+      for (const p of snapshot.patterns) {
+        bySource[p.source] = (bySource[p.source] ?? 0) + 1;
+        bySeverity[p.severity] = (bySeverity[p.severity] ?? 0) + 1;
+      }
+      snapshot.bySource = bySource;
+      snapshot.bySeverity = bySeverity;
+      const { saveSemanticDuplicatesAsync } = await import('./cognition/duplicates/storage.js');
+      await saveSemanticDuplicatesAsync(root, snapshot);
+      console.log(`Saved to .code-intelligence/<branch>/semantic-duplicates.json`);
+    }
   });
 
 program.parse();

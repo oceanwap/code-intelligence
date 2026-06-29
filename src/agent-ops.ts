@@ -16,6 +16,11 @@ import { refreshEvolutionAsync, loadEvolutionAsync } from './cognition/evolution
 import { refreshMemoryGovernanceAsync, loadMemoryGovernanceAsync } from './cognition/governance/engine.js';
 import { validateArchitectureAsync, listConstraintViolationsAsync } from './cognition/constraints/engine.js';
 import { regressionRiskAsync } from './cognition/reflection/engine.js';
+import {
+  refreshSemanticDuplicatesAsync,
+  loadSemanticDuplicates,
+} from './cognition/duplicates/orchestrator.js';
+import { getDuplicateSummary, findDuplicatesForTarget } from './cognition/duplicates/signals.js';
 import { loadGraphAsync } from './graph.js';
 import { getDataDir } from './git.js';
 import { moduleFromFile } from './utils/module-path.js';
@@ -30,6 +35,7 @@ const FRESHNESS_MS = {
   failures:    15 * 60 * 1_000,   // 15 min
   evolution:   10 * 60 * 1_000,   // 10 min
   governance:  10 * 60 * 1_000,   // 10 min
+  duplicates:  10 * 60 * 1_000,   // 10 min
 };
 
 const TASK_STOP_WORDS = new Set([
@@ -66,7 +72,7 @@ export async function ensureCognitionBaseline(projectRoot: string, qdrantUrl = '
   await syncProjectMemory(root, qdrantUrl);
 
   // Refresh each cognition layer only when its snapshot is stale.
-  const [needsStructure, needsArch, needsAttention, needsFailures, needsEvolution, needsGovernance] =
+  const [needsStructure, needsArch, needsAttention, needsFailures, needsEvolution, needsGovernance, needsDuplicates] =
     await Promise.all([
       shouldRefresh(`${dataDir}/structure.json`,             FRESHNESS_MS.structure,    root),
       shouldRefresh(`${dataDir}/architecture.json`,          FRESHNESS_MS.architecture, root),
@@ -74,6 +80,7 @@ export async function ensureCognitionBaseline(projectRoot: string, qdrantUrl = '
       shouldRefresh(`${dataDir}/failure-intelligence.json`,  FRESHNESS_MS.failures,     root),
       shouldRefresh(`${dataDir}/evolution.json`,             FRESHNESS_MS.evolution,    root),
       shouldRefresh(`${dataDir}/memory-governance.json`,     FRESHNESS_MS.governance,   root),
+      shouldRefresh(`${dataDir}/semantic-duplicates.json`,   FRESHNESS_MS.duplicates,   root),
     ]);
 
   await Promise.all([
@@ -83,6 +90,7 @@ export async function ensureCognitionBaseline(projectRoot: string, qdrantUrl = '
     needsFailures     ? refreshFailureIntelligenceAsync(root)    : Promise.resolve(),
     needsEvolution    ? refreshEvolutionAsync(root)              : Promise.resolve(),
     needsGovernance   ? refreshMemoryGovernanceAsync(root)       : Promise.resolve(),
+    needsDuplicates   ? refreshSemanticDuplicatesAsync(root, { withEnrichment: true }) : Promise.resolve(),
   ]);
 
   // Constraint validation is cheap and always runs after architecture refresh.
@@ -98,6 +106,7 @@ export interface PreflightChangeEntry {
   regressionRisk: number;
   regressionLevel: string;
   violations: string[];
+  duplicateFlags: string[];
   relatedBugCount: number;
   recentChangeCount: number;
 }
@@ -132,6 +141,14 @@ export async function buildPreflightChanges(projectRoot: string, qdrantUrl = 'ht
       .slice(0, 5)
       .map(item => `[${item.severity}] ${item.rule}`);
 
+    const duplicateSnapshot = await loadSemanticDuplicates(projectRoot);
+    const duplicateFlags = duplicateSnapshot
+      ? findDuplicatesForTarget(duplicateSnapshot, file.path)
+          .filter(p => p.severity === 'high' || p.severity === 'medium')
+          .slice(0, 3)
+          .map(p => `${p.category} (${p.locations.length})`)
+      : [];
+
     const relatedBugCount = bugs.filter(bug =>
       bug.files.some(bugFile => bugFile === file.path || bugFile.includes(moduleName))
     ).length;
@@ -149,19 +166,23 @@ export async function buildPreflightChanges(projectRoot: string, qdrantUrl = 'ht
       regressionRisk: regression.score,
       regressionLevel: regression.level,
       violations: moduleViolations,
+      duplicateFlags,
       relatedBugCount,
       recentChangeCount,
     } satisfies PreflightChangeEntry;
   }));
 
   const sorted = [...entries].sort((left, right) => {
-    const leftRisk = left.regressionRisk + left.attentionScore + (left.violations.length * 0.15);
-    const rightRisk = right.regressionRisk + right.attentionScore + (right.violations.length * 0.15);
+    const leftRisk = left.regressionRisk + left.attentionScore + (left.violations.length * 0.15) + (left.duplicateFlags.length * 0.1);
+    const rightRisk = right.regressionRisk + right.attentionScore + (right.violations.length * 0.15) + (right.duplicateFlags.length * 0.1);
     return rightRisk - leftRisk;
   });
 
   const highRiskFiles = sorted.filter(entry =>
-    entry.regressionLevel === 'high' || entry.attentionTier === 'CRITICAL' || entry.violations.length > 0
+    entry.regressionLevel === 'high'
+    || entry.attentionTier === 'CRITICAL'
+    || entry.violations.length > 0
+    || entry.duplicateFlags.length > 0
   ).length;
 
   return {
@@ -186,6 +207,19 @@ export interface AssembledTaskContext {
    * Agents must review these before writing new code to avoid duplication.
    */
   existingHandlers: ExistingMatch[];
+  /**
+   * Structural duplicate patterns that overlap the task's likely modules or retrieved symbols.
+   * These are independent of semantic similarity — they flag repeated shapes in the codebase.
+   */
+  duplicateSignals: Array<{
+    id: string;
+    category: string;
+    severity: string;
+    occurrenceCount: number;
+    affectedModules: string[];
+    affectedFiles: string[];
+    recommendation: string;
+  }>;
 }
 
 // Reuse the canonical thresholds from find-existing.ts.
@@ -205,13 +239,14 @@ export async function assembleTaskContext(
   let semantic = await queryProject(root, task, qdrantUrl);
   semantic = await rerankByAttentionAsync(root, semantic);
 
-  const [attention, violations, changes, bugs, memoryHits, graph] = await Promise.all([
+  const [attention, violations, changes, bugs, memoryHits, graph, duplicateSnapshot] = await Promise.all([
     loadAttentionAsync(root),
     listConstraintViolationsAsync(root, { limit: 25 }),
     listRecentChangesAsync(root, { limit: 30, topic }),
     listRecentBugsAsync(root, { limit: 20, topic }),
     queryProjectMemory(root, task, qdrantUrl, 8),
     loadGraphAsync(path.join(getDataDir(root), 'graph.json')),
+    loadSemanticDuplicates(root),
   ]);
 
   const taskTokens = new Set(tokenizeTask(task));
@@ -252,6 +287,29 @@ export async function assembleTaskContext(
     if (existingHandlers.length >= limit) break;
   }
 
+  // Collect structural duplicate patterns relevant to the task area.
+  const relevantFiles = new Set(existingHandlers.map(h => h.file));
+  const relevantModules = new Set(topModules.map(m => m.module));
+  const duplicateSignals = duplicateSnapshot
+    ? findDuplicatesForTarget(duplicateSnapshot, topic ?? '')
+        .filter(p => {
+          if (p.severity !== 'high' && p.severity !== 'medium') return false;
+          const touchesModule = p.affectedModules?.some(m => relevantModules.has(m));
+          const touchesFile = p.affectedFiles?.some(f => relevantFiles.has(f));
+          return touchesModule || touchesFile;
+        })
+        .slice(0, limit)
+        .map(p => ({
+          id: p.id,
+          category: p.category,
+          severity: p.severity,
+          occurrenceCount: p.locations.length,
+          affectedModules: p.affectedModules ?? [],
+          affectedFiles: p.affectedFiles ?? [],
+          recommendation: p.recommendation ?? 'Review occurrences for possible extraction.',
+        }))
+    : [];
+
   return {
     task,
     generatedAt: new Date().toISOString(),
@@ -287,6 +345,7 @@ export async function assembleTaskContext(
       summary: hit.entry.summary,
     })),
     existingHandlers,
+    duplicateSignals,
   };
 }
 
@@ -309,6 +368,17 @@ export async function generateProjectBrief(projectRoot: string, qdrantUrl = 'htt
   const topAttention = (attention?.modules ?? []).slice(0, 8)
     .map(module => `- ${module.module} (${module.tier}, ${module.score.composite.toFixed(3)})`)
     .join('\n') || '- none';
+
+  const duplicateSnapshot = await loadSemanticDuplicates(projectRoot);
+  const duplicateSummary = duplicateSnapshot ? getDuplicateSummary(duplicateSnapshot) : null;
+  const duplicateLines = duplicateSummary
+    ? [
+        `Total duplicate patterns: ${duplicateSummary.totalPatterns} (high=${duplicateSummary.bySeverity.high ?? 0}, medium=${duplicateSummary.bySeverity.medium ?? 0}, low=${duplicateSummary.bySeverity.low ?? 0})`,
+        ...duplicateSummary.topModules.slice(0, 5).map(m =>
+          `- ${m.module}: ${m.patternCount} pattern(s), ${m.locationCount} location(s)${m.density !== undefined ? ` (density ${m.density})` : ''}`
+        ),
+      ].join('\n')
+    : '- none';
 
   const topConstraints = constraints
     .map(item => `- [${item.severity}] ${item.rule}: ${item.details}`)
@@ -358,6 +428,9 @@ export async function generateProjectBrief(projectRoot: string, qdrantUrl = 'htt
     '## Current Hotspots',
     hotspotLines,
     '',
+    '## Semantic Duplicate Hotspots',
+    duplicateLines,
+    '',
     '## Recent Changes',
     recentChangeLines,
     '',
@@ -372,6 +445,8 @@ interface SnapshotSummary {
   criticalAttention: number;
   staleMemory: number;
   hotspotTop: string[];
+  duplicatePatterns: number;
+  duplicateTopModules: string[];
 }
 
 async function summarizeBranchSnapshots(projectRoot: string, branch: string): Promise<SnapshotSummary | null> {
@@ -387,15 +462,16 @@ async function summarizeBranchSnapshots(projectRoot: string, branch: string): Pr
     }
   };
 
-  const [architecture, attention, constraints, governance, evolution] = await Promise.all([
+  const [architecture, attention, constraints, governance, evolution, duplicates] = await Promise.all([
     readJson('architecture.json'),
     readJson('attention.json'),
     readJson('constraints.json'),
     readJson('memory-governance.json'),
     readJson('evolution.json'),
+    readJson('semantic-duplicates.json'),
   ]);
 
-  if (!architecture && !attention && !constraints && !governance && !evolution) return null;
+  if (!architecture && !attention && !constraints && !governance && !evolution && !duplicates) return null;
 
   const modules = Array.isArray(architecture?.['modules']) ? architecture?.['modules'].length : 0;
   const constraintsCount = Array.isArray(constraints?.['violations']) ? constraints?.['violations'].length : 0;
@@ -406,6 +482,13 @@ async function summarizeBranchSnapshots(projectRoot: string, branch: string): Pr
   const hotspotTop = Array.isArray(evolution?.['hotspots'])
     ? (evolution?.['hotspots'] as Array<Record<string, unknown>>).slice(0, 5).map(item => String(item['module'] ?? 'unknown'))
     : [];
+  const duplicatePatterns = Number(duplicates?.['totalPatterns'] ?? 0);
+  const duplicateTopModules = Array.isArray(duplicates?.['patterns'])
+    ? [...new Set(
+        (duplicates?.['patterns'] as Array<Record<string, unknown>>)
+          .flatMap(p => (p['affectedModules'] as string[] | undefined) ?? [])
+      )].slice(0, 5)
+    : [];
 
   return {
     modules,
@@ -413,6 +496,8 @@ async function summarizeBranchSnapshots(projectRoot: string, branch: string): Pr
     criticalAttention,
     staleMemory,
     hotspotTop,
+    duplicatePatterns,
+    duplicateTopModules,
   };
 }
 
@@ -432,6 +517,7 @@ export async function compareBranchCognition(projectRoot: string, targetBranch: 
     constraints: (current?.constraints ?? 0) - (target?.constraints ?? 0),
     criticalAttention: (current?.criticalAttention ?? 0) - (target?.criticalAttention ?? 0),
     staleMemory: (current?.staleMemory ?? 0) - (target?.staleMemory ?? 0),
+    duplicatePatterns: (current?.duplicatePatterns ?? 0) - (target?.duplicatePatterns ?? 0),
   };
 
   return { currentBranch, targetBranch, current, target, deltas };
@@ -445,6 +531,8 @@ export async function cognitionDiff(projectRoot: string): Promise<{
   constraints: number;
   staleMemory: number;
   topHotspots: string[];
+  duplicatePatterns: number;
+  duplicateTopModules: string[];
 }> {
   const branch = await getCurrentBranchAsync(projectRoot);
   const summary = branch ? await summarizeBranchSnapshots(projectRoot, branch) : null;
@@ -459,6 +547,8 @@ export async function cognitionDiff(projectRoot: string): Promise<{
     constraints: summary?.constraints ?? 0,
     staleMemory: summary?.staleMemory ?? 0,
     topHotspots: summary?.hotspotTop ?? [],
+    duplicatePatterns: summary?.duplicatePatterns ?? 0,
+    duplicateTopModules: summary?.duplicateTopModules ?? [],
   };
 }
 

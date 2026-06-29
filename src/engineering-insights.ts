@@ -195,12 +195,12 @@ function relationWeight(kind: RelationKind): number {
 
 function graphConnectivity(graph: GraphData, symbol: string): number {
   const neighbors = new Set<string>();
-  addUnique(neighbors, graph.symbols[symbol] ?? []);
-  addUnique(neighbors, graph.callers[symbol] ?? []);
-  addUnique(neighbors, graph.implementations[symbol] ?? []);
-  addUnique(neighbors, graph.implementedFrom[symbol] ?? []);
-  addUnique(neighbors, graph.supertypes[symbol] ?? []);
-  addUnique(neighbors, graph.subtypes[symbol] ?? []);
+  addUnique(neighbors, graph.symbols?.[symbol] ?? []);
+  addUnique(neighbors, graph.callers?.[symbol] ?? []);
+  addUnique(neighbors, graph.implementations?.[symbol] ?? []);
+  addUnique(neighbors, graph.implementedFrom?.[symbol] ?? []);
+  addUnique(neighbors, graph.supertypes?.[symbol] ?? []);
+  addUnique(neighbors, graph.subtypes?.[symbol] ?? []);
   return neighbors.size;
 }
 
@@ -265,10 +265,10 @@ function buildSymbolImpactSurface(graph: GraphData, symbol: string, limit = 3): 
     });
   };
 
-  for (const caller of graph.callers[symbol] ?? []) push(caller, 'calledBy');
-  for (const callee of graph.symbols[symbol] ?? []) push(callee, 'calls');
-  for (const implementation of graph.implementations[symbol] ?? []) push(implementation, 'implements');
-  for (const base of graph.implementedFrom[symbol] ?? []) push(base, 'implementedFrom');
+  for (const caller of graph.callers?.[symbol] ?? []) push(caller, 'calledBy');
+  for (const callee of graph.symbols?.[symbol] ?? []) push(callee, 'calls');
+  for (const implementation of graph.implementations?.[symbol] ?? []) push(implementation, 'implements');
+  for (const base of graph.implementedFrom?.[symbol] ?? []) push(base, 'implementedFrom');
 
   const deduped = new Map<string, HotspotImpactSurface>();
   for (const entry of entries) {
@@ -283,13 +283,13 @@ function buildSymbolImpactSurface(graph: GraphData, symbol: string, limit = 3): 
 }
 
 function likelyTestCallers(graph: GraphData, symbol: string): string[] {
-  return (graph.callers[symbol] ?? []).filter(caller => isTestPath(graph.symbolFile[caller] ?? null));
+  return (graph.callers?.[symbol] ?? []).filter(caller => isTestPath(graph.symbolFile[caller] ?? null));
 }
 
 function fileDependents(graph: GraphData, symbols: string[], currentFile: string): string[] {
   const dependents = new Set<string>();
   for (const symbol of symbols) {
-    for (const caller of graph.callers[symbol] ?? []) {
+    for (const caller of graph.callers?.[symbol] ?? []) {
       const callerFile = graph.symbolFile[caller];
       if (!callerFile || callerFile === currentFile) continue;
       dependents.add(callerFile);
@@ -299,7 +299,7 @@ function fileDependents(graph: GraphData, symbols: string[], currentFile: string
 }
 
 function candidateGraphFiles(graph: GraphData): string[] {
-  return [...new Set([...Object.keys(graph.files), ...Object.values(graph.symbolFile)])];
+  return [...new Set([...Object.keys(graph.files ?? {}), ...Object.values(graph.symbolFile ?? {})])];
 }
 
 function nearbyTestFiles(file: string, graph: GraphData): string[] {
@@ -500,6 +500,8 @@ function isValidGraph(value: unknown): value is GraphData {
     candidate.symbols !== null &&
     typeof candidate.callers === 'object' &&
     candidate.callers !== null &&
+    typeof candidate.files === 'object' &&
+    candidate.files !== null &&
     typeof candidate.symbolFile === 'object' &&
     candidate.symbolFile !== null
   );
