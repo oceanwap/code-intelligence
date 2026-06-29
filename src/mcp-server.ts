@@ -17,6 +17,7 @@ import {
 } from './engineering-insights.js';
 import { indexProject, queryProjectPage, type IndexMode, type ProgressCallback } from './indexer-run.js';
 import { loadGraphAsync, type GraphData } from './graph.js';
+import { renderBehaviorChecklist } from './behavior-graph.js';
 import {
   getFeatureMapAsync,
   getBugBriefAsync,
@@ -106,6 +107,8 @@ import {
   compareBranchCognition,
   generateProjectBrief,
 } from './agent-ops.js';
+import { refreshSemanticDuplicatesAsync, loadSemanticDuplicates } from './cognition/duplicates/orchestrator.js';
+import { getDuplicateSummary, findDuplicatesForTarget } from './cognition/duplicates/signals.js';
 import { buildGitSemanticChangeGraph } from './git-change-graph.js';
 import { buildProjectIntentSnapshot, renderProjectIntentSnapshot } from './project-intent.js';
 import { findExisting, renderFindExisting } from './find-existing.js';
@@ -1391,6 +1394,52 @@ function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    'semantic_duplicates',
+    {
+      description: 'Detect semantic duplicate patterns across the codebase. Returns structural duplicate clusters with severity, affected modules/files, and actionable recommendations. Call before writing new code to find existing implementations that could be reused, or to identify modules that need shared abstractions.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        target: z.string().optional().describe('Optional file path, symbol, or module filter. Omit for a project-wide summary.'),
+        severity: z.enum(['low', 'medium', 'high']).optional().describe('Optional severity filter.'),
+        limit: z.number().int().min(1).max(50).optional().describe('Maximum number of patterns to return (default: 15).'),
+        refresh: z.boolean().optional().describe('Recompute semantic duplicate snapshot before reporting (default: false).'),
+      },
+    },
+    async ({ projectRoot, target, severity, limit = 15, refresh = false }) => {
+      const root = path.resolve(projectRoot);
+      const snapshot = refresh
+        ? await refreshSemanticDuplicatesAsync(root, { withEnrichment: true })
+        : (await loadSemanticDuplicates(root)) ?? await refreshSemanticDuplicatesAsync(root, { withEnrichment: true });
+
+      let patterns = target
+        ? findDuplicatesForTarget(snapshot, target)
+        : getDuplicateSummary(snapshot).highSeverityPatterns;
+
+      if (severity) {
+        patterns = patterns.filter(p => p.severity === severity);
+      }
+
+      patterns = patterns.slice(0, limit);
+
+      if (patterns.length === 0) {
+        return { content: [{ type: 'text', text: target ? `No semantic duplicate patterns found for "${target}".` : 'No semantic duplicate patterns found.' }] };
+      }
+
+      const text = patterns
+        .map(p => [
+          `[${p.severity}] ${p.title} (${p.source}${p.ruleId ? ` / ${p.ruleId}` : ''})`,
+          p.recommendation ? `Recommendation: ${p.recommendation}` : p.description,
+          `Locations:`,
+          ...p.locations.slice(0, 5).map(loc => `  - ${loc.file}:${loc.line} (${loc.symbol})`),
+          p.locations.length > 5 ? `  ... and ${p.locations.length - 5} more` : '',
+        ].join('\n'))
+        .join('\n\n---\n\n');
+
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  server.registerTool(
     'boundary_analysis',
     {
       description: 'Analyze module boundary pressure using inbound/outbound dependency counts, instability, and coupling.',
@@ -2252,6 +2301,42 @@ function createMcpServer(): McpServer {
         }
 
         return { content: [{ type: 'text', text: sections.join('\n\n---\n\n') }] };
+      } catch (error) {
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
+      }
+    }
+  );
+
+  // --- render_behavior ---
+  server.registerTool(
+    'render_behavior',
+    {
+      description: 'Render a side-effect checklist for a symbol — DB writes, HTTP calls, cache, queue, events, transactions, locks, logs, metrics. Use this to understand what a function does at a glance before changing it, or to verify which side effects a refactor must preserve.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbol: z.string().describe('Exact symbol name to inspect, for example "BookingService.create" or "AuthService.login".'),
+        format: z.enum(['checklist', 'json']).optional().describe('Output format. Use json for the raw SideEffect[] array (default: checklist).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, symbol, format = 'checklist', qdrantUrl = 'http://localhost:6333' }) => {
+      const root = path.resolve(projectRoot);
+      try {
+        const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+        if (!graph) {
+          return { content: [{ type: 'text', text: 'Project not indexed. Run index_project first.' }] };
+        }
+        const effects = graph.sideEffects?.[symbol] ?? [];
+        if (effects.length === 0) {
+          return { content: [{ type: 'text', text: `No side effects recorded for "${symbol}".` }] };
+        }
+        if (format === 'json') {
+          return { content: [{ type: 'text', text: JSON.stringify(effects, null, 2) }] };
+        }
+        const header = `${symbol}\n${'─'.repeat(Math.min(40, symbol.length + 4))}`;
+        const body = renderBehaviorChecklist(effects);
+        return { content: [{ type: 'text', text: `${header}\n${body}` }] };
       } catch (error) {
         if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
         throw error;
