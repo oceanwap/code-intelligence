@@ -1,0 +1,487 @@
+{
+  "schemaVersion": 1,
+  "baselineCommit": "0c104caa",
+  "generatedAt": "2026-06-29T04:30:28.695Z",
+  "description": "FR-11 baseline: inputSchema + description + handler params for the 25 pre-US-001 leaves. Captured by scripts/gen-leaf-baseline.ts against src/mcp-server.ts. The `line` field is informational only — tests assert the other fields.",
+  "baselineLeaves": [
+    "render_behavior",
+    "get_symbol",
+    "get_symbols",
+    "list_symbols",
+    "find_references",
+    "find_implementations",
+    "expand_graph",
+    "query_project",
+    "query_project_memory",
+    "git_semantic_change_graph",
+    "index_status",
+    "index_project",
+    "regression_risk",
+    "regression_hotspots",
+    "risk_hotspots",
+    "hotspot_analysis",
+    "semantic_duplicates",
+    "attention_overview",
+    "architecture_overview",
+    "architecture_drift",
+    "constraint_violations",
+    "coupling_report",
+    "dependency_path",
+    "recent_changes",
+    "recent_bugs"
+  ],
+  "leaves": {
+    "render_behavior": {
+      "name": "render_behavior",
+      "line": 2351,
+      "description": "Render a side-effect checklist for a symbol — DB writes, HTTP calls, cache, queue, events, transactions, locks, logs, metrics. Use this to understand what a function does at a glance before changing it, or to verify which side effects a refactor must preserve.",
+      "inputKeys": [
+        "format",
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "handlerParams": [
+        "format",
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "get_symbol": {
+      "name": "get_symbol",
+      "line": 2248,
+      "description": "Precision drilldown for one exact symbol. Use this after query_project when a specific function, class, or method looks relevant, or when you already know the symbol name. Returns source plus inbound and outbound graph context. If you have several symbols to inspect, prefer get_symbols to avoid repeated round trips.",
+      "inputKeys": [
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "handlerParams": [
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "get_symbols": {
+      "name": "get_symbols",
+      "line": 2288,
+      "description": "Batch drilldown for multiple exact symbols. Use this when query_project, get_symbol, or expand_graph gives you a list of callers/callees that you want to inspect together. This is more efficient than repeated get_symbol calls and is the right tool for comparing several related symbols at once.",
+      "inputKeys": [
+        "projectRoot",
+        "qdrantUrl",
+        "symbols"
+      ],
+      "handlerParams": [
+        "projectRoot",
+        "qdrantUrl",
+        "symbols"
+      ],
+      "outputShape": "unknown"
+    },
+    "list_symbols": {
+      "name": "list_symbols",
+      "line": 2564,
+      "description": "Orientation tool for seeing the indexed API surface grouped by file. Use this when you know the module area but not the exact symbol names yet, or when you want entry points before using get_symbol/get_symbols/expand_graph. It is especially useful with fileFilter for narrowing to one subsystem such as auth, api, or graph.",
+      "inputKeys": [
+        "fileFilter",
+        "projectRoot"
+      ],
+      "handlerParams": [
+        "fileFilter",
+        "projectRoot"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "find_references": {
+      "name": "find_references",
+      "line": 2386,
+      "description": "Direct Serena-style reference lookup for one exact symbol. Use this after get_symbol or list_symbols when you need narrow upstream evidence instead of a wider subgraph. It returns graph-based callers for functions and methods, plus implementation/override references for base types or methods, with code snippets when the referenced symbols are indexed.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "find_implementations": {
+      "name": "find_implementations",
+      "line": 2448,
+      "description": "Serena-style implementation lookup for one exact type or method symbol. Use this when tracing interface adopters, subclasses, or method overrides, for example \"StorageProvider\", \"BaseIndexer\", or \"BaseIndexer.run\". Results come from the indexed inheritance graph and include code snippets for local implementations when available.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "symbol"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "expand_graph": {
+      "name": "expand_graph",
+      "line": 2498,
+      "description": "Use this when you need execution-path or dependency context around one or a few seed symbols. It expands the call graph outward, inward, or both, and returns reachable symbols with code. Prefer this over repeated get_symbol calls when tracing a flow through a subsystem. Start with 1-2 hops unless you intentionally want a wider boundary view.",
+      "inputKeys": [
+        "direction",
+        "hops",
+        "projectRoot",
+        "qdrantUrl",
+        "seeds"
+      ],
+      "handlerParams": [
+        "direction",
+        "hops",
+        "projectRoot",
+        "qdrantUrl",
+        "seeds"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "query_project": {
+      "name": "query_project",
+      "line": 561,
+      "description": "Use for implementation questions about code behavior, ownership, data flow, or where logic lives. This is the main semantic code-search entry point and returns ranked code plus graph-expanded related symbols. Prefer query_project_memory for history, status, bug timeline, or document questions. Typical follow-up: get_symbol for one result, get_symbols for several, expand_graph for an execution path, or get_file_chunks for a whole file.",
+      "inputKeys": [
+        "format",
+        "mode",
+        "page",
+        "pageSize",
+        "projectRoot",
+        "qdrantUrl",
+        "question",
+        "semanticThreshold"
+      ],
+      "handlerParams": [
+        "format",
+        "mode",
+        "page",
+        "pageSize",
+        "projectRoot",
+        "qdrantUrl",
+        "question",
+        "semanticThreshold"
+      ],
+      "outputShape": "unknown"
+    },
+    "query_project_memory": {
+      "name": "query_project_memory",
+      "line": 2228,
+      "description": "Semantic search over offline project memory, which combines git-derived change memory with document-derived project facts. Use this for questions about history, status, rationale, features, architecture, or recent bugs, for example \"what changed in auth recently\", \"why was caching touched\", or \"what does this project do\". Prefer query_project for source-level implementation questions.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "question"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "question"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "git_semantic_change_graph": {
+      "name": "git_semantic_change_graph",
+      "line": 1798,
+      "description": "Git-focused semantic change graph. Summarizes changed symbols (added/deleted/modified), usage impact (callers/callees), and compact risk signals from working tree, commit, or ref range.",
+      "inputKeys": [
+        "baseRef",
+        "commitSha",
+        "format",
+        "headRef",
+        "includeNoise",
+        "limit",
+        "mode",
+        "projectRoot"
+      ],
+      "handlerParams": [
+        "baseRef",
+        "commitSha",
+        "format",
+        "headRef",
+        "includeNoise",
+        "limit",
+        "mode",
+        "projectRoot"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "index_status": {
+      "name": "index_status",
+      "line": 747,
+      "description": "Lightweight readiness check. Use this before exploration when you are not sure the current branch is indexed, or when results may be stale after branch/file changes. If the project is not indexed, call index_project next. If it is indexed, choose project_status for a current-state summary, feature_map for high-level project understanding, query_project for code questions, or query_project_memory for history/status questions.",
+      "inputKeys": [
+        "projectRoot",
+        "qdrantUrl"
+      ],
+      "handlerParams": [
+        "projectRoot",
+        "qdrantUrl"
+      ],
+      "outputShape": "unknown"
+    },
+    "index_project": {
+      "name": "index_project",
+      "line": 505,
+      "description": "First tool to call for a repo or branch that may not be indexed yet. Parses code, stores code embeddings, builds the call graph, and refreshes offline project memory from git history and docs. Re-run after meaningful file changes or branch switches. Use fromScratch=true to clear all previous index data and rebuild from zero. Typical workflow: index_project -> index_status or project_status -> feature_map/query_project/query_project_memory -> get_symbol/get_symbols/expand_graph/get_file_chunks.",
+      "inputKeys": [
+        "fromScratch",
+        "indexMode",
+        "projectRoot",
+        "qdrantUrl"
+      ],
+      "handlerParams": [
+        "fromScratch",
+        "indexMode",
+        "projectRoot",
+        "qdrantUrl"
+      ],
+      "outputShape": "unknown"
+    },
+    "regression_risk": {
+      "name": "regression_risk",
+      "line": 1216,
+      "description": "Estimate regression risk for a target symbol, file, or module using instability and bug-history overlap.",
+      "inputKeys": [
+        "projectRoot",
+        "qdrantUrl",
+        "target"
+      ],
+      "handlerParams": [
+        "projectRoot",
+        "qdrantUrl",
+        "target"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "regression_hotspots": {
+      "name": "regression_hotspots",
+      "line": 1126,
+      "description": "Failure-prone hotspots correlated from historical regressions and temporal risk.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "risk_hotspots": {
+      "name": "risk_hotspots",
+      "line": 2142,
+      "description": "Use this to identify high-risk symbols and files before planning a change. It ranks hotspots by recent project-memory changes, fix frequency, and graph connectivity so agents can quickly spot unstable or highly connected areas that deserve extra caution. Add topic when you already know the subsystem you care about.",
+      "inputKeys": [
+        "excludeSinkNodes",
+        "format",
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "sortBy",
+        "topic"
+      ],
+      "handlerParams": [
+        "excludeSinkNodes",
+        "format",
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "sortBy",
+        "topic"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "hotspot_analysis": {
+      "name": "hotspot_analysis",
+      "line": 1527,
+      "description": "Return temporal hotspots ranked by composite risk from instability, coupling, bug recurrence, and churn.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "refresh",
+        "topic"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "refresh",
+        "topic"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "semantic_duplicates": {
+      "name": "semantic_duplicates",
+      "line": 1435,
+      "description": "Detect semantic duplicate patterns across the codebase. Returns structural duplicate clusters with severity, affected modules/files, and actionable recommendations. Call before writing new code to find existing implementations that could be reused, or to identify modules that need shared abstractions.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "refresh",
+        "severity",
+        "target"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "refresh",
+        "severity",
+        "target"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "attention_overview": {
+      "name": "attention_overview",
+      "line": 993,
+      "description": "Show attention snapshot across modules and symbols computed after structural cognition.",
+      "inputKeys": [
+        "projectRoot",
+        "qdrantUrl",
+        "refresh"
+      ],
+      "handlerParams": [
+        "projectRoot",
+        "qdrantUrl",
+        "refresh"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "architecture_overview": {
+      "name": "architecture_overview",
+      "line": 834,
+      "description": "Architecture cognition snapshot built from symbol graph dependencies. Use before planning edits to understand module boundaries, dependency direction, and architecture zones.",
+      "inputKeys": [
+        "projectRoot",
+        "refresh"
+      ],
+      "handlerParams": [
+        "projectRoot",
+        "refresh"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "architecture_drift": {
+      "name": "architecture_drift",
+      "line": 1502,
+      "description": "Track architecture drift over time by comparing module instability, coupling, and risk deltas across evolution snapshots.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "refresh"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "refresh"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "constraint_violations": {
+      "name": "constraint_violations",
+      "line": 1408,
+      "description": "List architecture constraint violations, optionally filtered by severity.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "severity"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "severity"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "coupling_report": {
+      "name": "coupling_report",
+      "line": 915,
+      "description": "Report module coupling scores and strongest dependency edges. Use this before refactors to identify tightly-coupled zones likely to regress.",
+      "inputKeys": [
+        "limit",
+        "projectRoot"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "dependency_path": {
+      "name": "dependency_path",
+      "line": 880,
+      "description": "Find a module-level dependency path between two modules. Use this to reason about transitive dependency direction before introducing new imports or cross-module calls.",
+      "inputKeys": [
+        "from",
+        "projectRoot",
+        "to"
+      ],
+      "handlerParams": [
+        "from",
+        "projectRoot",
+        "to"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "recent_changes": {
+      "name": "recent_changes",
+      "line": 2027,
+      "description": "Use for timeline-style questions such as \"what changed recently\", \"recent fixes in auth\", or \"show refactors touching caching\". Results come from offline project memory built from git history and are summarized by impacted symbols, files, and topics instead of raw diffs. This is usually the right follow-up after project_status when you want a chronological view.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "topic",
+        "type"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "topic",
+        "type"
+      ],
+      "outputShape": "mcp_text"
+    },
+    "recent_bugs": {
+      "name": "recent_bugs",
+      "line": 2047,
+      "description": "Use for bug-history questions such as \"what broke recently\", \"recent auth bugs\", or \"show regressions touching caching\". Results come from offline bug memory synthesized from local fix history, so they surface likely past failures rather than every change.",
+      "inputKeys": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "topic"
+      ],
+      "handlerParams": [
+        "limit",
+        "projectRoot",
+        "qdrantUrl",
+        "topic"
+      ],
+      "outputShape": "mcp_text"
+    }
+  }
+}
