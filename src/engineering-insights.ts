@@ -3,6 +3,8 @@ import { loadGraphAsync, type GraphData } from './graph.js';
 import { getDataDir } from './git.js';
 import { getProjectMemoryEntriesAsync, type ChangeMemoryEntry, type ProjectMemoryEntry } from './project-memory.js';
 import { summarizeOwnershipForFilesAsync } from './ownership-insights.js';
+import { loadCompositeScoresAsMap } from './cognition/composite/persist.js';
+import type { CompositeScore } from './cognition/composite/scoring.js';
 
 type ImpactDirection = 'out' | 'in' | 'both';
 type RelationKind = 'calls' | 'calledBy' | 'implements' | 'implementedFrom';
@@ -63,6 +65,10 @@ export interface SymbolHotspot {
   score: number;
   churnScore: number;
   connectivityScore: number;
+  /** P2 composite scoring hook (PRD US-003). Present when composite-scores.json exists. */
+  blastRadius?: number;
+  /** Breakdown of the blastRadius features, surfaced for explainability. */
+  blastRadiusBreakdown?: CompositeScore['blastRadiusBreakdown'];
 }
 
 export interface FileHotspot {
@@ -538,6 +544,9 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
     symbolsByFile.get(file)!.add(symbol);
   }
 
+  // P2 composite scoring hook (PRD US-003). Optional — missing file = no boost.
+  const compositeScores = await loadCompositeScoresAsMap({ projectRoot: root });
+
   function symbolSortKey(entry: { score: number; churnScore: number; connectivityScore: number; dependentsCount: number; symbol: string }): number {
     switch (sortBy) {
       case 'churn': return entry.churnScore;
@@ -575,8 +584,15 @@ export async function getRiskHotspots(projectRoot: string, opts: number | RiskHo
         score,
         churnScore,
         connectivityScore,
+        // P2 composite scoring hook (PRD US-003). Free upgrade: when a
+        // composite score is present, fold blastRadius into the symbol risk
+        // score and surface the breakdown in `riskSummary`. Missing
+        // composite file = no change.
+        blastRadius: compositeScores?.get(symbol)?.blastRadius,
+        blastRadiusBreakdown: compositeScores?.get(symbol)?.blastRadiusBreakdown,
       };
     })
+    .map(entry => boostSymbolHotspotByBlastRadius(entry))
     .filter(entry => !excludeSinkNodes || entry.dependentsCount > 0)
     .sort((left, right) => symbolSortKey(right) - symbolSortKey(left) || left.symbol.localeCompare(right.symbol))
     .slice(0, maxResults);
@@ -669,6 +685,9 @@ export function renderRiskHotspots(result: RiskHotspotsResult): string {
           : 'Impact surface: none',
         entry.topics.length > 0 ? `Topics: ${entry.topics.join(', ')}` : '',
         `Connectivity: ${entry.connectivity}`,
+        typeof entry.blastRadius === 'number'
+          ? `Blast radius (P2 composite): ${entry.blastRadius.toFixed(2)} (inbound ${entry.blastRadiusBreakdown?.inbound ?? 0}, outbound ${entry.blastRadiusBreakdown?.outbound ?? 0}, connectivity ${entry.blastRadiusBreakdown?.connectivity ?? 0})`
+          : '',
         `Score: ${entry.score.toFixed(1)}`,
         `Summary: ${entry.riskSummary}`,
       ].filter(Boolean).join('\n')).join('\n\n---\n\n'),
@@ -703,4 +722,33 @@ export function renderRiskHotspots(result: RiskHotspotsResult): string {
   }
 
   return sections.join('\n\n');
+}
+
+// ---------------------------------------------------------------------------
+// P2 composite scoring hook (PRD US-003).
+//
+// `boostSymbolHotspotByBlastRadius` is a pure helper that adjusts a symbol
+// hotspot's composite score by the per-symbol blastRadius from
+// composite-scores.json. The weight is intentionally small so existing
+// churn/connectivity ranking dominates, but the change can flip ties —
+// exactly what SM-6 ("top-3 includes at least one new symbol after
+// Phase 2") needs.
+// ---------------------------------------------------------------------------
+
+const BLAST_RADIUS_BOOST_WEIGHT = 4;
+
+export function boostSymbolHotspotByBlastRadius<T extends {
+  score: number;
+  blastRadius?: number | null;
+  blastRadiusBreakdown?: CompositeScore['blastRadiusBreakdown'] | null;
+  riskSummary?: string;
+}>(entry: T): T {
+  const br = entry.blastRadius;
+  if (br == null || !Number.isFinite(br) || br <= 0) return entry;
+  const boosted = entry.score + br * BLAST_RADIUS_BOOST_WEIGHT;
+  const existingSummary = entry.riskSummary ?? '';
+  const annotation = existingSummary.includes('blast radius')
+    ? existingSummary
+    : `${existingSummary}${existingSummary ? '; ' : ''}blast radius ${br.toFixed(2)}`;
+  return { ...entry, score: boosted, riskSummary: annotation };
 }

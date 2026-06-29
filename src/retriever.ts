@@ -4,6 +4,8 @@ import { resolveActiveCollectionAsync, embedQuery } from './embedder.js';
 import { getProjectMemoryEntriesAsync, type ProjectMemoryEntry } from './project-memory.js';
 import { getRetrievedSliceFreshnessAsync, type RetrievedSliceFreshness } from './query-freshness.js';
 import { renderCompactCallGraphLines } from './call-graph-preview.js';
+import { loadCompositeScoresAsMap } from './cognition/composite/persist.js';
+import type { CompositeScore } from './cognition/composite/scoring.js';
 
 const MAX_CHARS = 3000 * 4; // ~3000 tokens (1 token ≈ 4 chars)
 const STRONG_SEMANTIC_SCORE = 0.5;
@@ -343,7 +345,8 @@ export function rankRetrievedChunks(
   graph: GraphData | null,
   memoryEntries: ProjectMemoryEntry[] = [],
   mode: RetrievalMode = 'default',
-  strongSemanticSeedSymbols: Set<string> = new Set<string>()
+  strongSemanticSeedSymbols: Set<string> = new Set<string>(),
+  compositeScores?: Map<string, CompositeScore>
 ): RetrievedChunk[] {
   const queryTokens = new Set(tokenize(query));
   if (queryTokens.size === 0) return results;
@@ -397,10 +400,25 @@ export function rankRetrievedChunks(
       if (neighborContribution > 0) rankingSignals.push('connected to relevant symbols');
       if (connectivityContribution > 0) rankingSignals.push(`graph connectivity ${connectivity}`);
 
+      // P2 composite scoring hook (PRD US-003). Free upgrade: when a
+      // composite score is available for this symbol, blend its blast radius
+      // into the hybrid score and surface a transparent ranking signal. The
+      // weight is intentionally small (×4) so it tunes the ranking without
+      // overriding semantic relevance — same shape as rerankByAttentionAsync.
+      const composite = compositeScores?.get(result.symbol);
+      const blastRadiusScore = composite?.blastRadius ?? 0;
+      const blastRadiusBoost = composite ? blastRadiusScore * 4 : 0;
+      if (composite) {
+        const topFeature = topBlastRadiusFeature(composite);
+        if (topFeature) rankingSignals.push(`blast radius ${topFeature}`);
+      }
+
+      const finalScore = hybridScore + blastRadiusBoost;
+
       return {
         ...result,
         semanticScore,
-        score: hybridScore,
+        score: finalScore,
         rankingSignals,
         scoreBreakdown: {
           semantic: semanticContribution,
@@ -413,6 +431,20 @@ export function rankRetrievedChunks(
       } satisfies RetrievedChunk;
     })
     .sort((left, right) => right.score - left.score || left.symbol.localeCompare(right.symbol));
+}
+
+function topBlastRadiusFeature(score: CompositeScore): string {
+  const b = score.blastRadiusBreakdown;
+  const candidates: Array<[string, number]> = [
+    ['inbound callers', b.inboundNormalized],
+    ['outbound callees', b.outboundNormalized],
+    ['total degree', b.totalDegreeNormalized],
+    ['connectivity', b.connectivityNormalized],
+  ];
+  candidates.sort((a, b2) => b2[1] - a[1]);
+  const top = candidates[0];
+  if (!top || top[1] <= 0) return '';
+  return `${top[0]} ${top[1].toFixed(2)}`;
 }
 
 export async function retrieve(
@@ -601,8 +633,11 @@ export async function retrievePage(
   }
 
   const memoryEntries = await getProjectMemoryEntriesAsync(projectRoot);
+  // P2 composite scores (PRD US-003). Optional — load only when present;
+  // missing file = no boost (ranker falls back to existing hybrid score).
+  const compositeScores = await loadCompositeScoresAsMap({ projectRoot });
   const ranked = await Promise.all(
-    rankRetrievedChunks(query, results, graph, memoryEntries, mode, strongSemanticSeedSymbols)
+    rankRetrievedChunks(query, results, graph, memoryEntries, mode, strongSemanticSeedSymbols, compositeScores)
       .map(async result => ({
         ...result,
         graphSummary: buildGraphSummary(graph, result.symbol),

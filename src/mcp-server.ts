@@ -130,6 +130,14 @@ import {
   clearScratchpad,
   type ScratchpadEntry,
 } from './cognition/blackboard/scratchpad.js';
+import {
+  loadCompositeScoresAsMap,
+} from './cognition/composite/persist.js';
+import {
+  searchCrossOutputAsync,
+  renderCrossOutputHits,
+  type CrossOutputSearchHit,
+} from './cognition/composite/cross-output-index.js';
 
 const PROJECT_ROOT_DESC = 'Absolute path to the project root. For git repositories, indexes and project memory are branch-scoped, so check status or re-index after switching branches.';
 const QDRANT_URL_DESC = 'Qdrant server URL (default: http://localhost:6333). Use only if the local vector store is not running on the default port.';
@@ -441,6 +449,112 @@ function qdrantUnavailableResponse(qdrantUrl: string): { content: Array<{ type: 
   };
 }
 
+// ---------------------------------------------------------------------------
+// P2 composite scoring hook (PRD US-003).
+//
+// `rankDuplicatePatternsByBlastRadius` reorders semantic-duplicate patterns
+// so the patterns whose participating symbols have the largest blast radius
+// surface first. Severity stays the primary ordering criterion — within the
+// same severity bucket we surface high-blast-radius patterns first, which
+// is exactly what SM-6 calls for. Pure, deterministic.
+// ---------------------------------------------------------------------------
+
+type SemanticDuplicatePatternShape = {
+  severity: string;
+  title: string;
+  locations: Array<{ file: string; line: number; symbol: string; module: string }>;
+};
+
+async function loadCompositeScoresSafe(projectRoot: string): Promise<Map<string, { blastRadius: number }> | null> {
+  try {
+    return await loadCompositeScoresAsMap({ projectRoot });
+  } catch {
+    return null;
+  }
+}
+
+function maxBlastRadiusForPattern(
+  pattern: SemanticDuplicatePatternShape,
+  compositeScores: Map<string, { blastRadius: number }>
+): number {
+  let max = 0;
+  for (const loc of pattern.locations) {
+    const score = compositeScores.get(loc.symbol);
+    if (!score) continue;
+    if (score.blastRadius > max) max = score.blastRadius;
+  }
+  return max;
+}
+
+function rankDuplicatePatternsByBlastRadius<T extends SemanticDuplicatePatternShape>(
+  patterns: T[],
+  compositeScores: Map<string, { blastRadius: number }>
+): T[] {
+  // Severity ordering kept stable via severity index. Within each bucket,
+  // sort by blast radius descending, with the original index as the final
+  // tiebreaker for determinism.
+  const severityOrder: Record<string, number> = { high: 3, medium: 2, low: 1 };
+  return patterns
+    .map((pattern, idx) => ({ pattern, idx, br: maxBlastRadiusForPattern(pattern, compositeScores) }))
+    .sort((left, right) => {
+      const ls = severityOrder[left.pattern.severity] ?? 0;
+      const rs = severityOrder[right.pattern.severity] ?? 0;
+      if (ls !== rs) return rs - ls;
+      if (left.br !== right.br) return right.br - left.br;
+      return left.idx - right.idx;
+    })
+    .map(entry => entry.pattern);
+}
+
+function blastRadiusSummary(
+  pattern: SemanticDuplicatePatternShape,
+  compositeScores: Map<string, { blastRadius: number }> | null
+): string {
+  if (!compositeScores || compositeScores.size === 0) return '';
+  const top = pattern.locations
+    .map(loc => ({ symbol: loc.symbol, br: compositeScores.get(loc.symbol)?.blastRadius ?? 0 }))
+    .filter(item => item.br > 0)
+    .sort((a, b) => b.br - a.br)[0];
+  if (!top) return '';
+  return `Blast radius (P2 composite): max ${top.br.toFixed(2)} across ${pattern.locations.length} location(s); top symbol ${top.symbol}`;
+}
+
+// ---------------------------------------------------------------------------
+// P2 cross-output augmentation hook (PRD US-003 / FR-6).
+//
+// `isCrossOutputEnabled` returns true when the env flag is set OR the
+// session scratchpad contains a recent `crossOutput: true` hint. Used by
+// query_project's mcp-server handler to opt into cross-output augmentation
+// without changing the public inputSchema (FR-11 / backward-compat safe).
+// ---------------------------------------------------------------------------
+
+const CROSS_OUTPUT_ENV_KEY = 'CODE_INTEL_CROSS_OUTPUT';
+
+function isCrossOutputEnabled(sessionHint: boolean | undefined): boolean {
+  if (sessionHint === true) return true;
+  const raw = process.env[CROSS_OUTPUT_ENV_KEY];
+  if (raw == null) return false;
+  const norm = raw.trim().toLowerCase();
+  return norm === '1' || norm === 'true' || norm === 'yes' || norm === 'on';
+}
+
+async function crossOutputAugmentAsync(opts: {
+  projectRoot: string;
+  question: string;
+  qdrantUrl: string;
+  sessionId?: string;
+  limit: number;
+}): Promise<CrossOutputSearchHit[]> {
+  return searchCrossOutputAsync(opts.question, {
+    crossOutput: true,
+    limit: opts.limit,
+    ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+  }, {
+    projectRoot: opts.projectRoot,
+    qdrantUrl: opts.qdrantUrl,
+  });
+}
+
 /**
  * wrapLeaf — opt-in envelope wrapper for NEW tool registrations (US-001 P0).
  *
@@ -647,6 +761,30 @@ export function createMcpServer(): McpServer {
               sections.push('Architecture overview:');
               sections.push(...overviewClaims);
             }
+          }
+        }
+        // P2 cross-output augmentation (PRD US-003 / FR-6). Opt-in via
+        // CODE_INTEL_CROSS_OUTPUT=1 or session-level hint (read from
+        // scratchpad). When enabled, augment the response with hits from
+        // the cross-output Qdrant collection. Existing query paths are
+        // unchanged when disabled (default).
+        const crossOutputEnabled = isCrossOutputEnabled(undefined);
+        if (crossOutputEnabled) {
+          try {
+            const hits = await crossOutputAugmentAsync({
+              projectRoot: root,
+              question,
+              qdrantUrl,
+              limit: 5,
+            });
+            const rendered = renderCrossOutputHits(hits);
+            if (rendered) {
+              sections.push('Cross-output augmentation enabled (CODE_INTEL_CROSS_OUTPUT=1):');
+              sections.push(rendered);
+            }
+          } catch {
+            // Cross-output is opt-in; never fail the primary query because
+            // the augmentation hit a Qdrant error or the collection is missing.
           }
         }
         const output = results
@@ -1454,11 +1592,9 @@ export function createMcpServer(): McpServer {
       let patterns = target
         ? findDuplicatesForTarget(snapshot, target)
         : getDuplicateSummary(snapshot).highSeverityPatterns;
-
-      if (severity) {
-        patterns = patterns.filter(p => p.severity === severity);
-      }
-
+      if (severity) patterns = patterns.filter(p => p.severity === severity);
+      const compositeScores = await loadCompositeScoresSafe(root);
+      if (compositeScores) patterns = rankDuplicatePatternsByBlastRadius(patterns, compositeScores);
       patterns = patterns.slice(0, limit);
 
       if (patterns.length === 0) {
@@ -1472,7 +1608,8 @@ export function createMcpServer(): McpServer {
           `Locations:`,
           ...p.locations.slice(0, 5).map(loc => `  - ${loc.file}:${loc.line} (${loc.symbol})`),
           p.locations.length > 5 ? `  ... and ${p.locations.length - 5} more` : '',
-        ].join('\n'))
+          blastRadiusSummary(p, compositeScores),
+        ].filter(Boolean).join('\n'))
         .join('\n\n---\n\n');
 
       return { content: [{ type: 'text', text }] };
