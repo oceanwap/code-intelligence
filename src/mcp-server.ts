@@ -119,6 +119,9 @@ import { validateIntent, renderIntentValidation } from './intent-validator.js';
 import { validateGeneratedCode, renderCodeValidation } from './code-validator.js';
 import { getModuleConventions, renderModuleConventions } from './module-conventions.js';
 import { buildRepoMap, renderRepoMap } from './repo-map.js';
+import { auditSymbolAsync } from './cognition/audit/audit-symbol.js';
+import { planRefactorAsync } from './cognition/audit/plan-refactor.js';
+import type { AuditSymbolPayload, PlanRefactorPayload } from './cognition/audit/types.js';
 import { withSignals as withSignalsEnvelope, isToolResult as isEnvelope } from './cognition/signalization/builder.js';
 import {
   type ToolResult,
@@ -2962,6 +2965,67 @@ export function createMcpServer(): McpServer {
           isError: true,
         };
       }
+    }
+  );
+
+  // --- audit_symbol (US-004 / P3a) ---
+  // Superpowered combo tool that fuses 6 leaves + composite scoring into a
+  // single ToolResult<AuditSymbolPayload>. Returns a ToolResult JSON shape
+  // (FR-1); defaults writeToBlackboard=true per PRD OQ-5; deterministic
+  // sessionId `audit:<sha1_8>` when none is supplied.
+  server.registerTool(
+    'audit_symbol',
+    {
+      description: 'Fuse behavior, risk, impact, duplicates, rationale, and blast-radius into a single audit for one symbol. Calls get_symbol + render_behavior + regression_risk + analyze_impact + semantic_duplicates + query_project_memory + composite scoring. Returns a ToolResult<AuditSymbolPayload> with all 8 fields populated. Defaults to writeToBlackboard=true (per PRD OQ-5). Wall-time budget: <= 2x the slowest leaf.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbol: z.string().describe('Exact symbol name to audit, for example "BookingService.create" or "AuthService.login".'),
+        writeToBlackboard: z.boolean().optional().describe('Persist the audit ToolResult to the per-session blackboard (default: true). Pass false for read-only audits.'),
+        sessionId: z.string().optional().describe('Override the deterministic sessionId. Default: "audit:<sha1_8>" where sha1_8 is the first 8 hex chars of SHA-1(symbol).'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, symbol, writeToBlackboard, sessionId, qdrantUrl }) => {
+      const result = await auditSymbolAsync(path.resolve(projectRoot), symbol, {
+        writeToBlackboard,
+        sessionId,
+        qdrantUrl,
+      });
+      const text = JSON.stringify(result, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  // --- plan_refactor (US-004 / P3a) ---
+  // Superpowered combo tool that ranks intervention steps across a branch
+  // diff. Returns ToolResult<PlanRefactorPayload> with deterministic rank
+  // (confidence desc → blast_radius desc → reversible desc → symbol asc).
+  server.registerTool(
+    'plan_refactor',
+    {
+      description: 'Rank intervention steps across a branch diff. Calls git_semantic_change_graph(baseRef, headRef) + per-symbol regression_risk + render_behavior + semantic_duplicates on touched files + architecture_drift once globally. Each step carries confidence, reversible, blast_radius, and why[]. Default sessionId: "plan-refactor:<baseRef>..<headRef>".',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        baseRef: z.string().describe('Base ref for the diff, for example "main" or a commit SHA.'),
+        headRef: z.string().describe('Head ref for the diff, for example "HEAD" or a commit SHA.'),
+        topN: z.number().int().min(1).max(50).optional().describe('Maximum number of intervention steps to return (default: 10).'),
+        writeToBlackboard: z.boolean().optional().describe('Persist the plan ToolResult to the per-session blackboard (default: true).'),
+        sessionId: z.string().optional().describe('Override the deterministic sessionId. Default: "plan-refactor:<baseRef>..<headRef>".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, baseRef, headRef, topN, writeToBlackboard, sessionId, qdrantUrl }) => {
+      const result = await planRefactorAsync({
+        projectRoot: path.resolve(projectRoot),
+        baseRef,
+        headRef,
+        topN,
+        writeToBlackboard,
+        sessionId,
+        qdrantUrl,
+      });
+      const text = JSON.stringify(result, null, 2);
+      return { content: [{ type: 'text', text }] };
     }
   );
 

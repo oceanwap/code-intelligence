@@ -222,3 +222,33 @@ test('summary: 25 baseline leaves present with byte-identical shape', () => {
   assert.equal(mismatches.length, 0, `mismatched leaves: ${mismatches.join(', ')}`);
   assert.equal(matches.length, 25);
 });
+
+test('additive growth allowed: every baseline leaf still present, current count >= 25', () => {
+  // US-004 (Sprint 3) adds 2 new meta-tools (audit_symbol + plan_refactor)
+  // and US-006 (Sprint 4) will add more. Per FR-11 we cannot REMOVE a
+  // baseline leaf or CHANGE its input/output shape, but we CAN add new
+  // tool registrations. This test asserts the additive-growth rule:
+  //   - every baseline leaf is still present with byte-equal shape (above),
+  //   - the current total tool count is at least the baseline 25.
+  const fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8')) as Fixture;
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  for (const name of fixture.baselineLeaves) {
+    assert.ok(current.has(name), `baseline leaf "${name}" missing from current ${MCP_SERVER}`);
+  }
+  assert.ok(
+    current.size >= fixture.baselineLeaves.length,
+    `expected at least ${fixture.baselineLeaves.length} registered tools, found ${current.size}`,
+  );
+});
+
+test('US-004 meta-tools are registered as new tools (additive)', () => {
+  // Spot-check that the Sprint 3 additions are present in src/mcp-server.ts.
+  // This guards against accidentally deleting a new tool by failing the
+  // assertion if either meta-tool is missing.
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  for (const name of ['audit_symbol', 'plan_refactor']) {
+    assert.ok(current.has(name), `US-004 meta-tool "${name}" must be registered in ${MCP_SERVER}`);
+  }
+});
