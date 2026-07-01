@@ -27,6 +27,8 @@ import { refreshEvolutionAsync } from './cognition/evolution/engine.js';
 import { refreshMemoryGovernanceAsync } from './cognition/governance/engine.js';
 import { validateIndexerOutput, validateGraphOutput } from './pipeline-contract.js';
 import { detectCommunities, saveCommunitiesAsync } from './cognition/communities.js';
+import { computeAndPersistCompositeScores } from './cognition/composite/persist.js';
+import { getProjectMemoryEntriesAsync } from './project-memory.js';
 
 export interface IndexResult {
   mode: IndexMode;
@@ -51,6 +53,8 @@ export interface IndexResult {
   staleMemoryEntries: number;
   structureModules: number;
   attentionCritical: number;
+  /** Number of composite-score entries persisted to composite-scores.json. */
+  compositeScores: number;
   totalDurationMs: number;
   stageDurationsMs: Record<string, number>;
 }
@@ -430,6 +434,22 @@ export async function indexProject(
 
   const { structure, architecture, attention, reflection, failures, constraints, evolution, governance } = cognition;
 
+  // FR-5 / Q3 fix: recompute composite scores at the end of every index run.
+  // Previously `computeAndPersistCompositeScores` had zero callers in the
+  // indexing pipeline, so composite-scores.json was written once (typically
+  // by a test fixture) and then frozen — `query_project`, `risk_hotspots`,
+  // `semantic_duplicates` etc. read stale scores forever.
+  // Graph is finalized at line 315 above; memory at line 376. Both are
+  // stable when this block runs.
+  let compositeScoresCount = 0;
+  await measure('computing-composite', async () => {
+    const memoryEntries = await getProjectMemoryEntriesAsync(root);
+    const scores = await computeAndPersistCompositeScores(graph, memoryEntries, {
+      projectRoot: root,
+    });
+    compositeScoresCount = Object.keys(scores).length;
+  });
+
   await saveManifestAsync(newManifest, manifestFile);
   const totalDurationMs = Math.round((nowMs() - runStartedAt) * 100) / 100;
 
@@ -456,6 +476,7 @@ export async function indexProject(
     staleMemoryEntries: governance.health.staleEntries,
     structureModules: structure?.modules.length ?? 0,
     attentionCritical: attention?.modules.filter(module => module.tier === 'CRITICAL').length ?? 0,
+    compositeScores: compositeScoresCount,
     totalDurationMs,
     stageDurationsMs,
   };
