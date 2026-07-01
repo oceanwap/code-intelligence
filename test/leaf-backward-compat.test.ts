@@ -252,3 +252,48 @@ test('US-004 meta-tools are registered as new tools (additive)', () => {
     assert.ok(current.has(name), `US-004 meta-tool "${name}" must be registered in ${MCP_SERVER}`);
   }
 });
+
+test('additive growth after Sprint 4: current.size >= 29 (baseline 25 + US-004 ×2 + US-005 ×2 + US-006 ×1)', () => {
+  // Sprint 4 adds 3 new tools: trace_workflow + collaborate (US-005),
+  // session_status (US-006). run_intent (US-006) is the 4th.
+  // Baseline 25 + Sprint 3 (audit_symbol, plan_refactor) = 27
+  // + Sprint 4 (trace_workflow, collaborate, session_status, run_intent) = 31.
+  // The spec asks for size >= 29 to leave headroom for ordering differences.
+  const fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8')) as Fixture;
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  for (const name of fixture.baselineLeaves) {
+    assert.ok(current.has(name), `baseline leaf "${name}" missing`);
+  }
+  assert.ok(
+    current.size >= 29,
+    `expected at least 29 registered tools after Sprint 4, found ${current.size}`,
+  );
+});
+
+test('US-005: trace_workflow tool is registered (additive)', () => {
+  // Sprint 4 US-005 P3b superpowered tool. Spot-check the parser
+  // discovers the registration in src/mcp-server.ts. Fails the test if
+  // the new tool is missing or mis-registered.
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  assert.ok(current.has('trace_workflow'), 'US-005 meta-tool "trace_workflow" must be registered in src/mcp-server.ts');
+});
+
+test('US-005: collaborate tool is registered (additive)', () => {
+  // Sprint 4 US-005 P3b goal-shaped entry point. Spot-check the parser
+  // discovers the registration in src/mcp-server.ts. Fails the test if
+  // the new tool is missing or mis-registered.
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  assert.ok(current.has('collaborate'), 'US-005 meta-tool "collaborate" must be registered in src/mcp-server.ts');
+});
+
+test('US-006: session_status tool is registered (additive)', () => {
+  // Sprint 4 US-006 P4 read-only inspector (FR-9). Spot-check the
+  // parser discovers the registration in src/mcp-server.ts. Fails the
+  // test if the new tool is missing or mis-registered.
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  assert.ok(current.has('session_status'), 'US-006 read-only tool "session_status" must be registered in src/mcp-server.ts');
+});

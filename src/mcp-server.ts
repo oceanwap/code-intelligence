@@ -121,6 +121,14 @@ import { getModuleConventions, renderModuleConventions } from './module-conventi
 import { buildRepoMap, renderRepoMap } from './repo-map.js';
 import { auditSymbolAsync } from './cognition/audit/audit-symbol.js';
 import { planRefactorAsync } from './cognition/audit/plan-refactor.js';
+import { traceWorkflowAsync } from './cognition/audit/trace-workflow.js';
+import { collaborateAsync, buildDefaultToolRegistry } from './cognition/audit/collaborate.js';
+import { sessionStatusAsync } from './cognition/audit/session-status.js';
+import { runIntentAsync } from './cognition/intents/runner.js';
+import {
+  attachRecommendedNext,
+  isRecommendEnabled,
+} from './cognition/recommend/post-call.js';
 import type { AuditSymbolPayload, PlanRefactorPayload } from './cognition/audit/types.js';
 import { withSignals as withSignalsEnvelope, isToolResult as isEnvelope } from './cognition/signalization/builder.js';
 import {
@@ -580,6 +588,108 @@ function wrapLeaf<T>(
   fn: (...args: any[]) => T | Promise<T>,
 ): (...args: any[]) => Promise<ToolResult<T>> {
   return withSignalsEnvelope(fn, { name });
+}
+
+/**
+ * buildCollaborateToolRegistry — bridge from `collaborate` DAG tool names
+ * to bound leaf-callable functions.
+ *
+ * `collaborate` resolves DAG steps by name. For the in-process MCP server
+ * the cleanest bridge is to map each name to a closure that calls the
+ * leaf function the same way the registered tool would. Each closure
+ * returns a plain `data` value (not a ToolResult); the collaborate
+ * runner wraps it in its own envelope.
+ *
+ * Unknown names resolve to `null` (registry reports them as missing).
+ */
+function buildCollaborateToolRegistry(projectRoot: string, qdrantUrl: string) {
+  return buildDefaultToolRegistry((name) => {
+    switch (name) {
+      case 'audit_symbol':
+        return (args: Record<string, unknown>) => auditSymbolAsync(
+          projectRoot,
+          typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown',
+          { qdrantUrl, writeToBlackboard: false },
+        );
+      case 'plan_refactor':
+        return (args: Record<string, unknown>) => planRefactorAsync({
+          projectRoot,
+          baseRef: typeof args['baseRef'] === 'string' ? args['baseRef'] : 'main',
+          headRef: typeof args['headRef'] === 'string' ? args['headRef'] : 'HEAD',
+          qdrantUrl,
+          writeToBlackboard: false,
+        });
+      case 'trace_workflow':
+        return (args: Record<string, unknown>) => traceWorkflowAsync({
+          projectRoot,
+          symbol: typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown',
+          hops: args['hops'] === 3 ? 3 : 2,
+          qdrantUrl,
+          writeToBlackboard: false,
+        });
+      case 'render_behavior':
+        // The leaf is the registered render_behavior tool, but for the
+        // DAG bridge we read side-effects directly from the graph (same
+        // source the tool uses). Returning an object is sufficient for
+        // the runner's summarizer.
+        return async (args: Record<string, unknown>) => {
+          const sym = typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown';
+          const graph = await loadGraphAsync(path.join(getDataDir(projectRoot), 'graph.json'));
+          return { symbol: sym, sideEffects: graph?.sideEffects?.[sym] ?? [] };
+        };
+      case 'get_symbol':
+        return async (args: Record<string, unknown>) => {
+          const sym = typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown';
+          const graph = await loadGraphAsync(path.join(getDataDir(projectRoot), 'graph.json'));
+          return {
+            symbol: sym,
+            file: graph?.symbolFile?.[sym] ?? null,
+            callers: graph?.callers?.[sym] ?? [],
+            callees: graph?.symbols?.[sym] ?? [],
+          };
+        };
+      case 'regression_risk':
+        return (args: Record<string, unknown>) => regressionRiskAsync(
+          projectRoot,
+          typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown',
+        );
+      case 'analyze_impact':
+        return (args: Record<string, unknown>) => getAffectedSymbolsInsight(
+          projectRoot,
+          [typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown'],
+          { hops: 2, direction: 'both', limit: 15 },
+        );
+      case 'project_status':
+        return () => getProjectStatusAsync(projectRoot);
+      case 'feature_map':
+        return () => getFeatureMapAsync(projectRoot);
+      case 'repo_map':
+        return (args: Record<string, unknown>) => buildRepoMap(projectRoot, {
+          seeds: Array.isArray(args['seeds']) ? args['seeds'] as string[] : [],
+          maxLines: typeof args['maxLines'] === 'number' ? args['maxLines'] : 1000,
+          includeMethods: args['includeMethods'] !== false,
+        });
+      case 'query_project':
+        return (args: Record<string, unknown>) => smartQueryAsync(
+          projectRoot,
+          typeof args['question'] === 'string' ? args['question'] : '',
+        );
+      case 'query_project_memory':
+        return (args: Record<string, unknown>) => queryProjectMemory(
+          projectRoot,
+          typeof args['question'] === 'string' ? args['question'] : '',
+          typeof args['qdrantUrl'] === 'string' ? args['qdrantUrl'] : qdrantUrl,
+          5,
+        );
+      case 'architecture_drift':
+        return (args: Record<string, unknown>) => architectureDriftAsync(
+          projectRoot,
+          typeof args['limit'] === 'number' ? args['limit'] : 5,
+        );
+      default:
+        return null;
+    }
+  });
 }
 
 export function createMcpServer(): McpServer {
@@ -3028,6 +3138,162 @@ export function createMcpServer(): McpServer {
       return { content: [{ type: 'text', text }] };
     }
   );
+
+  // --- trace_workflow (US-005 / P3b) ---
+  // Superpowered combo tool that traces a symbol's runtime path: 2-3 hop
+  // BFS expansion (expand_graph leaf), per-callee side-effect rendering
+  // (render_behavior leaf), a numbered level-order narrative, and a
+  // Mermaid sequenceDiagram block that round-trips through the grammar
+  // fixture in test/trace-workflow.test.ts. Reads the blackboard for
+  // prior facts (FR-4). Default sessionId: "trace-workflow:<sha1_8>".
+  server.registerTool(
+    'trace_workflow',
+    {
+      description: 'Trace a symbol runtime path: 2-3 hop graph expansion (inbound + outbound) plus a numbered level-order narrative and a Mermaid sequenceDiagram block. For each neighbor, side effects are loaded from the graph (the same source render_behavior reads). Reads the per-session blackboard for prior facts (FR-4 propagation). Default sessionId: "trace-workflow:<sha1_8>". Hops must be 2 or 3; any other value falls back to 2.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        symbol: z.string().describe('Exact symbol name to trace, for example "BookingService.create" or "AuthService.login".'),
+        hops: z.union([z.literal(2), z.literal(3)]).optional().describe('Number of hops for the BFS expansion (2 or 3, default 2).'),
+        writeToBlackboard: z.boolean().optional().describe('Persist the trace ToolResult to the per-session blackboard (default: true).'),
+        sessionId: z.string().optional().describe('Override the deterministic sessionId. Default: "trace-workflow:<sha1_8>".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, symbol, hops, writeToBlackboard, sessionId, qdrantUrl }) => {
+      const result = await traceWorkflowAsync({
+        projectRoot: path.resolve(projectRoot),
+        symbol,
+        hops,
+        writeToBlackboard,
+        sessionId,
+        qdrantUrl,
+      });
+      const text = JSON.stringify(result, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  // --- collaborate (US-005 / P3b) ---
+  // Goal-shaped entry point. Classifies a natural-language goal into one of
+  // 5 intents (audit, onboard, refactor, debug, release-prep) using a
+  // deterministic keyword+regex classifier (OQ-1: heuristic by default,
+  // Ollama opt-in only — v1 defers Ollama to v2). Executes the registered
+  // DAG against this server's own MCP tools, returns a synthesis + the
+  // execution record. Default sessionId: "collaborate:<sha1_12>".
+  server.registerTool(
+    'collaborate',
+    {
+      description: 'Classify a natural-language goal (heuristic by default, Ollama opt-in) and execute a deterministic tool DAG against the existing leaves. Recognized intents: audit <symbol>, onboard, refactor <area>, debug <symptom>, release-prep. Returns the classified intent, the DAG, per-step execution record, and a human synthesis. No LLM by default (FR-8 / DR-5 / OQ-1).',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        goal: z.string().describe('Natural-language goal, for example "audit BookingService.create" or "release-prep for v2.0".'),
+        hints: z.array(z.string()).optional().describe('Optional hints appended to a query_project step in the DAG (used for refactor intent).'),
+        llm: z.enum(['heuristic', 'ollama']).optional().describe('Classifier backend (default: heuristic). Ollama is deferred to v2 — opting in falls back to heuristic with a deferral signal.'),
+        writeToBlackboard: z.boolean().optional().describe('Persist the synthesis ToolResult to the per-session blackboard (default: true).'),
+        sessionId: z.string().optional().describe('Override the deterministic sessionId. Default: "collaborate:<sha1_12>".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, goal, hints, llm, writeToBlackboard, sessionId, qdrantUrl }) => {
+      // Build a tool registry that resolves leaf names to in-process
+      // bound functions. We use a minimal bridge that maps the leaves
+      // collaborate references. Calls go through the public leaf
+      // functions so the meta-tool's signals/reasoning stay coherent.
+      const root = path.resolve(projectRoot);
+      const registry = buildCollaborateToolRegistry(root, qdrantUrl ?? 'http://localhost:6333');
+      const result = await collaborateAsync({
+        projectRoot: root,
+        goal,
+        hints,
+        llm,
+        writeToBlackboard,
+        sessionId,
+        qdrantUrl,
+        toolRegistry: registry,
+      });
+      const text = JSON.stringify(result, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  // --- session_status (US-006 / P4) ---
+  // Read-only inspector for the per-session blackboard. Returns a summary
+  // of what the session has touched + the last entry. Refuses to mutate
+  // the scratchpad (FR-9). Used to verify that prior meta-tool calls
+  // actually landed.
+  server.registerTool(
+    'session_status',
+    {
+      description: 'Read-only inspector for a session: entry count, lastUpdated timestamp, distinct tool names used, and the top symbols touched. Refuses to mutate the scratchpad (FR-9). Use this as a sanity check after running meta-tools to confirm the blackboard captured the call.',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        sessionId: z.string().describe('Session identifier (must be non-empty). The same sessionId passed to wrapped tool calls.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, sessionId, qdrantUrl }) => {
+      const result = await sessionStatusAsync({
+        projectRoot: path.resolve(projectRoot),
+        sessionId,
+        qdrantUrl,
+      });
+      const text = JSON.stringify(result, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  // --- run_intent (US-006 / P4) ---
+  // Goal-shaped entry point that takes a registered intent name (audit,
+  // onboard, refactor, debug, release-prep) and runs the pre-declared DAG
+  // (FR-8). Useful for callers that already know the intent and want
+  // the meta-tool's structured execution without going through
+  // `collaborate`'s classifier. The DAG registry lives in
+  // `src/cognition/intents/registry.ts`; adding a new intent is a code
+  // change to that file.
+  server.registerTool(
+    'run_intent',
+    {
+      description: 'Run a pre-declared intent (audit, onboard, refactor, debug, release-prep) by name. Returns the DAG, per-step execution record, and a synthesis. Adding a new intent = code change to src/cognition/intents/registry.ts (FR-8).',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        intent: z.enum(['audit', 'onboard', 'refactor', 'debug', 'release-prep']).describe('Registered intent name. The set of registered intents is fixed; unknown names return a typed empty result.'),
+        overrides: z.record(z.string(), z.record(z.string(), z.unknown())).optional().describe('Per-step argument overrides. Keys are tool names; values merge into the DAG step args.'),
+        writeToBlackboard: z.boolean().optional().describe('Persist the synthesis to the per-session blackboard (default: true).'),
+        sessionId: z.string().optional().describe('Override the deterministic sessionId.'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, intent, overrides, writeToBlackboard, sessionId, qdrantUrl }) => {
+      const root = path.resolve(projectRoot);
+      const registry = buildCollaborateToolRegistry(root, qdrantUrl ?? 'http://localhost:6333');
+      const result = await runIntentAsync({
+        projectRoot: root,
+        intent,
+        overrides,
+        toolRegistry: registry,
+        writeToBlackboard,
+        sessionId,
+        qdrantUrl,
+      });
+      const text = JSON.stringify(result, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  // --- post-call recommend_next hook (US-006 / P4) ---
+  // FR-11 byte-equality: opt-in only via CODE_INTEL_RECOMMEND=1. When off,
+  // every existing leaf's output shape is byte-identical. When on, the
+  // hook wraps `server.registerTool` so that envelope-returning tools
+  // get a `data.recommended_next` field derived from the scratchpad
+  // co-occurrence history.
+  if (isRecommendEnabled()) {
+    const originalRegister = server.registerTool.bind(server);
+    server.registerTool = attachRecommendedNext(
+      originalRegister,
+      (toolName) => process.cwd(),
+    ) as typeof server.registerTool;
+    mcpLog('info', 'recommended_next hook enabled (CODE_INTEL_RECOMMEND=1)');
+  }
 
   return server;
 }
