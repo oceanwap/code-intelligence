@@ -17,6 +17,39 @@
  * Failure mode: unknown intent or unknown tool in DAG → returns a typed
  * empty result with a `collaborate.leaf_missing` signal. Never throws on
  * bad intent classification.
+ *
+ * =====================================================================
+ * F2 — per-step blackboard threading (Sprint 6b deferred finding)
+ * =====================================================================
+ *
+ * Per-step ToolResult evidence is threaded to the outer scratchpad via
+ * FLAT APPEND at the same sessionId used for the outer synthesis. Each
+ * successful step contributes one additional entry whose `reasoning`
+ * array carries the step's own reasoning facts (distinct from the
+ * outer synthesis's facts). On a subsequent call, `readScratchpad`
+ * iteration pulls ALL entries — outer synthesis + per-step — into the
+ * `priorFacts` accumulator that `inheritReasoning` consumes. So a
+ * second call inherits the first call's per-leaf evidence (audit_symbol
+ * facts, trace_workflow facts, …), not only its outer synthesis.
+ *
+ * The bridge in `mcp-server.ts:buildCollaborateToolRegistry` passes the
+ * outer `writeToBlackboard` flag through to each inner leaf call (it is
+ * NOT forced to `false`), so each leaf can write its own ToolResult to
+ * the outer sessionId. When `writeToBlackboard: false` is supplied at
+ * the outer call, neither outer nor per-step writes happen.
+ *
+ * =====================================================================
+ * F6 — DAG $ref dataflow (Sprint 6b deferred finding)
+ * =====================================================================
+ *
+ * Any value in a `ToolStep.args` may be a `RefExpression` instead of a
+ * literal. The runner calls `resolveArgs(args, priorSteps)` immediately
+ * before dispatch, which substitutes `$ref` against the prior step's
+ * `ToolResult` envelope and supports `$concat` for string composition.
+ *
+ * See `intents/registry.ts` for the `RefExpression` type and the path
+ * syntax contract. `resolveArgs` is a pure function exported for test
+ * reuse.
  */
 
 import * as path from 'node:path';
@@ -48,10 +81,204 @@ export type IntentName =
 /** One step in a tool DAG. `name` resolves via the supplied `ToolRegistry`. */
 export interface ToolStep {
   name: string;
-  /** Static arguments to pass to the tool. Mutable per-execution if needed. */
+  /** Static arguments to pass to the tool. Mutable per-execution if needed.
+   *
+   *  F6: any value in `args` may be a `RefExpression` (see
+   *  `intents/registry.ts`) — the runner resolves these against the
+   *  immediately prior step's ToolResult before dispatch. Literal-only
+   *  args round-trip byte-equal through the resolver. */
   args: Record<string, unknown>;
   /** Human description of why this step is in the DAG. */
   rationale: string;
+}
+
+// ---------------------------------------------------------------------------
+// F6 — RefExpression resolution (Sprint 6b deferred finding)
+// ---------------------------------------------------------------------------
+
+/** Typed error thrown by `resolveArgs` when a `$ref` cannot be resolved.
+ *
+ *  Carries the unresolvable `path` so callers (and tests) can surface a
+ *  precise diagnostic. The executor's step loop catches this and turns
+ *  it into a `collaborate.arg_resolution_error` signal + an `ok: false`
+ *  executed-step record — never throws past the boundary. */
+export class CollaborateArgResolutionError extends Error {
+  readonly path: string;
+  readonly stepName?: string;
+  constructor(path: string, message: string, stepName?: string) {
+    super(message);
+    this.name = 'CollaborateArgResolutionError';
+    this.path = path;
+    this.stepName = stepName;
+  }
+}
+
+/** A captured `ToolResult` from a prior DAG step, used as the resolution
+ *  source for `$ref` expressions. The runner fills this from the value
+ *  returned by `toolRegistry.call(step.name, …)`.
+ *
+ *  Only the fields actually walked by `resolveArgs` are typed here; the
+ *  resolver is shape-tolerant via field-name lookups (e.g. `data`,
+ *  `signals`, `reasoning`, `confidence_tier`). */
+export interface ResolvedPriorStep {
+  data?: unknown;
+  signals?: ReadonlyArray<{ kind?: string; payload?: unknown }>;
+  reasoning?: ReadonlyArray<{ fact?: string; source?: string }>;
+  confidence_tier?: string;
+}
+
+/** Sentinel returned by the resolver when a `$ref` path walks into a
+ *  non-traversable intermediate value (e.g. `null` deeper than the
+ *  requested path). Tests assert that null/missing values pass through
+ *  without throwing. */
+const UNRESOLVED = Symbol('UNRESOLVED');
+
+/** Walk a `prev.<keyPath>` expression against the immediately prior step.
+ *
+ *  Path syntax (PRD F6 brief):
+ *    prev.data.<key>.<key>...     — dot-walks `data`
+ *    prev.signals[<n>].<key>      — array index + dot-walk into a signal
+ *    prev.reasoning[<n>].<key>    — same for the reasoning chain
+ *    prev.confidence_tier         — the envelope's tier string
+ *
+ *  Returns `UNRESOLVED` if any segment is missing or non-traversable.
+ *  The caller (`resolveArgs`) maps `UNRESOLVED` to a
+ *  `CollaborateArgResolutionError` only when the missing value is
+ *  actually requested as a final answer; for nullable values the result
+ *  is `null`/`undefined` and the resolver does not throw. */
+function walkRefPath(path: string, prior: ResolvedPriorStep): unknown {
+  if (!path.startsWith('prev.')) {
+    throw new CollaborateArgResolutionError(path, `ref path must start with "prev." (got "${path}")`);
+  }
+  const segments = path.slice('prev.'.length).split('.');
+  let cursor: unknown = prior;
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i] ?? '';
+    if (cursor == null) return UNRESOLVED;
+    if (Array.isArray(cursor)) {
+      const idx = Number.parseInt(seg, 10);
+      if (!Number.isFinite(idx) || idx < 0 || idx >= cursor.length) return UNRESOLVED;
+      cursor = cursor[idx];
+      continue;
+    }
+    if (typeof cursor !== 'object') return UNRESOLVED;
+    const obj = cursor as Record<string, unknown>;
+    if (!(seg in obj)) return UNRESOLVED;
+    cursor = obj[seg];
+  }
+  return cursor === undefined ? UNRESOLVED : cursor;
+}
+
+/** Resolve a single `RefExpression` against `prior`. Returns
+ *  `UNRESOLVED` for `$ref` whose path cannot be walked; the caller
+ *  decides whether that should throw. `$const` returns its value
+ *  unchanged. `$concat` joins all segments via `String(seg)`. */
+function resolveExpression(expr: unknown, prior: ResolvedPriorStep | undefined, exprPath: string): unknown {
+  if (expr == null || typeof expr !== 'object') return expr;
+  const obj = expr as Record<string, unknown>;
+  if (typeof obj['$ref'] === 'string') {
+    if (!prior) {
+      throw new CollaborateArgResolutionError(obj['$ref'], `no prior step available to resolve ${obj['$ref']}`, exprPath);
+    }
+    const v = walkRefPath(obj['$ref'], prior);
+    if (v === UNRESOLVED) {
+      throw new CollaborateArgResolutionError(
+        obj['$ref'],
+        `cannot resolve ${obj['$ref']} against prior step (path missing or non-traversable)`,
+        exprPath,
+      );
+    }
+    return v;
+  }
+  if (Array.isArray(obj['$concat'])) {
+    const parts: unknown[] = obj['$concat'];
+    let out = '';
+    for (const p of parts) {
+      const resolved = resolveExpression(p, prior, exprPath);
+      out += resolved == null ? '' : String(resolved);
+    }
+    return out;
+  }
+  if ('$const' in obj) return obj['$const'];
+  // Not a RefExpression — return as-is so nested recursion works.
+  return expr;
+}
+
+/** Decide whether a plain-object value is a `RefExpression`. Mirrors
+ *  `isRefExpression` in `intents/registry.ts`; kept local so the
+ *  resolver can be unit-tested without re-importing the registry. */
+function isRefExpressionLocal(value: unknown): boolean {
+  if (value == null || typeof value !== 'object') return false;
+  const obj = value as Record<string, unknown>;
+  return typeof obj['$ref'] === 'string'
+    || Array.isArray(obj['$concat'])
+    || '$const' in obj;
+}
+
+/** Resolve every `RefExpression` in `args` against the immediately prior
+ *  step's `ToolResult` envelope. Walks nested objects and arrays
+ *  recursively; non-expression values are returned byte-equal.
+ *
+ *  Contract:
+ *    - Literal-only args round-trip unchanged.
+ *    - `$ref` resolves against `priorSteps[priorSteps.length - 1]`
+ *      (the IMMEDIATELY PRIOR step). Earlier steps are NOT directly
+ *      addressable; thread state forward through intermediate steps.
+ *    - Unresolvable `$ref` throws `CollaborateArgResolutionError` with
+ *      the failing path in `.path`.
+ *    - `$concat` joins all segments (refs + literals) into a string.
+ *    - `$const` returns its inner value verbatim.
+ *
+ *  This function is pure; the caller is responsible for mutating a copy
+ *  if it wants to retain the original `args` shape. */
+export function resolveArgs(
+  args: Record<string, unknown>,
+  priorSteps: ReadonlyArray<ResolvedPriorStep>,
+): Record<string, unknown> {
+  const prior = priorSteps.length > 0 ? priorSteps[priorSteps.length - 1] : undefined;
+  return resolveArgsInternal(args, prior, '<root>') as Record<string, unknown>;
+}
+
+function resolveArgsInternal(value: unknown, prior: ResolvedPriorStep | undefined, exprPath: string): unknown {
+  if (isRefExpressionLocal(value)) {
+    return resolveExpression(value, prior, exprPath);
+  }
+  if (Array.isArray(value)) {
+    return value.map((v, i) => resolveArgsInternal(v, prior, `${exprPath}[${i}]`));
+  }
+  if (value != null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = resolveArgsInternal(v, prior, `${exprPath}.${k}`);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Coerce a `toolRegistry.call` return value into the
+ *  `ResolvedPriorStep` shape that `resolveArgs` walks. The bridge may
+ *  return either a `ToolResult<T>` envelope (preferred — supplies
+ *  `data`, `signals`, `reasoning`, `confidence_tier`) or a bare
+ *  `data` payload (legacy: the value the leaf would natively return).
+ *  Bare payloads are wrapped so the next step's `$ref: prev.data.<x>`
+ *  still resolves against them. */
+export function asResolvedPrior(result: unknown): ResolvedPriorStep {
+  if (result == null || typeof result !== 'object') {
+    return { data: result };
+  }
+  const r = result as Record<string, unknown>;
+  const isEnvelope = 'data' in r || 'signals' in r || 'reasoning' in r || 'confidence_tier' in r;
+  if (isEnvelope) {
+    return {
+      data: r['data'],
+      signals: Array.isArray(r['signals']) ? (r['signals'] as ResolvedPriorStep['signals']) : [],
+      reasoning: Array.isArray(r['reasoning']) ? (r['reasoning'] as ResolvedPriorStep['reasoning']) : [],
+      confidence_tier: typeof r['confidence_tier'] === 'string' ? r['confidence_tier'] : undefined,
+    };
+  }
+  // Bare data payload: wrap so `prev.data.<x>` walks against it.
+  return { data: result };
 }
 
 /** Description of a registered intent. */
@@ -533,7 +760,25 @@ export async function collaborateAsync(
   }
 
   // Execute DAG in order.
+  //
+  // F6: each step's args may contain RefExpression placeholders that
+  // resolve against the IMMEDIATELY PRIOR step's ToolResult envelope.
+  // `priorResults` collects each step's resolved envelope as the loop
+  // progresses; the resolver sees `priorResults[priorResults.length-1]`.
+  //
+  // F2: when `writeToBlackboard` is true, each successful step
+  // contributes ONE additional scratchpad entry at the OUTER sessionId,
+  // carrying the step's own `reasoning` facts (and a small `data`
+  // payload identifying the step). Subsequent `readScratchpad`
+  // iteration pulls these entries — together with the outer synthesis
+  // entry — into `priorFacts`, so `inheritReasoning` on the NEXT call
+  // sees per-leaf evidence (audit_symbol, trace_workflow, …), not only
+  // the previous outer synthesis. The bridge in
+  // `mcp-server.ts:buildCollaborateToolRegistry` passes
+  // `writeToBlackboard` through to each inner leaf call so the inner
+  // leaf's OWN blackboard write is also allowed.
   const executed: CollaborateExecutedStep[] = [];
+  const priorResults: ResolvedPriorStep[] = [];
   for (const step of dag) {
     const stepFacts: ReasoningFact[] = [];
     pushReasoning(stepFacts, { fact: `${step.name} (${step.rationale})`, source: 'collaborate.dag' });
@@ -550,30 +795,105 @@ export async function collaborateAsync(
       });
       continue;
     }
+
+    // F6: resolve $ref / $concat / $const in step.args against the prior
+    // step's ToolResult. On unresolvable path, capture a typed error
+    // signal + ok=false step instead of throwing past the executor
+    // boundary.
+    let resolvedArgs: Record<string, unknown>;
     try {
-      const result = await toolRegistry.call(step.name, { ...step.args, projectRoot });
+      resolvedArgs = resolveArgs(step.args, priorResults);
+    } catch (err) {
+      if (err instanceof CollaborateArgResolutionError) {
+        const message = `arg resolution failed at ${err.path}: ${err.message}`;
+        pushReasoning(stepFacts, { fact: message, source: 'collaborate.dag' });
+        signals.push({
+          kind: 'collaborate.arg_resolution_error',
+          payload: { tool: step.name, path: err.path, message: err.message },
+        });
+        executed.push({
+          name: step.name,
+          args: step.args,
+          rationale: step.rationale,
+          ok: false,
+          summary: `arg resolution error: ${err.path}`,
+          reasoning: stepFacts,
+        });
+        continue;
+      }
+      throw err;
+    }
+
+    try {
+      const result = await toolRegistry.call(step.name, { ...resolvedArgs, projectRoot });
       const summary = summarizeResult(result);
       pushReasoning(stepFacts, { fact: `${step.name} returned ${summary}`, source: step.name });
+
+      // F6 — capture the step's ToolResult-shaped envelope so the NEXT
+      // step's $ref can resolve against it. The bridge returns either
+      // a `ToolResult<T>` (envelope) or a bare `data` payload; both
+      // shapes are accepted.
+      const envelope = asResolvedPrior(result);
+      priorResults.push(envelope);
+
+      // F2 — extract the step's own reasoning facts (if any) for both
+      // the global chain and the per-step blackboard entry. When the
+      // inner leaf did not return a ToolResult envelope (legacy bare
+      // `data` payload), the step's facts are just the executor's
+      // local stepFacts — better than nothing.
+      const perStepReasoning: ReasoningFact[] = envelope.reasoning && envelope.reasoning.length > 0
+        ? envelope.reasoning.map((r) => ({ fact: r.fact ?? '', source: r.source ?? step.name }))
+            .filter((r) => r.fact.length > 0)
+        : stepFacts;
+
       executed.push({
         name: step.name,
-        args: step.args,
+        args: resolvedArgs,
         rationale: step.rationale,
         ok: true,
         summary,
         reasoning: stepFacts,
       });
+
+      // F2 — append per-step evidence to the outer scratchpad. Distinct
+      // from the outer-synthesis entry written after the loop: each step
+      // gets its own line so subsequent inheritReasoning sees per-leaf
+      // facts (not only the outer synthesis). `data` is a small
+      // identifier so the entry is self-describing without bloating the
+      // log; the per-step reasoning array is the substantive payload.
+      if (writeToBlackboard) {
+        await appendScratchpad(sessionId, {
+          ts: new Date().toISOString(),
+          tool: step.name,
+          data: {
+            kind: 'collaborate.step',
+            step: step.name,
+            args: resolvedArgs,
+            summary,
+          },
+          reasoning: perStepReasoning.map((f) => f.fact),
+          confidence_tier: envelope.confidence_tier ?? 'EXTRACTED',
+          sessionId,
+        }, { projectRoot });
+      }
     } catch (error) {
       const message = (error as Error).message;
       pushReasoning(stepFacts, { fact: `${step.name} threw: ${message}`, source: step.name });
       signals.push({ kind: 'collaborate.tool_error', payload: { tool: step.name, message } });
       executed.push({
         name: step.name,
-        args: step.args,
+        args: resolvedArgs,
         rationale: step.rationale,
         ok: false,
         summary: `error: ${message}`,
         reasoning: stepFacts,
       });
+      // A failed step still occupies a slot in priorResults so the next
+      // step's $ref (if any) can resolve against its (empty) envelope
+      // rather than the EARLIER step's data, which would be a hidden
+      // off-by-one. The empty envelope will throw a clean
+      // CollaborateArgResolutionError on the next iteration.
+      priorResults.push({});
     }
     // Concatenate per-step facts into the global chain.
     for (const f of stepFacts) pushReasoning(reasoning, f);

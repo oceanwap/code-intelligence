@@ -95,7 +95,24 @@ function makeFakeRegistry(opts: {
       if (opts.throwsOn?.has(name)) {
         throw new Error(`fake:${name}: thrown for test`);
       }
-      return { name, args, ok: true, summary: `result-of-${name}` };
+      // F6 (Sprint 6b): return a ToolResult-shaped envelope so downstream
+      // `$ref` resolution can walk `data.*` against the prior step's
+      // payload. Previously this returned a bare `{ name, args, ok, summary }`
+      // object, which `asResolvedPrior` wrapped as `{ data: <bare> }`
+      // and the `$ref` resolver failed on `prev.data.topIntervention.symbol`.
+      return {
+        data: {
+          symbol: 'Foo.bar',
+          topIntervention: { symbol: 'Bar.baz', blast_radius: 0.4 },
+          symbols: ['Bar.baz'],
+          ok: true,
+          summary: `result-of-${name}`,
+        },
+        reasoning: [{ fact: `${name} ran`, source: name }],
+        signals: [],
+        sources: [],
+        confidence_tier: 'EXTRACTED',
+      };
     },
   };
 }
@@ -364,8 +381,16 @@ test('runIntentAsync: writeToBlackboard=true appends to per-session scratchpad',
     writeToBlackboard: true,
   });
   const entries = await readScratchpad(sessionId, { projectRoot: root });
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0]?.tool, 'run_intent');
+  // F2 (Sprint 6b): per-step ToolResult evidence is appended alongside
+  // the outer synthesis entry. Audit intent has 2 steps
+  // (audit_symbol + trace_workflow), so we expect 1 outer + 2 per-step = 3.
+  assert.equal(entries.length, 3);
+  // The LAST entry is the outer synthesis (per F2 convention: per-step
+  // entries are appended at execution time, outer synthesis written last
+  // after the loop). First entry is the first step.
+  assert.equal(entries[0]?.tool, 'audit_symbol');
+  assert.equal(entries[1]?.tool, 'trace_workflow');
+  assert.equal(entries[2]?.tool, 'run_intent');
 });
 
 test('runIntentAsync: writeToBlackboard=false does NOT write', async (t) => {

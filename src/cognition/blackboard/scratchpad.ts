@@ -12,31 +12,62 @@
  *   - No in-process cache. Reads always re-open the file.
  *   - `clearScratchpad` removes the file. Idempotent — no error if absent.
  *
- * Concurrency (Q2 fix): POSIX guarantees that `write(2)` is atomic only
- * for buffers <= `PIPE_BUF` (1024 B on macOS, 4096 B on Linux). Larger
- * writes may be split by the kernel and interleaved byte-for-byte with
- * concurrent writers, even on `O_APPEND` file descriptors. `readScratchpad`
- * silently drops malformed lines (`JSON.parse` per line, catch + skip),
- * which means two parallel agents appending large payloads (e.g. code
- * vectors, audit_symbol payloads) to the same sessionId would lose
- * entries without any error surfaced.
+ * Concurrency — TWO LAYERS:
  *
- * The fix is a per-sessionId in-process mutex: every `appendScratchpad`
- * call chains onto the previous tail promise for that sessionId, so
- * concurrent calls on the same sessionId execute strictly sequentially.
- * Different sessionIds do not contend. Single-node deterministic.
+ *   1. In-process mutex (Q2 fix, commit 4b273f7): every `appendScratchpad`
+ *      call chains onto the previous tail promise for that sessionId, so
+ *      concurrent calls on the same sessionId within one process execute
+ *      strictly sequentially. Different sessionIds do not contend.
+ *      Rationale: POSIX `write(2)` is atomic only for buffers <= PIPE_BUF
+ *      (1024 B macOS, 4096 B Linux). Larger writes can interleave
+ *      byte-for-byte across overlapping async calls even on `O_APPEND`
+ *      descriptors; the chain keeps the open→write→fsync→close sequence
+ *      atomic per sessionId within one process.
  *
- * Scope limitation: this mutex only covers callers within a single
- * process. Cross-process races (VS Code multi-window, HTTP transport mode)
- * are out of scope — those need OS-level advisory locking, which is a
- * separate design pass (see F2 in the Sprint-5 hardening brief).
+ *   2. Cross-process advisory lock (Sprint 6a F3 fix): the in-process
+ *      mutex does NOT cover multi-process races (VS Code multi-window,
+ *      HTTP transport mode, `spawn('bun cli')` + MCP server over stdio
+ *      sharing the same `<sessionId>.json`). Layer (1) is bypassed when
+ *      the two writers are in different processes. We wrap the per-call
+ *      doAppend in a `proper-lockfile` flock keyed on the sibling
+ *      `<sessionId>.lock` file. `proper-lockfile` (MIT, ~3 KB, no native
+ *      bindings) provides exponential-backoff retries with a hard
+ *      stale-timeout (default 10s). The advisory lock sits INSIDE the
+ *      in-process chain so single-process callers still get the fast
+ *      zero-fsync-contention path; the cross-process layer is what
+ *      serializes across process boundaries.
  *
- * This is intentionally minimal: no locking, no rotation, no indexing. The
- * scratchpad is per-session, single-writer; locking is the caller's job.
+ * Lock acquisition contract (CRITICAL):
+ *   - `sanitizeSessionId(sessionId)` is called EAGERLY before either
+ *     layer is acquired. A rejected sessionId throws synchronously with
+ *     `SecurityError` — no I/O happens, no lock is taken. This preserves
+ *     the F1 security contract from Sprint 5 hardening (the eager-sync
+ *     rule that lets `appendScratchpad('../escape', ...)` reject without
+ *     ever opening a file).
+ *   - Lock acquisition runs INSIDE the in-process chain, so the chain
+ *     tail waits for both the previous in-process call AND any prior
+ *     cross-process holder before opening the file.
+ *   - Lock files are pre-touched (idempotent `O_CREAT`) before
+ *     `lockfile.lock` so `lockfile.unlock` can `lstat` the target on
+ *     release. Without the pre-touch, `unlock` ENOENTs on a fresh
+ *     scratchpad. The touch is a single fsync-less write, costs ~one
+ *     syscall.
+ *
+ * readScratchpad does NOT take a lock: POSIX `read(2)` is safe alongside
+ * `O_APPEND` writers for any single entry <= PIPE_BUF, and our existing
+ * line-skip malformed handling (see `safeScratchpadReviver`) covers any
+ * oversize entries that happen to interleave. Locking reads would add a
+ * cross-process synchronization point on every read with no correctness
+ * benefit.
+ *
+ * This is intentionally minimal: no rotation, no indexing. The scratchpad
+ * is per-session, single-writer-per-session across processes; locking is
+ * the append path's job.
  */
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import lockfile from 'proper-lockfile';
 import { getDataDir } from '../../git.js';
 import { SecurityError } from '../../utils/security.js';
 
@@ -161,7 +192,15 @@ export async function readScratchpad(sessionId: string, opts?: ScratchpadOptions
  * across processes, and even within a single process two overlapping
  * `await fs.open(...)` + `await fh.write(...)` calls would race the
  * kernel buffer. The mutex makes the open→write→fsync→close sequence
- * strictly sequential per sessionId.
+ * strictly sequential per sessionId within one process.
+ *
+ * FIX F3 (Sprint 6a review-wave): wrap the chain tail in a cross-process
+ * advisory file lock keyed on a `<sessionId>.lock` sibling file. The
+ * in-process mutex above does NOT cover multi-process races (VS Code
+ * multi-window, HTTP transport, `spawn('bun cli')` + MCP server over
+ * stdio sharing the same sessionId). The advisory lock sits INSIDE the
+ * chain so single-process callers still get fast sequential execution;
+ * the cross-process layer serializes across process boundaries.
  */
 export async function appendScratchpad(sessionId: string, entry: ScratchpadEntry, opts?: ScratchpadOptions): Promise<void> {
   // Per-sessionId serialization. See module header for the rationale.
@@ -172,11 +211,13 @@ export async function appendScratchpad(sessionId: string, entry: ScratchpadEntry
   // Sanitize eagerly so a SecurityError throws synchronously, matching the
   // pre-mutex contract. (Sanitization is pure; calling it here is safe and
   // matches the test that expects `appendScratchpad('../escape', ...)` to
-  // reject with SecurityError without ever opening a file.)
+  // reject with SecurityError without ever opening a file.) The lock is
+  // acquired LATER, inside the chain — so a rejected sessionId never
+  // touches the filesystem or takes a lock.
   sanitizeSessionId(sessionId);
 
   const previous = appendMutex.get(sessionId) ?? Promise.resolve();
-  const next = previous.then(() => doAppend(sessionId, entry, opts));
+  const next = previous.then(() => doAppendWithLock(sessionId, entry, opts));
   appendMutex.set(sessionId, next);
   // Best-effort cleanup: once this append settles, if no later caller has
   // replaced us in the map, drop the entry so the map doesn't grow
@@ -196,6 +237,36 @@ export async function appendScratchpad(sessionId: string, entry: ScratchpadEntry
 function cleanupMutexEntry(sessionId: string, tail: Promise<unknown>): void {
   if (appendMutex.get(sessionId) === tail) {
     appendMutex.delete(sessionId);
+  }
+}
+
+/**
+ * Cross-process advisory lock wrapper around `doAppend`.
+ *
+ * `proper-lockfile` uses `mkdir` as the atomic lock primitive — the
+ * sibling `<file>.lock` path is created as a DIRECTORY, not a regular
+ * file. We do NOT pre-touch it: pre-touching as a regular file would
+ * cause `mkdir` to fail with EEXIST and proper-lockfile would report
+ * "Lock file is already being held" on the very first call. The lock
+ * directory is created on lock acquire and removed on release.
+ *
+ * Acquires the lock with exponential-backoff retries (~5 s total) and
+ * a 10 s stale timeout (force-take on a crashed holder). `realpath:
+ * false` lets us lock before the scratchpad file exists (the first
+ * append creates the file inside `doAppend` via `fs.open(file, 'a')`).
+ */
+async function doAppendWithLock(sessionId: string, entry: ScratchpadEntry, opts?: ScratchpadOptions): Promise<void> {
+  const file = scratchpadPath(sessionId, opts);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const release = await lockfile.lock(file, {
+    realpath: false,
+    stale: 10_000,
+    retries: { retries: 50, factor: 1.2, minTimeout: 10, maxTimeout: 100 },
+  });
+  try {
+    await doAppend(sessionId, entry, opts);
+  } finally {
+    await release();
   }
 }
 

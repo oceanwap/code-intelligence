@@ -35,6 +35,10 @@ import {
   type ToolStep,
   type ToolRegistry,
   type CollaborateExecutedStep,
+  resolveArgs,
+  CollaborateArgResolutionError,
+  asResolvedPrior,
+  type ResolvedPriorStep,
 } from '../audit/collaborate.js';
 import { getIntent, hasIntent, type RegisteredIntentName } from './registry.js';
 
@@ -128,6 +132,10 @@ export async function runIntentAsync(
 
   // Execute DAG.
   const executed: CollaborateExecutedStep[] = [];
+  // F6 — collect prior step ToolResult envelopes for $ref resolution.
+  // F2 — at the same time, per-step evidence flows to the same
+  // sessionId via appendScratchpad, mirroring collaborate.ts.
+  const priorResults: ResolvedPriorStep[] = [];
   for (const step of dag) {
     const stepFacts: ReasoningFact[] = [];
     pushReasoning(stepFacts, { fact: `${step.name} (${step.rationale})`, source: 'run_intent.dag' });
@@ -144,30 +152,89 @@ export async function runIntentAsync(
       });
       continue;
     }
+
+    // F6: resolve $ref / $concat / $const in step.args against the
+    // immediately prior step's ToolResult envelope.
+    let resolvedArgs: Record<string, unknown>;
     try {
-      const result = await input.toolRegistry.call(step.name, { ...step.args, projectRoot });
+      resolvedArgs = resolveArgs(step.args, priorResults);
+    } catch (err) {
+      if (err instanceof CollaborateArgResolutionError) {
+        const message = `arg resolution failed at ${err.path}: ${err.message}`;
+        pushReasoning(stepFacts, { fact: message, source: 'run_intent.dag' });
+        signals.push({
+          kind: 'intents.arg_resolution_error',
+          payload: { tool: step.name, path: err.path, message: err.message },
+        });
+        executed.push({
+          name: step.name,
+          args: step.args,
+          rationale: step.rationale,
+          ok: false,
+          summary: `arg resolution error: ${err.path}`,
+          reasoning: stepFacts,
+        });
+        continue;
+      }
+      throw err;
+    }
+
+    try {
+      const result = await input.toolRegistry.call(step.name, { ...resolvedArgs, projectRoot });
       const summary = summarizeLeafResult(result);
       pushReasoning(stepFacts, { fact: `${step.name} returned ${summary}`, source: step.name });
+
+      // F6 — capture envelope for next step's $ref resolution.
+      const envelope = asResolvedPrior(result);
+      priorResults.push(envelope);
+
+      // F2 — per-step reasoning (from the leaf's ToolResult if any,
+      // else the executor's local stepFacts) feeds the outer scratchpad.
+      const perStepReasoning: ReasoningFact[] = envelope.reasoning && envelope.reasoning.length > 0
+        ? envelope.reasoning.map((r) => ({ fact: r.fact ?? '', source: r.source ?? step.name }))
+            .filter((r) => r.fact.length > 0)
+        : stepFacts;
+
       executed.push({
         name: step.name,
-        args: step.args,
+        args: resolvedArgs,
         rationale: step.rationale,
         ok: true,
         summary,
         reasoning: stepFacts,
       });
+
+      if (writeToBlackboard) {
+        await appendScratchpad(sessionId, {
+          ts: new Date().toISOString(),
+          tool: step.name,
+          data: {
+            kind: 'run_intent.step',
+            step: step.name,
+            intent: input.intent,
+            args: resolvedArgs,
+            summary,
+          },
+          reasoning: perStepReasoning.map((f) => f.fact),
+          confidence_tier: envelope.confidence_tier ?? 'EXTRACTED',
+          sessionId,
+        }, { projectRoot });
+      }
     } catch (error) {
       const message = (error as Error).message;
       pushReasoning(stepFacts, { fact: `${step.name} threw: ${message}`, source: step.name });
       signals.push({ kind: 'intents.tool_error', payload: { tool: step.name, message } });
       executed.push({
         name: step.name,
-        args: step.args,
+        args: resolvedArgs,
         rationale: step.rationale,
         ok: false,
         summary: `error: ${message}`,
         reasoning: stepFacts,
       });
+      // A failed step still occupies a slot in priorResults so the next
+      // step's $ref (if any) resolves against its (empty) envelope.
+      priorResults.push({});
     }
     for (const f of stepFacts) pushReasoning(reasoning, f);
   }

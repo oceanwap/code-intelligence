@@ -145,11 +145,21 @@ export async function planRefactorAsync(input: PlanRefactorInput): Promise<ToolR
   }
   const maxima = graph ? computeGraphMaxima(graph, null) : null;
 
+  // 3b. Load the semantic-duplicates snapshot ONCE for the whole diff.
+  // FIX F7: previously this load happened inside `readDuplicatesForFile`
+  // which runs inside `scoreSymbol` inside a per-symbol Promise.all —
+  // so a 10-symbol diff triggered up to 10 full Qdrant scans on a
+  // fresh project. We hoist it next to the graph/maxima hoist above
+  // (see lines above) and pass the resolved snapshot into scoreSymbol.
+  const duplicatesSnapshot = await loadSemanticDuplicates(root)
+    .catch(() => null)
+    .then(async (snap) => snap ?? await refreshSemanticDuplicatesAsync(root, { withEnrichment: true }).catch(() => null));
+
   // 4. For each changed symbol, run regression_risk + render_behavior +
   //    semantic_duplicates (against the file). These can be parallel per
   //    symbol.
   const perSymbolScores = await Promise.all(top.map(async (sym) => {
-    return scoreSymbol(sym, root, graph, maxima, qdrantUrl, signals, reasoning);
+    return scoreSymbol(sym, root, graph, maxima, duplicatesSnapshot, qdrantUrl, signals, reasoning);
   }));
 
   // 5. Architecture drift — called once globally.
@@ -188,6 +198,7 @@ async function scoreSymbol(
   root: string,
   graph: Awaited<ReturnType<typeof loadGraphAsync>>,
   maxima: ReturnType<typeof computeGraphMaxima> | null,
+  duplicatesSnapshot: Awaited<ReturnType<typeof loadSemanticDuplicates>>,
   qdrantUrl: string,
   signals: Signal[],
   reasoning: ReasoningFact[],
@@ -221,8 +232,9 @@ async function scoreSymbol(
     why.push('blast_radius=0 (graph not indexed)');
   }
 
-  // semantic_duplicates on the touched file
-  const dups = await readDuplicatesForFile(root, sym.file, signals);
+  // semantic_duplicates on the touched file — uses the pre-loaded snapshot
+  // hoisted once above the per-symbol loop (FIX F7).
+  const dups = await readDuplicatesForFile(duplicatesSnapshot, sym.file, signals);
   if (dups > 0) {
     why.push(`${dups} duplicate pattern(s) on ${sym.file}`);
   }
@@ -265,12 +277,11 @@ async function scoreSymbol(
 }
 
 async function readDuplicatesForFile(
-  root: string,
+  snapshot: Awaited<ReturnType<typeof loadSemanticDuplicates>>,
   file: string,
   signals: Signal[],
 ): Promise<number> {
   try {
-    const snapshot = (await loadSemanticDuplicates(root)) ?? await refreshSemanticDuplicatesAsync(root, { withEnrichment: true });
     if (!snapshot) return 0;
     // Pass an empty context — findDuplicatesForTarget filters by target string
     // and a missing context just leaves patterns un-scored (still filtered).

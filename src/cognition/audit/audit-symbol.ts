@@ -297,7 +297,17 @@ async function readRegressionAsync(
   try {
     const report = await regressionRiskAsync(root, symbol);
     reasoning.push({ fact: `regression_risk: ${symbol} score=${report.score.toFixed(3)} level=${report.level}`, source: 'regression_risk' });
-    void qdrantUrl; // regressionRiskAsync reads from .code-intelligence, no qdrant needed
+    // FIX F9 (Sprint 6a review-wave): `qdrantUrl` is accepted for parity
+    // with sibling leaves (risk_hotspots, query_project_memory,
+    // semantic_duplicates all thread qdrantUrl through). `regressionRiskAsync`
+    // intentionally does NOT take qdrantUrl — it reads only the local
+    // `.code-intelligence/memory.json` snapshot. Passing qdrantUrl here
+    // would silently drop it; the parameter is intentionally unused.
+    // The `audit_symbol` tool description documents this contract so
+    // users are not surprised when two calls with different qdrantUrl
+    // values produce identical regression_risk output. See the
+    // regression test `audit-symbol-f9-qdranturl-contract.test.ts`.
+    void qdrantUrl;
     return report;
   } catch (error) {
     signals.push({ kind: 'audit_symbol.leaf_error', payload: { leaf: 'regression_risk', message: (error as Error).message } });

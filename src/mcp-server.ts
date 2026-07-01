@@ -613,16 +613,27 @@ function wrapLeaf<T>(
  * returns a plain `data` value (not a ToolResult); the collaborate
  * runner wraps it in its own envelope.
  *
+ * F2 (Sprint 6b deferred finding): the bridge passes `writeToBlackboard`
+ * THROUGH to the inner leaf calls instead of forcing it to `false`.
+ * This lets each per-step leaf (audit_symbol, plan_refactor, …) write
+ * its own ToolResult evidence to the OUTER scratchpad sessionId, so
+ * subsequent `collaborate` calls inherit per-leaf facts (not only the
+ * outer synthesis). The outer `collaborate` call also writes its own
+ * envelope to the same sessionId; the two writes coexist by
+ * sessionId. The runner's append loop in `collaborate.ts` decides per
+ * step whether to write (via `writeToBlackboard`); this bridge just
+ * removes the `false`-override so the leaf's own write flag is honored.
+ *
  * Unknown names resolve to `null` (registry reports them as missing).
  */
-function buildCollaborateToolRegistry(projectRoot: string, qdrantUrl: string) {
+function buildCollaborateToolRegistry(projectRoot: string, qdrantUrl: string, writeToBlackboard: boolean = false) {
   return buildDefaultToolRegistry((name) => {
     switch (name) {
       case 'audit_symbol':
         return (args: Record<string, unknown>) => auditSymbolAsync(
           projectRoot,
           typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown',
-          { qdrantUrl, writeToBlackboard: false },
+          { qdrantUrl, writeToBlackboard },
         );
       case 'plan_refactor':
         return (args: Record<string, unknown>) => planRefactorAsync({
@@ -630,7 +641,7 @@ function buildCollaborateToolRegistry(projectRoot: string, qdrantUrl: string) {
           baseRef: typeof args['baseRef'] === 'string' ? args['baseRef'] : 'main',
           headRef: typeof args['headRef'] === 'string' ? args['headRef'] : 'HEAD',
           qdrantUrl,
-          writeToBlackboard: false,
+          writeToBlackboard,
         });
       case 'trace_workflow':
         return (args: Record<string, unknown>) => traceWorkflowAsync({
@@ -638,7 +649,7 @@ function buildCollaborateToolRegistry(projectRoot: string, qdrantUrl: string) {
           symbol: typeof args['symbol'] === 'string' ? args['symbol'] : 'unknown',
           hops: args['hops'] === 3 ? 3 : 2,
           qdrantUrl,
-          writeToBlackboard: false,
+          writeToBlackboard,
         });
       case 'render_behavior':
         // The leaf is the registered render_behavior tool, but for the
@@ -3147,10 +3158,18 @@ export function createMcpServer(): McpServer {
   // single ToolResult<AuditSymbolPayload>. Returns a ToolResult JSON shape
   // (FR-1); defaults writeToBlackboard=true per PRD OQ-5; deterministic
   // sessionId `audit:<sha1_8>` when none is supplied.
+  //
+  // FIX F9 (Sprint 6a review-wave): the `qdrantUrl` parameter is forwarded
+  // to every leaf EXCEPT regression_risk. `regression_risk` reads only
+  // the local `.code-intelligence/memory.json` snapshot (no Qdrant) — the
+  // parameter is accepted for parity with sibling leaves but is intentionally
+  // unused on that leaf. Users may see different `data.risk` values when
+  // they pass different `qdrantUrl` values; the regression_risk output is
+  // intentionally stable across qdrantUrl choices.
   server.registerTool(
     'audit_symbol',
     {
-      description: 'Fuse behavior, risk, impact, duplicates, rationale, and blast-radius into a single audit for one symbol. Calls get_symbol + render_behavior + regression_risk + analyze_impact + semantic_duplicates + query_project_memory + composite scoring. Returns a ToolResult<AuditSymbolPayload> with all 8 fields populated. Defaults to writeToBlackboard=true (per PRD OQ-5). Wall-time budget: <= 2x the slowest leaf.',
+      description: 'Fuse behavior, risk, impact, duplicates, rationale, and blast-radius into a single audit for one symbol. Calls get_symbol + render_behavior + regression_risk + analyze_impact + semantic_duplicates + query_project_memory + composite scoring. Returns a ToolResult<AuditSymbolPayload> with all 8 fields populated. Defaults to writeToBlackboard=true (per PRD OQ-5). Wall-time budget: <= 2x the slowest leaf. Note: regression_risk reads from .code-intelligence, no Qdrant — it ignores qdrantUrl by design.',
       inputSchema: {
         projectRoot: z.string().describe(PROJECT_ROOT_DESC),
         symbol: z.string().describe('Exact symbol name to audit, for example "BookingService.create" or "AuthService.login".'),
@@ -3263,14 +3282,23 @@ export function createMcpServer(): McpServer {
       // bound functions. We use a minimal bridge that maps the leaves
       // collaborate references. Calls go through the public leaf
       // functions so the meta-tool's signals/reasoning stay coherent.
+      //
+      // F2 (Sprint 6b): pass `writeToBlackboard` through to the inner
+      // leaves so each step's ToolResult can be written to the OUTER
+      // sessionId (per-leaf evidence flows to the same scratchpad as
+      // the outer synthesis). The runner's append loop in
+      // `collaborate.ts` decides per step whether to write; this
+      // bridge just removes the previous `false`-override so the
+      // leaf's own write flag is honored.
       const root = path.resolve(projectRoot);
-      const registry = buildCollaborateToolRegistry(root, qdrantUrl ?? 'http://localhost:6333');
+      const outerWrite = writeToBlackboard !== false;
+      const registry = buildCollaborateToolRegistry(root, qdrantUrl ?? 'http://localhost:6333', outerWrite);
       const result = await collaborateAsync({
         projectRoot: root,
         goal,
         hints,
         llm,
-        writeToBlackboard,
+        writeToBlackboard: outerWrite,
         sessionId,
         qdrantUrl,
         toolRegistry: registry,
@@ -3329,13 +3357,18 @@ export function createMcpServer(): McpServer {
     },
     async ({ projectRoot, intent, overrides, writeToBlackboard, sessionId, qdrantUrl }) => {
       const root = path.resolve(projectRoot);
-      const registry = buildCollaborateToolRegistry(root, qdrantUrl ?? 'http://localhost:6333');
+      // F2 (Sprint 6b): pass `writeToBlackboard` through to the inner
+      // leaves so each step's ToolResult lands on the OUTER sessionId
+      // alongside the outer synthesis. See the matching note on the
+      // `collaborate` tool above.
+      const outerWrite = writeToBlackboard !== false;
+      const registry = buildCollaborateToolRegistry(root, qdrantUrl ?? 'http://localhost:6333', outerWrite);
       const result = await runIntentAsync({
         projectRoot: root,
         intent,
         overrides,
         toolRegistry: registry,
-        writeToBlackboard,
+        writeToBlackboard: outerWrite,
         sessionId,
         qdrantUrl,
       });

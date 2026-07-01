@@ -479,9 +479,14 @@ test('collaborate: writeToBlackboard=true appends to per-session scratchpad', as
     writeToBlackboard: true,
   });
   const entries = await readScratchpad(expectedSession, { projectRoot: root });
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0]?.tool, 'collaborate');
-  assert.equal(entries[0]?.sessionId, expectedSession);
+  // F2 (Sprint 6b): per-step ToolResult evidence is appended alongside
+  // the outer synthesis entry. Audit intent has 2 steps
+  // (audit_symbol + trace_workflow), so we expect 1 outer + 2 per-step = 3.
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0]?.tool, 'audit_symbol');
+  assert.equal(entries[1]?.tool, 'trace_workflow');
+  assert.equal(entries[2]?.tool, 'collaborate');
+  assert.equal(entries[2]?.sessionId, expectedSession);
 });
 
 test('collaborate: writeToBlackboard=false does NOT write', async (t) => {
