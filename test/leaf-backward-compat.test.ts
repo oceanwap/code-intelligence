@@ -253,21 +253,36 @@ test('US-004 meta-tools are registered as new tools (additive)', () => {
   }
 });
 
-test('additive growth after Sprint 4: current.size >= 29 (baseline 25 + US-004 ×2 + US-005 ×2 + US-006 ×1)', () => {
-  // Sprint 4 adds 3 new tools: trace_workflow + collaborate (US-005),
-  // session_status (US-006). run_intent (US-006) is the 4th.
-  // Baseline 25 + Sprint 3 (audit_symbol, plan_refactor) = 27
-  // + Sprint 4 (trace_workflow, collaborate, session_status, run_intent) = 31.
-  // The spec asks for size >= 29 to leave headroom for ordering differences.
+test('additive growth: current.size === 69 (parser-derived exact count after Sprint 5)', () => {
+  // ACTUAL_COUNT is the exact number of leaves the parser below discovers in
+  // src/mcp-server.ts. It is intentionally an `===` equality (not `>=`) so
+  // accidental additions or removals fail this test — the old `>= 29`
+  // formula passed trivially because the real count is 69.
+  //
+  // Composition (Sprint 5 snapshot, parser-based):
+  //   baseline 25 (FR-11 fixture, byte-equal)
+  //   + US-004 Sprint 3   = 2  (audit_symbol, plan_refactor)
+  //   + US-005 Sprint 4   = 2  (trace_workflow, collaborate)
+  //   + US-006 Sprint 4   = 2  (session_status, run_intent)
+  //   + cognition-layer tools shipped across Sprints 1-4 (~38) such as
+  //     index_project, query_project, expand_graph, get_symbol, repo_map,
+  //     smart_query, render_behavior, validate_architecture, etc.
+  //   = 69 total
+  //
+  // If you add a new tool, update ACTUAL_COUNT and add a spot-check test
+  // mirroring the existing US-004 / US-005 / US-006 style.
+  const ACTUAL_COUNT = 69;
   const fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8')) as Fixture;
   const source = fs.readFileSync(MCP_SERVER, 'utf8');
   const current = parseLeaves(source);
   for (const name of fixture.baselineLeaves) {
     assert.ok(current.has(name), `baseline leaf "${name}" missing`);
   }
-  assert.ok(
-    current.size >= 29,
-    `expected at least 29 registered tools after Sprint 4, found ${current.size}`,
+  assert.equal(
+    current.size,
+    ACTUAL_COUNT,
+    `expected exactly ${ACTUAL_COUNT} registered tools (parser-derived), found ${current.size}. ` +
+      `If you added/removed a tool intentionally, update ACTUAL_COUNT and the spot-check tests below.`,
   );
 });
 

@@ -19,6 +19,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { getDataDir } from '../../git.js';
+import { SecurityError } from '../../utils/security.js';
 
 export interface ScratchpadEntry {
   ts: string;
@@ -34,19 +35,60 @@ export interface ScratchpadOptions {
   projectRoot?: string;
 }
 
+/** Maximum length of a sessionId, in characters. Bounds path length. */
+const SESSION_ID_MAX_LENGTH = 128;
+
+/**
+ * Reject any sessionId that could escape the scratchpad directory.
+ *
+ * A sessionId is appended to the data dir as `<sessionId>.json`. To keep the
+ * resolved path inside the data dir, the id must NOT contain:
+ *   - path separators (`/` or `\`)
+ *   - null bytes (`\x00`)
+ *   - the `..` parent-dir segment (as the whole string or any path segment)
+ *
+ * Also rejects empty/whitespace strings and ids longer than 128 chars. Throws
+ * `SecurityError` on rejection so callers (and the MCP tool layer) can map
+ * the failure to a typed, fail-loud response.
+ */
+export function sanitizeSessionId(sessionId: unknown): string {
+  if (typeof sessionId !== 'string' || sessionId.length === 0 || sessionId.trim().length === 0) {
+    throw new SecurityError('scratchpad: sessionId must be a non-empty string');
+  }
+  if (sessionId.length > SESSION_ID_MAX_LENGTH) {
+    throw new SecurityError(
+      `scratchpad: sessionId exceeds max length of ${SESSION_ID_MAX_LENGTH} characters`,
+    );
+  }
+  // Reject path separators and null bytes in a single pass.
+  if (/[\/\\\x00]/.test(sessionId)) {
+    throw new SecurityError(
+      'scratchpad: sessionId contains a forbidden path separator or null byte',
+    );
+  }
+  // Reject `..` as a path segment (defense in depth — bare `..` is the only
+  // remaining way to reach a parent directory after the separator check).
+  if (sessionId === '..' || sessionId.split(/[\/\\]/).includes('..')) {
+    throw new SecurityError('scratchpad: sessionId contains a forbidden ".." segment');
+  }
+  return sessionId;
+}
+
 /**
  * Compute the scratchpad file path for a given session.
  *
  * The branch segment uses the project's current git branch (per `getDataDir`).
  * Tests may pass `projectRoot` to avoid touching the real `.code-intelligence`.
+ *
+ * The sessionId is sanitized at the single chokepoint: every entry point
+ * (append/read/clear) routes through this function, so path-traversal
+ * rejection is centralized.
  */
 export function scratchpadPath(sessionId: string, opts?: ScratchpadOptions): string {
-  if (!sessionId || !sessionId.trim()) {
-    throw new Error('scratchpad: sessionId must be a non-empty string');
-  }
+  const safe = sanitizeSessionId(sessionId);
   const root = opts?.projectRoot ?? process.cwd();
   const dataDir = getDataDir(root);
-  return path.join(dataDir, 'scratchpad', `${sessionId}.json`);
+  return path.join(dataDir, 'scratchpad', `${safe}.json`);
 }
 
 /**
