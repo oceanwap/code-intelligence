@@ -12,6 +12,25 @@
  *   - No in-process cache. Reads always re-open the file.
  *   - `clearScratchpad` removes the file. Idempotent — no error if absent.
  *
+ * Concurrency (Q2 fix): POSIX guarantees that `write(2)` is atomic only
+ * for buffers <= `PIPE_BUF` (1024 B on macOS, 4096 B on Linux). Larger
+ * writes may be split by the kernel and interleaved byte-for-byte with
+ * concurrent writers, even on `O_APPEND` file descriptors. `readScratchpad`
+ * silently drops malformed lines (`JSON.parse` per line, catch + skip),
+ * which means two parallel agents appending large payloads (e.g. code
+ * vectors, audit_symbol payloads) to the same sessionId would lose
+ * entries without any error surfaced.
+ *
+ * The fix is a per-sessionId in-process mutex: every `appendScratchpad`
+ * call chains onto the previous tail promise for that sessionId, so
+ * concurrent calls on the same sessionId execute strictly sequentially.
+ * Different sessionIds do not contend. Single-node deterministic.
+ *
+ * Scope limitation: this mutex only covers callers within a single
+ * process. Cross-process races (VS Code multi-window, HTTP transport mode)
+ * are out of scope — those need OS-level advisory locking, which is a
+ * separate design pass (see F2 in the Sprint-5 hardening brief).
+ *
  * This is intentionally minimal: no locking, no rotation, no indexing. The
  * scratchpad is per-session, single-writer; locking is the caller's job.
  */
@@ -135,8 +154,56 @@ export async function readScratchpad(sessionId: string, opts?: ScratchpadOptions
  * before write. The reader below reverses the tags via a reviver. The
  * previous implementation called `JSON.stringify(payload)` directly,
  * which silently dropped these fields and broke round-trip equality.
+ *
+ * FIX Q2: serialize concurrent calls on the same sessionId via a per-id
+ * promise chain. POSIX `write(2)` is atomic only for buffers <= PIPE_BUF
+ * (1024 B macOS, 4096 B Linux); larger writes can interleave byte-for-byte
+ * across processes, and even within a single process two overlapping
+ * `await fs.open(...)` + `await fh.write(...)` calls would race the
+ * kernel buffer. The mutex makes the open→write→fsync→close sequence
+ * strictly sequential per sessionId.
  */
 export async function appendScratchpad(sessionId: string, entry: ScratchpadEntry, opts?: ScratchpadOptions): Promise<void> {
+  // Per-sessionId serialization. See module header for the rationale.
+  // The previous tail promise (or a resolved sentinel) is awaited before
+  // the new tail's `doAppend` runs; the new tail is published as the next
+  // "previous" for whoever comes after.
+  //
+  // Sanitize eagerly so a SecurityError throws synchronously, matching the
+  // pre-mutex contract. (Sanitization is pure; calling it here is safe and
+  // matches the test that expects `appendScratchpad('../escape', ...)` to
+  // reject with SecurityError without ever opening a file.)
+  sanitizeSessionId(sessionId);
+
+  const previous = appendMutex.get(sessionId) ?? Promise.resolve();
+  const next = previous.then(() => doAppend(sessionId, entry, opts));
+  appendMutex.set(sessionId, next);
+  // Best-effort cleanup: once this append settles, if no later caller has
+  // replaced us in the map, drop the entry so the map doesn't grow
+  // unbounded across long-lived processes. The `.then(onFulfilled,
+  // onRejected)` form is intentional: it gives us a settled-cleanup
+  // Promise that we can `void` without creating an unhandled-rejection
+  // trail when `next` rejects (which would surface as a logged
+  // SecurityError even though the original `await appendScratchpad(...)`
+  // already saw the rejection).
+  void next.then(
+    () => cleanupMutexEntry(sessionId, next),
+    () => cleanupMutexEntry(sessionId, next),
+  );
+  return next;
+}
+
+function cleanupMutexEntry(sessionId: string, tail: Promise<unknown>): void {
+  if (appendMutex.get(sessionId) === tail) {
+    appendMutex.delete(sessionId);
+  }
+}
+
+/**
+ * The actual append, factored out so `appendScratchpad` can serialize it
+ * via the per-sessionId promise chain without a recursive `await`.
+ */
+async function doAppend(sessionId: string, entry: ScratchpadEntry, opts?: ScratchpadOptions): Promise<void> {
   const file = scratchpadPath(sessionId, opts);
   await fs.mkdir(path.dirname(file), { recursive: true });
   const fh = await fs.open(file, 'a');
@@ -148,6 +215,18 @@ export async function appendScratchpad(sessionId: string, entry: ScratchpadEntry
     await fh.close();
   }
 }
+
+/**
+ * Per-sessionId serialization queue for `appendScratchpad`.
+ *
+ * Each entry is the tail promise of the chain; the next call awaits the
+ * previous tail before its own `doAppend` runs. The map entry is dropped
+ * once the tail settles and no later caller has replaced it (best-effort
+ * cleanup). Memory cost: O(active concurrent sessionIds).
+ *
+ * Module-level state. Not exported.
+ */
+const appendMutex = new Map<string, Promise<unknown>>();
 
 /**
  * Remove the scratchpad file for a session. Idempotent — succeeds even if the
