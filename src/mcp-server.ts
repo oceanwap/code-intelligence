@@ -139,6 +139,7 @@ import {
   readScratchpad,
   appendScratchpad,
   clearScratchpad,
+  sanitizeSessionId,
   type ScratchpadEntry,
 } from './cognition/blackboard/scratchpad.js';
 import {
@@ -440,7 +441,13 @@ async function checkQdrantHealthAsync(qdrantUrl: string): Promise<{ status: 'hea
   }
 }
 
-function isQdrantUnavailableError(error: unknown): boolean {
+/**
+ * FIX F3: detect Qdrant backend failures by message keywords. Exported
+ * for the regression test surface. The F3 fix added a try/catch +
+ * qdrantUnavailableResponse wrapper to `find_existing`; the test
+ * imports this helper to assert the detection logic.
+ */
+export function isQdrantUnavailableError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = error.message.toLowerCase();
   return message.includes('fetch failed')
@@ -453,7 +460,13 @@ function isQdrantUnavailableError(error: unknown): boolean {
     || message.includes('not found');
 }
 
-function qdrantUnavailableResponse(qdrantUrl: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+/**
+ * FIX F3: typed Qdrant-unavailable response. Exported for the
+ * regression test surface. The handler wrappers in this file return
+ * this shape so callers can branch on `isError: true` + a stable text
+ * payload.
+ */
+export function qdrantUnavailableResponse(qdrantUrl: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
   return {
     content: [{ type: 'text', text: `Qdrant backend unavailable at ${qdrantUrl}` }],
     isError: true,
@@ -695,6 +708,27 @@ function buildCollaborateToolRegistry(projectRoot: string, qdrantUrl: string) {
 export function createMcpServer(): McpServer {
   const server = new McpServer({ name: 'code-intelligence', version: '1.0.0' });
   attachToolLogging(server);
+
+  // ── post-call recommend_next hook (US-006 / P4) ────────────────────────
+  // FR-11 byte-equality: opt-in only via CODE_INTEL_RECOMMEND=1. When off,
+  // every existing leaf's output shape is byte-identical. When on, the
+  // hook wraps `server.registerTool` so that envelope-returning tools
+  // get a `data.recommended_next` field derived from the scratchpad
+  // co-occurrence history.
+  //
+  // FIX F1: this hook MUST be installed BEFORE any `server.registerTool`
+  // call. The previous location (after all tool registrations) caused the
+  // hook to be a dead path: every tool was registered with the un-wrapped
+  // `server.registerTool`, so the env flag was logged but no tool's
+  // handler was actually wrapped.
+  if (isRecommendEnabled()) {
+    const originalRegister = server.registerTool.bind(server);
+    server.registerTool = attachRecommendedNext(
+      originalRegister,
+      (toolName) => process.cwd(),
+    ) as typeof server.registerTool;
+    mcpLog('info', 'recommended_next hook enabled (CODE_INTEL_RECOMMEND=1)');
+  }
 
   const registerSnapshotResource = (name: string, fileName: string, description: string): void => {
     server.registerResource(
@@ -2945,8 +2979,18 @@ export function createMcpServer(): McpServer {
       },
     },
     async ({ projectRoot, description, qdrantUrl = 'http://localhost:6333', limit = 6 }) => {
-      const result = await findExisting(path.resolve(projectRoot), description, qdrantUrl, limit);
-      return { content: [{ type: 'text', text: renderFindExisting(result) }] };
+      try {
+        const result = await findExisting(path.resolve(projectRoot), description, qdrantUrl, limit);
+        return { content: [{ type: 'text', text: renderFindExisting(result) }] };
+      } catch (error) {
+        // FIX F3: mirror sibling tools (expand_graph, get_file_chunks) and
+        // return a typed Qdrant-unavailable response on backend failure
+        // instead of bubbling a raw throw. The previous handler lacked
+        // the try/catch wrapper entirely, so Qdrant outages surfaced as
+        // untyped MCP errors to the agent.
+        if (isQdrantUnavailableError(error)) return qdrantUnavailableResponse(qdrantUrl);
+        throw error;
+      }
     }
   );
 
@@ -3059,8 +3103,28 @@ export function createMcpServer(): McpServer {
       },
     },
     async ({ projectRoot, sessionId, clear }) => {
+      const root = path.resolve(projectRoot);
+      // FIX F8: pre-validate sessionId via the same chokepoint that
+      // readScratchpad uses, and convert a SecurityError into a typed
+      // empty response. The previous handler wrapped the entire body in
+      // a single try/catch and returned `{ isError: true, ... }` on any
+      // rejection, which diverged from `session_status` (which returns a
+      // typed empty on the same input). Agents that branched on
+      // `isError` saw inconsistent shapes between the two inspectors.
       try {
-        const root = path.resolve(projectRoot);
+        sanitizeSessionId(sessionId);
+      } catch (error) {
+        // Reject path: typed empty, no isError flag. The text describes
+        // the rejection reason so the caller can debug without parsing a
+        // thrown error.
+        return {
+          content: [{
+            type: 'text',
+            text: `Scratchpad for session "${sessionId}" is empty (rejected: ${(error as Error).message}).`,
+          }],
+        };
+      }
+      try {
         const entries = await readScratchpad(sessionId, { projectRoot: root });
         if (clear === true) {
           await clearScratchpad(sessionId, { projectRoot: root });

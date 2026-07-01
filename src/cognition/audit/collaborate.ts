@@ -384,10 +384,17 @@ function buildReleasePrepDag(): ToolStep[] {
       args: { limit: 5 },
       rationale: 'surface any architecture-drift signals that should block release',
     },
+    // FIX F10: replaced the previous `regression_risk` step (which passed
+    // the literal symbol `'HOTSPOT'` — a non-existent symbol that scored
+    // 0/null and silently masked release-blocking risks) with
+    // `risk_hotspots`, which returns the top-N globally elevated
+    // symbols. The literal string could never match a real symbol, so
+    // the step emitted an empty result and the synthesis missed every
+    // elevated-risk call site.
     {
-      name: 'regression_risk',
-      args: { symbol: 'HOTSPOT' },
-      rationale: 'global regression-risk ranking to find newly-elevated symbols',
+      name: 'risk_hotspots',
+      args: { limit: 10, excludeSinkNodes: false },
+      rationale: 'top-10 globally elevated regression-risk symbols to block release',
     },
   ];
 }

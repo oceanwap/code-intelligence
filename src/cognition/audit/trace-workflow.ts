@@ -93,6 +93,13 @@ export interface TraceWorkflowPayload {
   capped: boolean;
   /** Pre-call facts inherited from the scratchpad (FR-4). */
   inheritedFacts: number;
+  /**
+   * FIX F5: maximum number of prior scratchpad entries the meta-tool
+   * pulls into its reasoning chain. Surfaced so callers can reason
+   * about the deterministic upper bound. The current cap is
+   * `INHERITED_FACTS_CAP` (20) at the top of this file.
+   */
+  inheritedFactsCap: number;
   /** Reasoning chain. */
   reasoning_chain: ReasoningFact[];
 }
@@ -110,6 +117,13 @@ export interface TraceWorkflowInput {
 
 const DEFAULT_HOPS = 2;
 const MAX_STEPS = 30; // narrative + sequence cap
+// FIX F5: cap the inherited facts pulled from the scratchpad append-log.
+// The previous implementation walked the full log on every call, so a
+// long-running session's `inheritedFacts` count grew unbounded and the
+// reasoning chain pulled in arbitrarily many prior facts. We keep the
+// most recent INHERITED_FACTS_CAP entries — that is the deterministic
+// upper bound surfaced to the caller in the payload.
+const INHERITED_FACTS_CAP = 20;
 
 /**
  * Run `trace_workflow`.
@@ -140,9 +154,15 @@ export async function traceWorkflowAsync(
   const reasoning: ReasoningFact[] = [];
 
   // ── Read prior blackboard facts (FR-4) ────────────────────────────────────
+  // FIX F5: cap inherited facts at the last INHERITED_FACTS_CAP entries
+  // of the append-log. Earlier entries are dropped — the reasoning
+  // chain pulls in at most INHERITED_FACTS_CAP facts and the cap is
+  // surfaced in the payload via `inheritedFactsCap` so callers can
+  // reason about it.
   const priorEntries = await readScratchpad(sessionId, { projectRoot });
+  const recentEntries = priorEntries.slice(-INHERITED_FACTS_CAP);
   const priorFacts: ReasoningFact[] = [];
-  for (const entry of priorEntries) {
+  for (const entry of recentEntries) {
     if (Array.isArray(entry.reasoning)) {
       for (const f of entry.reasoning) {
         if (typeof f === 'string' && f.trim()) priorFacts.push({ fact: f });
@@ -211,6 +231,7 @@ export async function traceWorkflowAsync(
     reachableCount: reachable.length,
     capped: expansion.capped,
     inheritedFacts,
+    inheritedFactsCap: INHERITED_FACTS_CAP,
     reasoning_chain: reasoning,
   };
 
@@ -394,6 +415,7 @@ function emptyPayload(
     reachableCount: 0,
     capped: false,
     inheritedFacts,
+    inheritedFactsCap: INHERITED_FACTS_CAP,
     reasoning_chain: reasoning,
   };
 }

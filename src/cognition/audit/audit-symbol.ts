@@ -125,7 +125,12 @@ export async function auditSymbolAsync(
   ]);
 
   // ── blast_radius from US-003 composite scoring ────────────────────────
-  const blast = await readBlastRadiusAsync(root, symbol, signals, reasoning);
+  // FIX F4: pass the shared graph promise so the graph is loaded only
+  // once. The previous implementation called loadGraphAsync a second
+  // time inside readBlastRadiusAsync — a serial read that doubled the
+  // wall-time cost of the meta-tool. Mirrors the readBehaviorAsync
+  // pattern at line 184.
+  const blast = await readBlastRadiusAsync(root, symbol, graphP, signals, reasoning);
 
   // ── deterministic action_recommendation ────────────────────────────────
   const action_recommendation = synthesizeAction({
@@ -303,11 +308,12 @@ async function readRegressionAsync(
 async function readBlastRadiusAsync(
   root: string,
   symbol: string,
+  graphP: Promise<unknown>,
   signals: Signal[],
   reasoning: ReasoningFact[],
 ): Promise<BlastRadius> {
   try {
-    const graph = await loadGraphAsync(path.join(getDataDir(root), 'graph.json'));
+    const graph = await graphP as Awaited<ReturnType<typeof loadGraphAsync>>;
     if (!graph) {
       reasoning.push({ fact: 'blast_radius: graph not loaded; score=0', source: 'composite' });
       signals.push({ kind: 'audit_symbol.leaf_missing', payload: { leaf: 'blast_radius' } });
@@ -372,8 +378,12 @@ function synthesizeAction(input: {
 }
 
 function inferTier(input: { behavior: Behavior; risk: RiskHotspot; regressionScore: number | null; blastScore: number }): ToolResult['confidence_tier'] {
+  // FIX F12: removed the dead branch `if (input.behavior.length === 0
+  // && input.risk == null) return 'AMBIGUOUS'`. The prior line already
+  // returned when `risk == null`, so the second guard was unreachable.
+  // The 3 tier cases (AMBIGUOUS / INFERRED / EXTRACTED) are still
+  // covered by the regression and risk signals alone.
   if (input.regressionScore == null && input.risk == null) return 'AMBIGUOUS';
-  if (input.behavior.length === 0 && input.risk == null) return 'AMBIGUOUS';
   if (input.regressionScore != null && input.regressionScore < 0.5) return 'INFERRED';
   return 'EXTRACTED';
 }
