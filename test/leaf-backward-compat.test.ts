@@ -312,3 +312,15 @@ test('US-006: session_status tool is registered (additive)', () => {
   const current = parseLeaves(source);
   assert.ok(current.has('session_status'), 'US-006 read-only tool "session_status" must be registered in src/mcp-server.ts');
 });
+
+test('US-006: run_intent tool is registered (additive)', () => {
+  // Sprint 4 US-006 P4 goal-shaped entry point (FR-8). The companion
+  // to `collaborate`: takes a registered intent name (audit, onboard,
+  // refactor, debug, release-prep) and runs the pre-declared DAG
+  // directly. Spot-check the parser discovers the registration in
+  // src/mcp-server.ts. Fails the test if the new tool is missing or
+  // mis-registered.
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  assert.ok(current.has('run_intent'), 'US-006 goal-shaped tool "run_intent" must be registered in src/mcp-server.ts');
+});
