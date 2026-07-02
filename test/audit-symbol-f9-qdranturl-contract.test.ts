@@ -84,12 +84,28 @@ const mockGetRiskHotspots = (async (
   };
 }) as unknown as typeof insights.getRiskHotspots;
 
+const F9_QDRANT_URLS = new Set(['http://qdrant-A:6333', 'http://qdrant-B:6333']);
+const realQueryProjectMemory = projectMemory.queryProjectMemory;
+
 const mockQueryProjectMemory = (async (
-  _projectRoot: string,
-  _question: string,
-  _qdrantUrl: string,
-  _limit: number,
+  projectRoot: string,
+  question: string,
+  qdrantUrl: string,
+  limit: number,
 ): Promise<Array<{ entry: { id: string; summary: string; topics: string[] }; score: number }>> => {
+  // Only return the F9 canned response for the qdrantUrls this test
+  // exercises. Any other caller (e.g. audit-symbol.test.ts "missing
+  // graph" case using the default qdrantUrl) is delegated to the REAL
+  // implementation captured at module load time.
+  //
+  // Why: in Bun 1.3.13, `mock.module` is process-global and leaks
+  // across test files. Without this guard, the F9 canned entry leaks
+  // into audit-symbol.test.ts and its "missing graph → typed empty
+  // fields" assertion fails because data.rationale is non-empty.
+  // (mock.restore() does NOT undo mock.module registrations.)
+  if (!F9_QDRANT_URLS.has(qdrantUrl)) {
+    return realQueryProjectMemory(projectRoot, question, qdrantUrl, limit);
+  }
   // Stable response — does NOT vary with qdrantUrl. This pins the
   // contract that rationale is intentionally qdrantUrl-agnostic.
   return [
