@@ -161,6 +161,113 @@ export interface PlanRefactorPayload {
 }
 
 // ---------------------------------------------------------------------------
+// review_pr (Sprint 8 US-001)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-symbol verdict from the deterministic rule table. No LLM —
+ * a heuristic rule (regression score + blast radius + duplicate matches +
+ * project-wide constraint violations) maps each changed symbol to one
+ * of these three outcomes.
+ *
+ *   HOLD   — at least one trigger is met (regression_score >= 0.8 OR
+ *            a project-wide high-severity constraint violation triggers
+ *            for this symbol). Stop and fix before merging.
+ *   REVIEW — at least one risk trigger is met (regression_score >= 0.5 OR
+ *            blast_radius >= 0.7 OR duplicate_matches >= 2). Worth a human
+ *            look before merging; the change may be reversible.
+ *   PASS   — no triggers met. Proceed.
+ *
+ * The rule table is documented in `audit/review-pr.ts`.
+ */
+export type ReviewVerdict = 'HOLD' | 'REVIEW' | 'PASS';
+
+/**
+ * Aggregate decision across the whole PR diff.
+ *
+ *   BLOCK  — at least one per-symbol verdict is HOLD. Do NOT merge.
+ *   REVIEW — at least one per-symbol verdict is REVIEW OR the top per-symbol
+ *            blast_radius is >= 0.7. Worth a human pass.
+ *   PASS   — every per-symbol verdict is PASS and top blast_radius < 0.7.
+ *
+ * Mirrors `ReviewVerdict` but at the diff level. The mapping is encoded
+ * in `verdictAggregate` in `audit/review-pr.ts`.
+ */
+export type MergeDecision = 'PASS' | 'REVIEW' | 'BLOCK';
+
+/**
+ * One row of `ReviewPrPayload.perSymbol`. The deterministic rule table
+ * (`verdictPerSymbol` in audit/review-pr.ts) populates `verdict` + the
+ * trigger counts from a row of per-symbol leaves; `confidence` is derived
+ * from those triggers and `blast_radius`.
+ */
+export interface ReviewPerSymbol {
+  symbol: string;
+  file: string;
+  verdict: ReviewVerdict;
+  /** Confidence in [0,1]. */
+  confidence: number;
+  /** Per-symbol blast radius in [0,1]. */
+  blast_radius: number;
+  /** Per-symbol regression risk score in [0,1]. */
+  regression_score: number;
+  /** Count of duplicate patterns that touch the symbol's file. */
+  duplicate_matches: number;
+  /** Number of side effects recorded for the symbol (from graph). */
+  side_effect_count: number;
+  /** 1-3 short facts that drove the verdict. */
+  why: string[];
+}
+
+/**
+ * Aggregate verdict for the whole diff plus the counts that drove it.
+ *
+ * `rule` is the name of the first violated rule that drove the decision —
+ * a stable identifier so callers can branch on the violation type without
+ * re-reading the count fields. Examples:
+ *   - `per_symbol_hold_present`       — at least one per-symbol HOLD
+ *   - `per_symbol_review_present`     — at least one per-symbol REVIEW
+ *   - `top_blast_radius_review`       — top blast_radius >= 0.7
+ *   - `all_clear`                     — all-clear PASS
+ */
+export interface ReviewAggregate {
+  merge_decision: MergeDecision;
+  rule: string;
+  hold_count: number;
+  review_count: number;
+  pass_count: number;
+  total_changed_symbols: number;
+  /** Distinct files touched by symbols that have at least one duplicate pattern. */
+  duplicates_at_files: number;
+  /** Number of architecture-drift records at the time of the call. */
+  architecture_drift_records: number;
+  /** Number of project-wide HIGH-severity constraint violations. */
+  constraint_violations_high: number;
+}
+
+/**
+ * `review_pr` payload — fuses git_semantic_change_graph + per-symbol
+ * audit_symbol + semantic_duplicates + architecture_drift + constraint
+ * violations (high severity) + composite blast radius into one
+ * merge-decision surface.
+ */
+export interface ReviewPrPayload {
+  baseRef: string;
+  headRef: string;
+  perSymbol: ReviewPerSymbol[];
+  aggregate: ReviewAggregate;
+  /**
+   * Recommended next steps, derived from the rule table + the existing
+   * recommend hook (`CODE_INTEL_RECOMMEND=1` opt-in). When the env flag
+   * is off, the array is empty and the meta-tool's output is byte-equal
+   * to a non-recommend run (FR-11 backward compat).
+   */
+  recommended_next: string[];
+  /** Reasoning chain (FR-4) — leaf facts appended in call order. */
+  reasoning_chain: import('../signalization/types.js').ReasoningFact[];
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 

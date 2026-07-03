@@ -47,13 +47,25 @@ export interface WithSignalsOptions {
 export function isToolResult(value: unknown): value is ToolResult {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
-  return (
-    'data' in v &&
-    'signals' in v &&
-    'reasoning' in v &&
-    'sources' in v &&
-    'confidence_tier' in v
-  );
+  // Sprint 8 US-002 B3: strict discriminator. Beyond the 5-key shape
+  // check, every field must satisfy its declared type:
+  //   - `confidence_tier` must be one of the three CONFIDENCE_TIERS
+  //     strings (the prior implementation accepted any string, which
+  //     let typos like `EXTRACTed` pass).
+  //   - `signals`, `reasoning`, `sources` MUST be arrays (the prior
+  //     implementation accepted any non-array and then failed silently
+  //     downstream when downstream code did `signals[0]?.kind`).
+  // A malformed envelope fails the discriminator — downstream callers
+  // (post-call hook in `recommend/post-call.ts`, `runner.ts`, …) now
+  // get a typed false instead of a half-broken envelope.
+  if (!('data' in v)) return false;
+  if (!('signals' in v) || !Array.isArray(v['signals'])) return false;
+  if (!('reasoning' in v) || !Array.isArray(v['reasoning'])) return false;
+  if (!('sources' in v) || !Array.isArray(v['sources'])) return false;
+  const tier = v['confidence_tier'];
+  if (typeof tier !== 'string') return false;
+  if (tier !== 'EXTRACTED' && tier !== 'INFERRED' && tier !== 'AMBIGUOUS') return false;
+  return true;
 }
 
 /** Detect whether a payload field looks like a confidence float. */

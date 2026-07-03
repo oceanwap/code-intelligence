@@ -121,9 +121,11 @@ function makeFakeRegistry(opts: {
 // 1. Registry shape — 5 intents
 // ---------------------------------------------------------------------------
 
-test('intents: registry contains exactly 5 intents', () => {
+test('intents: registry contains exactly 6 intents', () => {
+  // Sprint 8 US-001: 6 pre-declared intents (audit, onboard, refactor,
+  // debug, release-prep, plus the new `review`).
   const names = listIntents();
-  assert.deepEqual(names, ['audit', 'debug', 'onboard', 'refactor', 'release-prep'].sort());
+  assert.deepEqual(names, ['audit', 'debug', 'onboard', 'refactor', 'release-prep', 'review'].sort());
 });
 
 test('intents: each intent is a pure data record (name, description, dag, post)', () => {
@@ -645,11 +647,17 @@ test('runIntentAsync: every registered intent executes successfully end-to-end',
   initGit(root);
   for (const intent of listIntents()) {
     const reg = makeFakeRegistry();
+    // Sprint 8 US-001: the `review` intent carries `$baseRef` / `$headRef`
+    // opts references in its DAG. Provide concrete values so the resolver
+    // succeeds end-to-end. The other 5 intents use literal-only args and
+    // do NOT need opts.
+    const opts = intent === 'review' ? { baseRef: 'main', headRef: 'HEAD' } : undefined;
     const result = await runIntentAsync({
       projectRoot: root,
       intent,
       toolRegistry: reg,
       writeToBlackboard: false,
+      ...(opts ? { opts } : {}),
     });
     assert.equal(result.data.intent, intent);
     assert.equal(result.confidence_tier, 'EXTRACTED');

@@ -295,10 +295,58 @@ function collectSymbols(graph: GraphData | null, memory: Map<string, MemoryStats
  * for O(1) lookup vs. an object.
  *
  * Missing file → empty Map. Caller falls back to no scoring.
+ *
+ * Sprint 8 B2 (US-002): module-level mtime-keyed cache. The first call
+ * parses the JSON file; subsequent calls in the same process with an
+ * unchanged `(projectRoot, branch, mtime, graphMtime)` tuple return the
+ * SAME `Map` instance (pointer-equal). The cache busts on:
+ *   1. The composite-scores.json mtime changing (recompute).
+ *   2. The graph.json mtime changing (OQ-4 recommendation: scores may
+ *      be stale relative to graph reindex).
+ *   3. A different `projectRoot` (per-process, no cross-project leak).
+ * Bun is single-threaded so a `Map` is sufficient — no mutex needed.
+ *
+ * The PR-mandated test (`test/composite-scoring.test.ts` B2 case)
+ * asserts `m1 === m2` for two consecutive calls with the same file
+ * mtime; a touch + reload test verifies the cache busts.
  */
 export async function loadCompositeScoresAsMap(opts?: CompositeScoresOptions): Promise<Map<string, CompositeScore>> {
+  const root = opts?.projectRoot ?? process.cwd();
+  const file = compositeScoresPath(opts);
+  let mtimeScores = 0;
+  let mtimeGraph = 0;
+  try {
+    const [s, g] = await Promise.all([fs.stat(file), statGraphMtime(root)]);
+    mtimeScores = s.mtimeMs;
+    mtimeGraph = g;
+  } catch {
+    // ENOENT or stat failure → cache miss.
+  }
+  const key = `${root}|${mtimeScores}|${mtimeGraph}`;
+  const cached = COMPOSITE_SCORES_MEMO.get(key);
+  if (cached) return cached;
   const obj = await loadCompositeScores(opts);
-  return new Map(Object.entries(obj));
+  const map = new Map(Object.entries(obj));
+  COMPOSITE_SCORES_MEMO.set(key, map);
+  return map;
+}
+
+/**
+ * Module-level memo for `loadCompositeScoresAsMap`. The key is a tuple
+ * of `(projectRoot, compositeScoresMtime, graphMtime)` so the cache
+ * busts correctly when EITHER file changes. The value is the resolved
+ * `Map` (same instance returned on cache hit).
+ */
+const COMPOSITE_SCORES_MEMO = new Map<string, Map<string, CompositeScore>>();
+
+async function statGraphMtime(projectRoot: string): Promise<number> {
+  try {
+    const graphFile = path.join(getDataDir(projectRoot), 'graph.json');
+    const s = await fs.stat(graphFile);
+    return s.mtimeMs;
+  } catch {
+    return 0;
+  }
 }
 
 // Re-export scorer symbols for callers who prefer the persist.ts surface.

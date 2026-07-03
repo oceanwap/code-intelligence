@@ -120,6 +120,57 @@ test('isToolResult detects ToolResult envelopes and rejects plain values', () =>
   assert.equal(isToolResult(42), false);
 });
 
+// Sprint 8 US-002 / B3 — strict isToolResult discriminator.
+test('isToolResult rejects bad confidence_tier (unknown string)', () => {
+  // All 5 keys present but `confidence_tier` is an unknown string.
+  // The strict discriminator must reject this.
+  assert.equal(
+    isToolResult({ data: 1, signals: [], reasoning: [], sources: [], confidence_tier: 'EXTRACTED_typo' }),
+    false,
+    'unknown confidence_tier must fail the strict discriminator',
+  );
+});
+
+test('isToolResult rejects bad confidence_tier (lowercase variant)', () => {
+  assert.equal(
+    isToolResult({ data: 1, signals: [], reasoning: [], sources: [], confidence_tier: 'extracted' }),
+    false,
+    'lowercase confidence_tier must fail the strict discriminator',
+  );
+});
+
+test('isToolResult rejects non-array signals field', () => {
+  // All keys present but `signals` is an object, not an array.
+  assert.equal(
+    isToolResult({ data: 1, signals: {}, reasoning: [], sources: [], confidence_tier: 'EXTRACTED' }),
+    false,
+    'object-valued signals must fail the strict discriminator',
+  );
+});
+
+test('isToolResult rejects non-array reasoning field', () => {
+  assert.equal(
+    isToolResult({ data: 1, signals: [], reasoning: 'not an array', sources: [], confidence_tier: 'EXTRACTED' }),
+    false,
+    'string-valued reasoning must fail the strict discriminator',
+  );
+});
+
+test('isToolResult rejects non-array sources field', () => {
+  assert.equal(
+    isToolResult({ data: 1, signals: [], reasoning: [], sources: null, confidence_tier: 'EXTRACTED' }),
+    false,
+    'null sources must fail the strict discriminator',
+  );
+});
+
+test('isToolResult accepts all three CONFIDENCE_TIERS strings', () => {
+  for (const tier of ['EXTRACTED', 'INFERRED', 'AMBIGUOUS'] as const) {
+    const result = isToolResult({ data: 1, signals: [], reasoning: [], sources: [], confidence_tier: tier });
+    assert.equal(result, true, `tier ${tier} must pass the strict discriminator`);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 2. withSignals HOF — opt-in contract
 // ---------------------------------------------------------------------------

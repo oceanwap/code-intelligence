@@ -1,12 +1,15 @@
 /**
  * intents/registry — PRD US-006 FR-8 pre-declared intent registry.
  *
- * The intent registry ships with five pre-declared intents:
+ * The intent registry ships with six pre-declared intents:
  *   - audit         → audit_symbol (US-004)
  *   - onboard       → project_status + feature_map + repo_map
  *   - refactor      → plan_refactor + analyze_impact + regression_risk
  *   - debug         → get_symbol + regression_risk + render_behavior + query_project_memory
  *   - release-prep  → plan_refactor + architecture_drift + regression_risk
+ *   - review        → review_pr (Sprint 8 US-001) — fuses 6 leaves into one
+ *                      PR-merge-decision call, with `$baseRef` / `$headRef`
+ *                      placeholders resolved from the caller-supplied `opts`.
  *
  * Adding a new intent = code change to `registry.ts` (no runtime
  * registration, FR-8). Each intent is a pure data record; the runner
@@ -28,7 +31,8 @@ export type RegisteredIntentName =
   | 'onboard'
   | 'refactor'
   | 'debug'
-  | 'release-prep';
+  | 'release-prep'
+  | 'review';
 
 // ---------------------------------------------------------------------------
 // F6 — RefExpression: per-args dataflow placeholders.
@@ -207,7 +211,7 @@ const RELEASE_PREP: IntentRecord = {
     {
       name: 'plan_refactor',
       args: { baseRef: 'main', headRef: 'HEAD' },
-      rationale: 'intervention plan for the current branch diff',
+      rationale: 'intervention plan for the current branch diff before release',
     },
     {
       name: 'architecture_drift',
@@ -226,12 +230,42 @@ const RELEASE_PREP: IntentRecord = {
   ],
 };
 
+// Sprint 8 US-001: review intent — one-call PR merge decision.
+//
+// The DAG carries `$baseRef` and `$headRef` placeholders that are
+// resolved against the caller's `opts` at run-time. The literal-only
+// intent pattern is preserved for the other 5 intents; only this
+// intent introduces an `opts` thread through `resolveArgs` (see
+// `intents/runner.ts`). Acceptance:
+//   - run_intent('review', { baseRef: 'main', headRef: 'HEAD' }) resolves
+//     `$baseRef` → 'main' and `$headRef` → 'HEAD'.
+//   - Direct `getIntent('review').dag` evaluation without `opts`
+//     surfaces a typed unresolvable error — by design, the intent
+//     requires caller-supplied refs to do anything meaningful.
+const REVIEW: IntentRecord = {
+  name: 'review',
+  description: 'Single-call PR review: fuse git_semantic_change_graph + per-symbol audit_symbol + semantic_duplicates + architecture_drift + constraint_violations + composite blast radius into one Block / Review / Pass merge decision. Heuristic only — no LLM.',
+  dag: [
+    {
+      name: 'review_pr',
+      args: { baseRef: { $ref: '$baseRef' }, headRef: { $ref: '$headRef' }, topN: 10 },
+      rationale: 'single-call merge-decision fusion ($baseRef/$headRef resolved from opts)',
+    },
+  ],
+  post: [
+    'If aggregate.merge_decision === BLOCK, address the per-symbol HOLD verdict(s) before merging.',
+    'If aggregate === REVIEW, walk perSymbol.why[] for the trigger detail and confirm each review-level symbol is safe.',
+    'Re-run review_pr after applying remediation to confirm the verdict flips to PASS.',
+  ],
+};
+
 const REGISTRY: Record<RegisteredIntentName, IntentRecord> = {
   audit: AUDIT,
   onboard: ONBOARD,
   refactor: REFACTOR,
   debug: DEBUG,
   'release-prep': RELEASE_PREP,
+  review: REVIEW,
 };
 
 // ---------------------------------------------------------------------------

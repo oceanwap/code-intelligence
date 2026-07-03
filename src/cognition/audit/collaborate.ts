@@ -64,6 +64,7 @@ import {
 } from '../signalization/types.js';
 import { inheritReasoning, appendReasoning, type ReasoningFact } from '../reasoning/bus.js';
 import { appendScratchpad, readScratchpad } from '../blackboard/scratchpad.js';
+import { INHERITED_FACTS_CAP } from './inherited-facts-cap.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -169,22 +170,50 @@ function walkRefPath(path: string, prior: ResolvedPriorStep): unknown {
   return cursor === undefined ? UNRESOLVED : cursor;
 }
 
-/** Resolve a single `RefExpression` against `prior`. Returns
- *  `UNRESOLVED` for `$ref` whose path cannot be walked; the caller
- *  decides whether that should throw. `$const` returns its value
- *  unchanged. `$concat` joins all segments via `String(seg)`. */
-function resolveExpression(expr: unknown, prior: ResolvedPriorStep | undefined, exprPath: string): unknown {
+/** Resolve a single `RefExpression` against `prior` (or `optsRef` for
+ *  caller-supplied placeholders). Returns `UNRESOLVED` for `$ref`
+ *  whose path cannot be walked; the caller decides whether that should
+ *  throw. `$const` returns its value unchanged. `$concat` joins all
+ *  segments via `String(seg)`. */
+function resolveExpression(
+  expr: unknown,
+  prior: ResolvedPriorStep | undefined,
+  exprPath: string,
+  optsRef?: Record<string, unknown>,
+): unknown {
   if (expr == null || typeof expr !== 'object') return expr;
   const obj = expr as Record<string, unknown>;
   if (typeof obj['$ref'] === 'string') {
-    if (!prior) {
-      throw new CollaborateArgResolutionError(obj['$ref'], `no prior step available to resolve ${obj['$ref']}`, exprPath);
+    const refPath = obj['$ref'];
+    // Sprint 8: `$ref: '$key'` (leading $) is a caller-supplied opt ref,
+    // resolved against the `optsRef` map. Distinct from `prev.*` which
+    // walks the immediately-prior-step ToolResult envelope.
+    if (refPath.startsWith('$')) {
+      if (!optsRef) {
+        throw new CollaborateArgResolutionError(
+          refPath,
+          `no opts passed to resolve ${refPath} (Sprint 8 review-intent opts thread required)`,
+          exprPath,
+        );
+      }
+      const key = refPath.slice(1);
+      if (!(key in optsRef)) {
+        throw new CollaborateArgResolutionError(
+          refPath,
+          `opt "${key}" not provided to resolveArgs (callers must pass optsRef with ${key})`,
+          exprPath,
+        );
+      }
+      return optsRef[key];
     }
-    const v = walkRefPath(obj['$ref'], prior);
+    if (!prior) {
+      throw new CollaborateArgResolutionError(refPath, `no prior step available to resolve ${refPath}`, exprPath);
+    }
+    const v = walkRefPath(refPath, prior);
     if (v === UNRESOLVED) {
       throw new CollaborateArgResolutionError(
-        obj['$ref'],
-        `cannot resolve ${obj['$ref']} against prior step (path missing or non-traversable)`,
+        refPath,
+        `cannot resolve ${refPath} against prior step (path missing or non-traversable)`,
         exprPath,
       );
     }
@@ -194,7 +223,7 @@ function resolveExpression(expr: unknown, prior: ResolvedPriorStep | undefined, 
     const parts: unknown[] = obj['$concat'];
     let out = '';
     for (const p of parts) {
-      const resolved = resolveExpression(p, prior, exprPath);
+      const resolved = resolveExpression(p, prior, exprPath, optsRef);
       out += resolved == null ? '' : String(resolved);
     }
     return out;
@@ -229,31 +258,91 @@ function isRefExpressionLocal(value: unknown): boolean {
  *    - `$concat` joins all segments (refs + literals) into a string.
  *    - `$const` returns its inner value verbatim.
  *
+ *  Sprint 8 US-001 + FR-11 backward-compat: `optsRef` (optional) lets
+ *  the caller thread per-call options (e.g. `baseRef` / `headRef` for
+ *  the `review` intent) into the resolver. The dispatcher can pass
+ *  `undefined` for literal-only intents and the resolved args stay
+ *  byte-equal to the pre-Sprint-8 implementation. Placeholders use
+ *  the form `{ $ref: '$key' }` (note the leading `$` distinguishes
+ *  them from `prev.*`).
+ *
  *  This function is pure; the caller is responsible for mutating a copy
  *  if it wants to retain the original `args` shape. */
 export function resolveArgs(
   args: Record<string, unknown>,
   priorSteps: ReadonlyArray<ResolvedPriorStep>,
+  optsRef?: Record<string, unknown>,
 ): Record<string, unknown> {
   const prior = priorSteps.length > 0 ? priorSteps[priorSteps.length - 1] : undefined;
-  return resolveArgsInternal(args, prior, '<root>') as Record<string, unknown>;
+  return resolveArgsInternal(args, prior, '<root>', optsRef) as Record<string, unknown>;
 }
 
-function resolveArgsInternal(value: unknown, prior: ResolvedPriorStep | undefined, exprPath: string): unknown {
+function resolveArgsInternal(
+  value: unknown,
+  prior: ResolvedPriorStep | undefined,
+  exprPath: string,
+  optsRef?: Record<string, unknown>,
+): unknown {
   if (isRefExpressionLocal(value)) {
-    return resolveExpression(value, prior, exprPath);
+    return resolveExpression(value, prior, exprPath, optsRef);
   }
   if (Array.isArray(value)) {
-    return value.map((v, i) => resolveArgsInternal(v, prior, `${exprPath}[${i}]`));
+    return value.map((v, i) => resolveArgsInternal(v, prior, `${exprPath}[${i}]`, optsRef));
   }
   if (value != null && typeof value === 'object') {
+    // B4 (Sprint 8 US-002) F6 resolver gate: when the object contains
+    // NO `$ref` / `$concat` / `$const` expressions ANYWHERE within its
+    // shape (including any nested object/array values), skip the
+    // per-entry walk and return the value byte-equal. This shortcuts
+    // the 5 kB `query_project.question` strings Sprint 7 surfaced:
+    // args with only primitive values (e.g. `{ question: "<long>" }`)
+    // pass through resolveArgs with a single equality check, no walk.
+    // `$ref` expressions still walk as before — `isRefExpressionLocal`
+    // catches them at the top of the recursion.
+    if (!objectContainsRefExpression(value)) {
+      return value;
+    }
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = resolveArgsInternal(v, prior, `${exprPath}.${k}`);
+      out[k] = resolveArgsInternal(v, prior, `${exprPath}.${k}`, optsRef);
     }
     return out;
   }
   return value;
+}
+
+/**
+ * B4 fast-path detector: walk the shape at most one level deep looking
+ * for `$ref` / `$concat` / `$const` keys. Returns true when at least
+ * one `$ref`-style expression exists SOMEWHERE inside (so recursion
+ * must continue), false otherwise (so the caller can byte-equal
+ * short-circuit the walk).
+ *
+ * One-level walk-through: when a shallow value is itself an object or
+ * array, recurse one extra step so nested expressions are caught. This
+ * is a *bounded* walk — in the worst case the depth equals the depth
+ * of nesting in the user's args, which for the test surface is
+ * typically 1-2 (e.g. `{ question: { ... } }`). The 5 kB string case
+ * hits this once at the top and returns false; the `{ question: long
+ * string }` form hits this once and returns false; no descent happens.
+ */
+function objectContainsRefExpression(value: object): boolean {
+  // Direct $ref-shape check is done in the recursion caller already,
+  // but be defensive: if THIS object's keys contain $ref-style keys,
+  // we must descend into them.
+  for (const key of Object.keys(value)) {
+    if (key === '$ref' || key === '$concat' || key === '$const') return true;
+  }
+  for (const v of Object.values(value)) {
+    if (v == null || typeof v !== 'object') continue;
+    // Primitives never contain a RefExpression — already filtered out.
+    // For nested objects/arrays, recurse one more level so we cover
+    // `{ question: { $ref: ... } }` but bail before walking arbitrary
+    // deep shapes (the contract: a single-arg-pass is byte-equal when
+    // nothing at the surface looks ref-shaped).
+    if (objectContainsRefExpression(v)) return true;
+  }
+  return false;
 }
 
 /** Coerce a `toolRegistry.call` return value into the
@@ -691,10 +780,11 @@ export async function collaborateAsync(
   ];
   const reasoning: ReasoningFact[] = [];
 
-  // Inherit prior facts from the scratchpad (FR-4).
+  // Inherit prior facts from the scratchpad (FR-4), capped (B1 F5).
   const prior = await readScratchpad(sessionId, { projectRoot });
+  const recentPrior = prior.slice(-INHERITED_FACTS_CAP);
   const priorFacts: (string | ReasoningFact)[] = [];
-  for (const entry of prior) {
+  for (const entry of recentPrior) {
     if (Array.isArray(entry.reasoning)) {
       for (const f of entry.reasoning) {
         if (typeof f === 'string' && f.trim()) {
@@ -706,7 +796,7 @@ export async function collaborateAsync(
   reasoning.push(...inheritReasoning(priorFacts));
 
   // Leading fact.
-  pushReasoning(reasoning, { fact: `collaborate called for goal="${shortGoal(goal)}" llm=${llm}`, source: 'collaborate' });
+  pushReasoning(reasoning, { fact: `collaborate called for goal="${shortGoal(goal)}" llm=${llm} inheritedFactsCap=${INHERITED_FACTS_CAP}`, source: 'collaborate' });
 
   // Classify.
   let classified: IntentName;

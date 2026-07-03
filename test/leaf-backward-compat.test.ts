@@ -253,25 +253,26 @@ test('US-004 meta-tools are registered as new tools (additive)', () => {
   }
 });
 
-test('additive growth: current.size === 69 (parser-derived exact count after Sprint 5)', () => {
+test('additive growth: current.size === 70 (parser-derived exact count after Sprint 8)', () => {
   // ACTUAL_COUNT is the exact number of leaves the parser below discovers in
   // src/mcp-server.ts. It is intentionally an `===` equality (not `>=`) so
   // accidental additions or removals fail this test — the old `>= 29`
-  // formula passed trivially because the real count is 69.
+  // formula passed trivially because the real count is 70.
   //
-  // Composition (Sprint 5 snapshot, parser-based):
+  // Composition (Sprint 8 snapshot, parser-based):
   //   baseline 25 (FR-11 fixture, byte-equal)
   //   + US-004 Sprint 3   = 2  (audit_symbol, plan_refactor)
   //   + US-005 Sprint 4   = 2  (trace_workflow, collaborate)
   //   + US-006 Sprint 4   = 2  (session_status, run_intent)
+  //   + Sprint 8 US-001   = 1  (review_pr)
   //   + cognition-layer tools shipped across Sprints 1-4 (~38) such as
   //     index_project, query_project, expand_graph, get_symbol, repo_map,
   //     smart_query, render_behavior, validate_architecture, etc.
-  //   = 69 total
+  //   = 70 total
   //
   // If you add a new tool, update ACTUAL_COUNT and add a spot-check test
   // mirroring the existing US-004 / US-005 / US-006 style.
-  const ACTUAL_COUNT = 69;
+  const ACTUAL_COUNT = 70;
   const fixture = JSON.parse(fs.readFileSync(FIXTURE, 'utf8')) as Fixture;
   const source = fs.readFileSync(MCP_SERVER, 'utf8');
   const current = parseLeaves(source);
@@ -323,4 +324,16 @@ test('US-006: run_intent tool is registered (additive)', () => {
   const source = fs.readFileSync(MCP_SERVER, 'utf8');
   const current = parseLeaves(source);
   assert.ok(current.has('run_intent'), 'US-006 goal-shaped tool "run_intent" must be registered in src/mcp-server.ts');
+});
+
+test('Sprint 8: review_pr tool is registered (additive)', () => {
+  // Sprint 8 US-001 PR review combo tool. Fuses git_semantic_change_graph
+  // + per-symbol audit_symbol + semantic_duplicates + architecture_drift +
+  // constraint_violations + composite blast radius into a single
+  // Block/Review/Pass merge-decision ToolResult. Mirrors the existing
+  // US-006 spot-check style. Fails the test if review_pr gets dropped or
+  // mis-registered.
+  const source = fs.readFileSync(MCP_SERVER, 'utf8');
+  const current = parseLeaves(source);
+  assert.ok(current.has('review_pr'), 'Sprint 8 PR-review tool "review_pr" must be registered in src/mcp-server.ts');
 });

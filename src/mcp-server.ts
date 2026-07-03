@@ -121,6 +121,7 @@ import { getModuleConventions, renderModuleConventions } from './module-conventi
 import { buildRepoMap, renderRepoMap } from './repo-map.js';
 import { auditSymbolAsync } from './cognition/audit/audit-symbol.js';
 import { planRefactorAsync } from './cognition/audit/plan-refactor.js';
+import { reviewPrAsync } from './cognition/audit/review-pr.js';
 import { traceWorkflowAsync } from './cognition/audit/trace-workflow.js';
 import { collaborateAsync, buildDefaultToolRegistry } from './cognition/audit/collaborate.js';
 import { sessionStatusAsync } from './cognition/audit/session-status.js';
@@ -129,7 +130,7 @@ import {
   attachRecommendedNext,
   isRecommendEnabled,
 } from './cognition/recommend/post-call.js';
-import type { AuditSymbolPayload, PlanRefactorPayload } from './cognition/audit/types.js';
+import type { AuditSymbolPayload, PlanRefactorPayload, ReviewPrPayload } from './cognition/audit/types.js';
 import { withSignals as withSignalsEnvelope, isToolResult as isEnvelope } from './cognition/signalization/builder.js';
 import {
   type ToolResult,
@@ -640,6 +641,15 @@ function buildCollaborateToolRegistry(projectRoot: string, qdrantUrl: string, wr
           projectRoot,
           baseRef: typeof args['baseRef'] === 'string' ? args['baseRef'] : 'main',
           headRef: typeof args['headRef'] === 'string' ? args['headRef'] : 'HEAD',
+          qdrantUrl,
+          writeToBlackboard,
+        });
+      case 'review_pr':
+        return (args: Record<string, unknown>) => reviewPrAsync({
+          projectRoot,
+          baseRef: typeof args['baseRef'] === 'string' ? args['baseRef'] : 'main',
+          headRef: typeof args['headRef'] === 'string' ? args['headRef'] : 'HEAD',
+          topN: typeof args['topN'] === 'number' ? args['topN'] : 10,
           qdrantUrl,
           writeToBlackboard,
         });
@@ -3209,6 +3219,47 @@ export function createMcpServer(): McpServer {
     },
     async ({ projectRoot, baseRef, headRef, topN, writeToBlackboard, sessionId, qdrantUrl }) => {
       const result = await planRefactorAsync({
+        projectRoot: path.resolve(projectRoot),
+        baseRef,
+        headRef,
+        topN,
+        writeToBlackboard,
+        sessionId,
+        qdrantUrl,
+      });
+      const text = JSON.stringify(result, null, 2);
+      return { content: [{ type: 'text', text }] };
+    }
+  );
+
+  // --- review_pr (Sprint 8 US-001) ---
+  // Single-call PR merge-decision tool. Fuses git_semantic_change_graph +
+  // per-symbol audit_symbol + semantic_duplicates (hoisted) +
+  // architecture_drift + constraint_violations(high) + composite blast
+  // radius into a ToolResult<ReviewPrPayload>. Per-symbol rule table:
+  //   HOLD   = regression >= 0.8 OR (constraint violation high touches symbol)
+  //   REVIEW = regression >= 0.5 OR blast_radius >= 0.7 OR duplicate_matches >= 2
+  //   PASS   = otherwise
+  // Aggregate: BLOCK on any HOLD; REVIEW on any REVIEW or top_blast>=0.7.
+  // Mirror of plan_refactor's hoist pattern (lines 148-156) so wall-time
+  // is ~max of slowest leaf + per-symbol fan-out. Default sessionId:
+  // "review-pr:<baseRef>..<headRef>".
+  server.registerTool(
+    'review_pr',
+    {
+      description: 'Single-call PR merge-decision: fuses git_semantic_change_graph(baseRef, headRef) + per-symbol regression_risk + composite blast_radius + semantic_duplicates(hoisted) + architecture_drift + constraint_violations(high) into a Block/Review/Pass verdict. Per-symbol rule table is deterministic (no LLM). aggregate.rule names the FIRST violated rule that drove the decision. Default sessionId: "review-pr:<baseRef>..<headRef>".',
+      inputSchema: {
+        projectRoot: z.string().describe(PROJECT_ROOT_DESC),
+        baseRef: z.string().describe('Base ref for the diff, for example "main" or a commit SHA.'),
+        headRef: z.string().describe('Head ref for the diff, for example "HEAD" or a commit SHA.'),
+        topN: z.number().int().min(1).max(50).optional().describe('Maximum number of changed symbols to score (default: 10).'),
+        writeToBlackboard: z.boolean().optional().describe('Persist the review ToolResult to the per-session blackboard (default: true).'),
+        sessionId: z.string().optional().describe('Override the deterministic sessionId. Default: "review-pr:<baseRef>..<headRef>".'),
+        qdrantUrl: z.string().optional().describe(QDRANT_URL_DESC),
+      },
+    },
+    async ({ projectRoot, baseRef, headRef, topN, writeToBlackboard, sessionId, qdrantUrl }) => {
+      const result = await reviewPrAsync({
         projectRoot: path.resolve(projectRoot),
         baseRef,
         headRef,

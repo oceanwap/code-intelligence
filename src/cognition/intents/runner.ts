@@ -16,6 +16,15 @@
  *   - DAG step tool missing → ok=false step + `intents.tool_missing` signal
  *   - tool throws → ok=false step + `intents.tool_error` signal
  *   The runner NEVER throws on bad input.
+ *
+ * Sprint 8 B1 (US-002): inherit the F5 inherited-facts cap from
+ * `INHERITED_FACTS_CAP` so reasoning chains stay bounded.
+ *
+ * Sprint 8 US-001 (FR-11 backward-compat): thread `opts` into the
+ * `resolveArgs` call so `$baseRef` / `$headRef` placeholders inside an
+ * intent DAG resolve against caller-supplied options. Literal-only
+ * intents (the 5 pre-existing intents) do NOT touch opts and stay
+ * byte-equal to the pre-Sprint-8 implementation.
  */
 
 import * as path from 'node:path';
@@ -41,6 +50,7 @@ import {
   type ResolvedPriorStep,
 } from '../audit/collaborate.js';
 import { getIntent, hasIntent, type RegisteredIntentName } from './registry.js';
+import { INHERITED_FACTS_CAP } from '../audit/inherited-facts-cap.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -52,6 +62,17 @@ export interface RunIntentInput {
   intent: RegisteredIntentName;
   /** Per-step parameter overrides. Keys are tool names; values merge into the DAG step `args`. */
   overrides?: Record<string, Record<string, unknown>>;
+  /**
+   * Caller-supplied options threaded into `$ref: '$key'` placeholders.
+   *
+   * Used by the Sprint 8 `review` intent: the DAG carries
+   * `{ $ref: '$baseRef' }` / `{ $ref: '$headRef' }` references that
+   * resolve against this object at run-time. For the 5 pre-existing
+   * intents (audit / onboard / refactor / debug / release-prep), this
+   * argument is `undefined` and resolveArgs returns byte-equal args
+   * (FR-11 backward-compat).
+   */
+  opts?: Record<string, unknown>;
   /** Override the tool registry (testing). */
   toolRegistry: ToolRegistry;
   writeToBlackboard?: boolean;
@@ -69,6 +90,12 @@ export interface RunIntentPayload {
   synthesis: string;
   /** Reasoning chain (FR-4). */
   reasoning_chain: ReasoningFact[];
+  /**
+   * B1: surfaced in the payload so callers can reason about the
+   * deterministic upper bound on inherited facts. Always equals
+   * `INHERITED_FACTS_CAP` (mirrors `trace_workflow.inheritedFactsCap`).
+   */
+  inheritedFactsCap: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,10 +122,11 @@ export async function runIntentAsync(
   ];
   const reasoning: ReasoningFact[] = [];
 
-  // Inherit prior facts (FR-4).
+  // Inherit prior facts (FR-4), capped (B1 F5).
   const prior = await readScratchpad(sessionId, { projectRoot });
+  const recentPrior = prior.slice(-INHERITED_FACTS_CAP);
   const priorFacts: (string | ReasoningFact)[] = [];
-  for (const entry of prior) {
+  for (const entry of recentPrior) {
     if (Array.isArray(entry.reasoning)) {
       for (const f of entry.reasoning) {
         if (typeof f === 'string' && f.trim()) priorFacts.push(f);
@@ -108,7 +136,7 @@ export async function runIntentAsync(
   reasoning.push(...inheritReasoning(priorFacts));
 
   // Leading fact.
-  pushReasoning(reasoning, { fact: `run_intent called for ${input.intent}`, source: 'run_intent' });
+  pushReasoning(reasoning, { fact: `run_intent called for ${input.intent} inheritedFactsCap=${INHERITED_FACTS_CAP}`, source: 'run_intent' });
 
   // Resolve the intent.
   if (!hasIntent(input.intent)) {
@@ -118,8 +146,9 @@ export async function runIntentAsync(
       intent: input.intent,
       dag: [],
       executed: [],
-      synthesis: `Unknown intent "${input.intent}". Registered intents: audit, onboard, refactor, debug, release-prep.`,
+      synthesis: `Unknown intent "${input.intent}". Registered intents: audit, onboard, refactor, debug, release-prep, review.`,
       reasoning_chain: reasoning,
+      inheritedFactsCap: INHERITED_FACTS_CAP,
     }, signals, sources, sessionId, projectRoot, writeToBlackboard, 'AMBIGUOUS');
   }
 
@@ -154,10 +183,14 @@ export async function runIntentAsync(
     }
 
     // F6: resolve $ref / $concat / $const in step.args against the
-    // immediately prior step's ToolResult envelope.
+    // immediately prior step's ToolResult envelope. Sprint 8 US-001:
+    // `$ref: '$key'` placeholders in the DAG args are resolved against
+    // the caller's `input.opts` object. Literal-only intents (audit,
+    // onboard, debug, release-prep) pass `input.opts ?? undefined` so
+    // the resolver byte-equals the pre-Sprint-8 implementation.
     let resolvedArgs: Record<string, unknown>;
     try {
-      resolvedArgs = resolveArgs(step.args, priorResults);
+      resolvedArgs = resolveArgs(step.args, priorResults, input.opts);
     } catch (err) {
       if (err instanceof CollaborateArgResolutionError) {
         const message = `arg resolution failed at ${err.path}: ${err.message}`;
@@ -257,6 +290,7 @@ export async function runIntentAsync(
     executed,
     synthesis,
     reasoning_chain: reasoning,
+    inheritedFactsCap: INHERITED_FACTS_CAP,
   }, signals, sources, sessionId, projectRoot, writeToBlackboard, tier);
 }
 

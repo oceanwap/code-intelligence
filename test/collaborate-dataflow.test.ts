@@ -536,3 +536,40 @@ test('CollaborateArgResolutionError: thrown error carries .path and .step info',
     // documented contract.
   }
 });
+
+// ---------------------------------------------------------------------------
+// Sprint 8 US-002 / B4 — F6 resolver gate (5kB question + zero refs).
+// ---------------------------------------------------------------------------
+
+test('B4: resolver gate — 5kB args with zero $ref keys resolves in <50ms; byte-equal output', () => {
+  // Build a 5 kB question string (mirrors `query_project.question`
+  // patterns from the F6 brief).
+  const longQuestion = 'how does authentication work? '.repeat(170); // ≈ 5.1 kB
+  const args = {
+    projectRoot: '/repo',
+    question: longQuestion,
+    topN: 10,
+  };
+  // Capture the byte-equal baseline: resolveArgs must return the SAME
+  // string instance (no copy, no walk).
+  const t0 = Date.now();
+  const resolved = resolveArgs(args, []);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 50, `resolveArgs on 5kB args should be <50ms (B4 acceptance); got ${ms}ms`);
+  // Byte-equal: same keys, same values, same string identity.
+  assert.deepEqual(resolved, args);
+  assert.equal(resolved.question, longQuestion, '5kB string returned byte-equal');
+});
+
+test('B4: resolver gate — array of long strings at the top level skips recursion', () => {
+  // `query_project` uses `seeds: string[]`. The B4 gate must skip
+  // recursion when the top-level value is an array of primitives.
+  const seeds = Array.from({ length: 100 }, (_, i) => `seed-${i}-${'x'.repeat(50)}`);
+  const args = { projectRoot: '/repo', seeds };
+  const t0 = Date.now();
+  const resolved = resolveArgs(args, []);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 50, `resolveArgs on seed array should be <50ms; got ${ms}ms`);
+  assert.deepEqual(resolved, args);
+  assert.equal(resolved.seeds.length, 100);
+});

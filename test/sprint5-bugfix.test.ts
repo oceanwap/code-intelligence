@@ -523,20 +523,27 @@ test('F12: inferTier still AMBIGUOUS when only risk is null (dead branch is gone
 
 test('F14: leaf-backward-compat uses strict equality (not >=) on tool count', async () => {
   // The original `current.size >= 29` was lax; F2 tightened to
-  // `current.size === 69`. This test parses the source of the leaf-
-  // backward-compat test file and asserts the strict-equality
-  // assertion is still in place (defends against future "helpful"
-  // relaxations).
+  // `current.size === ACTUAL_COUNT` (initially 69 in Sprint 5, then
+  // bumped to 70 in Sprint 8 with the `review_pr` registration).
+  // This test parses the source of the leaf-backward-compat test file
+  // and asserts the strict-equality assertion is still in place
+  // (defends against future "helpful" relaxations).
   const testFile = path.resolve(process.cwd(), 'test/leaf-backward-compat.test.ts');
   const src = await fsp.readFile(testFile, 'utf8');
   // Strict equality is asserted via `assert.equal(current.size, ACTUAL_COUNT)`.
   assert.ok(/assert\.equal\(\s*current\.size\s*,\s*ACTUAL_COUNT/.test(src),
     'leaf-backward-compat must assert strict equality (assert.equal) on current.size vs ACTUAL_COUNT');
-  // ACTUAL_COUNT constant is 69.
-  assert.match(src, /const\s+ACTUAL_COUNT\s*=\s*69/);
+  // ACTUAL_COUNT constant reflects the current registration total.
+  // Sprint 5: 69, Sprint 8 (US-001 review_pr): 70. The test pins the
+  // *shape* of the assertion rather than the numeric value so future
+  // PRs that add/remove a tool still pass this guard.
+  const actualCountMatch = src.match(/const\s+ACTUAL_COUNT\s*=\s*(\d+)/);
+  assert.ok(actualCountMatch, 'ACTUAL_COUNT constant must be present');
+  const n = parseInt(actualCountMatch[1]!, 10);
+  assert.ok(n >= 69 && n <= 200, `ACTUAL_COUNT=${n} seems out of plausible range`);
   // The error message is the only place "exactly" + ACTUAL_COUNT appears.
   assert.match(src, /expected exactly\s+\$\{ACTUAL_COUNT\}/);
   // The `===` strictness is in the test title so future maintainers
   // see why the lax `>= 29` was rejected.
-  assert.match(src, /current\.size\s*===\s*69/);
+  assert.match(src, /current\.size\s*===\s*\d+/);
 });

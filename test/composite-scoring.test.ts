@@ -329,6 +329,128 @@ test('loadCompositeScoresAsMap returns Map and reflects empty case', async (t) =
   assert.equal(map.size, 0);
 });
 
+// ---------------------------------------------------------------------------
+// Sprint 8 US-002 / B2 — module-level mtime-keyed memo
+// ---------------------------------------------------------------------------
+
+test('B2: memo — consecutive loadCompositeScoresAsMap calls return same Map instance', async (t) => {
+  const dir = makeProjectRoot(t);
+  initGit(dir);
+  // Seed the composite-scores file with at least one entry.
+  const graph = buildFixtureGraph();
+  const entries = buildFixtureMemory();
+  await saveCompositeScores({
+    'A.run': {
+      symbol: 'A.run',
+      blastRadius: 0.5,
+      intentAlignment: 0.5,
+      changeRisk: 0.3,
+      overall: 0.4,
+      blastRadiusBreakdown: {
+        inbound: 0, outbound: 0, totalDegree: 0, connectivity: 0,
+        inboundNormalized: 0, outboundNormalized: 0,
+        totalDegreeNormalized: 0, connectivityNormalized: 0,
+        symbolMissingFromGraph: true,
+      },
+      intentAlignmentBreakdown: {
+        goalTokenCount: 0, directSymbolOverlap: 0, fileOverlap: 0,
+        neighborSymbolSupport: 0, topicOverlap: 0, memorySymbolHits: 0,
+        directSymbolOverlapNormalized: 0, fileOverlapNormalized: 0,
+        neighborSymbolSupportNormalized: 0, topicOverlapNormalized: 0,
+        goalEmpty: true,
+      },
+      changeRiskBreakdown: {
+        changeCount: 0, fixCount: 0, connectivity: 0, instability: 0,
+        changeCountNormalized: 0, fixCountNormalized: 0,
+        connectivityNormalized: 0, instabilityNormalized: 0,
+        memoryMissing: true,
+      },
+      computedAt: '2026-06-29T00:00:00.000Z',
+    },
+  }, { projectRoot: dir });
+
+  const m1 = await loadCompositeScoresAsMap({ projectRoot: dir });
+  const m2 = await loadCompositeScoresAsMap({ projectRoot: dir });
+  assert.ok(m1 instanceof Map);
+  assert.equal(m1.size, 1);
+  // B2 acceptance: pointer-equal Map instance on cache hit.
+  assert.equal(m1, m2, 'consecutive calls must return the SAME Map instance (memo hit)');
+  void graph;
+  void entries;
+});
+
+test('B2: memo — touching the file invalidates the cache', async (t) => {
+  const dir = makeProjectRoot(t);
+  initGit(dir);
+  await saveCompositeScores({
+    'A.run': {
+      symbol: 'A.run',
+      blastRadius: 0.5,
+      intentAlignment: 0.5,
+      changeRisk: 0.3,
+      overall: 0.4,
+      blastRadiusBreakdown: {
+        inbound: 0, outbound: 0, totalDegree: 0, connectivity: 0,
+        inboundNormalized: 0, outboundNormalized: 0,
+        totalDegreeNormalized: 0, connectivityNormalized: 0,
+        symbolMissingFromGraph: true,
+      },
+      intentAlignmentBreakdown: {
+        goalTokenCount: 0, directSymbolOverlap: 0, fileOverlap: 0,
+        neighborSymbolSupport: 0, topicOverlap: 0, memorySymbolHits: 0,
+        directSymbolOverlapNormalized: 0, fileOverlapNormalized: 0,
+        neighborSymbolSupportNormalized: 0, topicOverlapNormalized: 0,
+        goalEmpty: true,
+      },
+      changeRiskBreakdown: {
+        changeCount: 0, fixCount: 0, connectivity: 0, instability: 0,
+        changeCountNormalized: 0, fixCountNormalized: 0,
+        connectivityNormalized: 0, instabilityNormalized: 0,
+        memoryMissing: true,
+      },
+      computedAt: '2026-06-29T00:00:00.000Z',
+    },
+  }, { projectRoot: dir });
+  const m1 = await loadCompositeScoresAsMap({ projectRoot: dir });
+  // Force mtime tick by waiting briefly then re-writing the file. The
+  // mtime resolution on some filesystems is 1s; we sleep 1.05s and
+  // re-write to guarantee a different mtime.
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  await saveCompositeScores({
+    'B.run': {
+      symbol: 'B.run',
+      blastRadius: 0.6,
+      intentAlignment: 0.6,
+      changeRisk: 0.4,
+      overall: 0.5,
+      blastRadiusBreakdown: {
+        inbound: 0, outbound: 0, totalDegree: 0, connectivity: 0,
+        inboundNormalized: 0, outboundNormalized: 0,
+        totalDegreeNormalized: 0, connectivityNormalized: 0,
+        symbolMissingFromGraph: true,
+      },
+      intentAlignmentBreakdown: {
+        goalTokenCount: 0, directSymbolOverlap: 0, fileOverlap: 0,
+        neighborSymbolSupport: 0, topicOverlap: 0, memorySymbolHits: 0,
+        directSymbolOverlapNormalized: 0, fileOverlapNormalized: 0,
+        neighborSymbolSupportNormalized: 0, topicOverlapNormalized: 0,
+        goalEmpty: true,
+      },
+      changeRiskBreakdown: {
+        changeCount: 0, fixCount: 0, connectivity: 0, instability: 0,
+        changeCountNormalized: 0, fixCountNormalized: 0,
+        connectivityNormalized: 0, instabilityNormalized: 0,
+        memoryMissing: true,
+      },
+      computedAt: '2026-06-29T00:00:01.000Z',
+    },
+  }, { projectRoot: dir });
+  const m2 = await loadCompositeScoresAsMap({ projectRoot: dir });
+  assert.notEqual(m1, m2, 'mtime change must bust the memo (different Map instance)');
+  assert.equal(m2.size, 1);
+  assert.ok(m2.has('B.run'), 'after touch, the new file contents are reflected');
+});
+
 test('saveCompositeScores writes atomically (no partial file)', async (t) => {
   const dir = makeProjectRoot(t);
   initGit(dir);
