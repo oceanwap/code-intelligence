@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated": "2026-06-29T04-15:00Z",
+  "updated": "2026-07-03T00-00:00Z",
   "items": [
     {
       "id": "cognition-layer",
@@ -48,6 +48,35 @@
         "OQ-5: audit_symbol writeToBlackboard default"
       ],
       "next_step": "Engineer for US-001 (P0 cognition foundation)"
+    },
+    {
+      "id": "sprint8-review-pr",
+      "title": "Sprint 8: review_pr combo + intelligence-layer hardening",
+      "type": "feature",
+      "status": "draft",
+      "prd": ".prd/prd-sprint8-review-pr.md",
+      "scope": "review_pr + 4 quick wins",
+      "summary": "Single highest-frequency agent workflow (PR review) plus 4 architectural quick wins from the intelligence-layer review. review_pr fuses 6 leaf signals into one merge-decision call. Quick wins (B1 F5 cap propagation, B2 composite memoization, B3 strict isToolResult, B4 F6 resolver gate) close scoring/cap/discriminator gaps.",
+      "sprints": [
+        {
+          "id": "sprint-8",
+          "name": "Sprint 8: review_pr combo + B1-B4 hardening",
+          "loc_estimate": 750,
+          "stories": ["US-001", "US-002"]
+        }
+      ],
+      "totals": {
+        "loc_estimate": 750,
+        "sprints": 1,
+        "user_stories": 2
+      },
+      "open_questions": [
+        "OQ-1: canonical merge-gate tool (review_pr vs plan_refactor vs release-prep)",
+        "OQ-2: top-N cutoff on per-symbol audit_symbol calls inside review_pr (default 10)",
+        "OQ-3: cross-output recall in review_pr (opt-in via env to avoid FR-11 break)",
+        "OQ-4: B2 cache invalidation on graph.json changes"
+      ],
+      "next_step": "Engineer for US-001 (review_pr combo) + US-002 (B1-B4 quick wins)"
     }
   ]
 }
